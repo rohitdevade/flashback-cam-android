@@ -1,0 +1,601 @@
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:provider/provider.dart';
+import 'package:flashback_cam/providers/app_state.dart';
+import 'package:flashback_cam/theme.dart';
+import 'package:flashback_cam/widgets/glass_container.dart';
+import 'package:flashback_cam/widgets/frosted_glass_card.dart';
+
+class ProUpgradeScreen extends StatefulWidget {
+  const ProUpgradeScreen({super.key});
+
+  @override
+  State<ProUpgradeScreen> createState() => _ProUpgradeScreenState();
+}
+
+class _ProUpgradeScreenState extends State<ProUpgradeScreen>
+    with TickerProviderStateMixin {
+  String _selectedTier = 'yearly';
+  late AnimationController _fadeController;
+  late AnimationController _pulseController;
+  late Animation<double> _fadeAnimation;
+  late Animation<double> _pulseAnimation;
+
+  @override
+  void initState() {
+    super.initState();
+    _fadeController = AnimationController(
+      duration: const Duration(milliseconds: 600),
+      vsync: this,
+    );
+    _pulseController = AnimationController(
+      duration: const Duration(milliseconds: 2000),
+      vsync: this,
+    );
+
+    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(parent: _fadeController, curve: Curves.easeOut),
+    );
+
+    _pulseAnimation = Tween<double>(begin: 1.0, end: 1.1).animate(
+      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
+    );
+
+    _fadeController.forward();
+    _pulseController.repeat(reverse: true);
+  }
+
+  @override
+  void dispose() {
+    _fadeController.dispose();
+    _pulseController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: AppColors.deepCharcoal,
+      body: SafeArea(
+        child: FadeTransition(
+          opacity: _fadeAnimation,
+          child: Column(
+            children: [
+              _buildTopBar(context),
+              Expanded(
+                child: SingleChildScrollView(
+                  physics: const BouncingScrollPhysics(),
+                  padding: const EdgeInsets.symmetric(horizontal: 20),
+                  child: Column(
+                    children: [
+                      const SizedBox(height: 20),
+                      _buildProHero(),
+                      const SizedBox(height: 40),
+                      _buildFeaturesList(),
+                      const SizedBox(height: 40),
+                      _buildPricingSection(),
+                      const SizedBox(height: 32),
+                      _buildPurchaseButton(),
+                      const SizedBox(height: 20),
+                      _buildDisclaimer(),
+                      const SizedBox(height: 40),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTopBar(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.all(20),
+      child: GlassContainer(
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+        child: Row(
+          children: [
+            GestureDetector(
+              onTap: () => Navigator.pop(context),
+              child: const Icon(Icons.close, color: AppColors.textPrimary),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Text(
+                'Upgrade to Pro',
+                style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                      color: AppColors.textPrimary,
+                      fontWeight: FontWeight.w700,
+                    ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildProHero() {
+    return ScaleTransition(
+      scale: _pulseAnimation,
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(32),
+        decoration: BoxDecoration(
+          gradient: const LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [AppColors.electricBlue, AppColors.neonCyan],
+          ),
+          borderRadius: BorderRadius.circular(24),
+          boxShadow: [
+            BoxShadow(
+              color: AppColors.electricBlue.withValues(alpha: 0.3),
+              blurRadius: 20,
+              offset: const Offset(0, 8),
+            ),
+          ],
+        ),
+        child: Column(
+          children: [
+            const Icon(
+              Icons.workspace_premium,
+              size: 80,
+              color: Colors.white,
+            ),
+            const SizedBox(height: 20),
+            Text(
+              'Unlock Pro Power',
+              style: Theme.of(context).textTheme.headlineLarge?.copyWith(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w800,
+                  ),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'Record in 4K60, 30s pre-roll, no ads\nPremium features & more',
+              style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                    color: Colors.white.withValues(alpha: 0.9),
+                    height: 1.4,
+                  ),
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildFeaturesList() {
+    final features = [
+      {
+        'icon': Icons.video_settings,
+        'title': '4K Recording',
+        'desc': 'Ultra-HD video capture'
+      },
+      {
+        'icon': Icons.speed,
+        'title': '60 FPS',
+        'desc': 'Buttery smooth playback'
+      },
+      {
+        'icon': Icons.history,
+        'title': 'Up to 30s Pre-roll',
+        'desc': 'Extended buffer time'
+      },
+      {
+        'icon': Icons.block,
+        'title': 'No Ads',
+        'desc': 'Distraction-free experience'
+      },
+      {
+        'icon': Icons.high_quality,
+        'title': 'High Bitrate',
+        'desc': 'Maximum quality output'
+      },
+    ];
+
+    return Column(
+      children: [
+        Text(
+          'PRO FEATURES',
+          style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                color: AppColors.electricBlue,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 1.5,
+              ),
+        ),
+        const SizedBox(height: 20),
+        GlassContainer(
+          padding: const EdgeInsets.all(0),
+          child: Column(
+            children: features.asMap().entries.map((entry) {
+              final index = entry.key;
+              final feature = entry.value;
+              return Column(
+                children: [
+                  _buildFeatureItem(
+                    feature['icon'] as IconData,
+                    feature['title'] as String,
+                    feature['desc'] as String,
+                  ),
+                  if (index < features.length - 1)
+                    const Divider(height: 1, color: AppColors.glassBorder),
+                ],
+              );
+            }).toList(),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildFeatureItem(IconData icon, String title, String description) {
+    return Padding(
+      padding: const EdgeInsets.all(20),
+      child: Row(
+        children: [
+          Container(
+            width: 48,
+            height: 48,
+            decoration: BoxDecoration(
+              color: AppColors.electricBlue.withValues(alpha: 0.1),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Icon(
+              icon,
+              color: AppColors.electricBlue,
+              size: 24,
+            ),
+          ),
+          const SizedBox(width: 16),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        color: AppColors.textPrimary,
+                        fontWeight: FontWeight.w600,
+                      ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  description,
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: AppColors.textSecondary,
+                      ),
+                ),
+              ],
+            ),
+          ),
+          const Icon(
+            Icons.check_circle,
+            color: AppColors.neonGreen,
+            size: 24,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPricingSection() {
+    return Column(
+      children: [
+        Text(
+          'CHOOSE YOUR PLAN',
+          style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                color: AppColors.electricBlue,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 1.5,
+              ),
+        ),
+        const SizedBox(height: 20),
+        _buildPricingCard(
+          tier: 'monthly',
+          label: 'Monthly',
+          price: '\$3.00',
+          period: 'per month',
+          originalPrice: null,
+        ),
+        const SizedBox(height: 12),
+        _buildPricingCard(
+          tier: 'yearly',
+          label: 'Yearly',
+          price: '\$8.00',
+          period: 'per year',
+          originalPrice: '\$36.00',
+          badge: 'SAVE 78%',
+          isPopular: true,
+        ),
+        const SizedBox(height: 12),
+        _buildPricingCard(
+          tier: 'lifetime',
+          label: 'Lifetime',
+          price: '\$15.00',
+          period: 'one-time payment',
+          originalPrice: null,
+          badge: 'BEST VALUE',
+        ),
+      ],
+    );
+  }
+
+  Widget _buildPricingCard({
+    required String tier,
+    required String label,
+    required String price,
+    required String period,
+    String? originalPrice,
+    String? badge,
+    bool isPopular = false,
+  }) {
+    final isSelected = _selectedTier == tier;
+
+    return GestureDetector(
+      onTap: () {
+        HapticFeedback.lightImpact();
+        setState(() => _selectedTier = tier);
+      },
+      child: Stack(
+        children: [
+          GlassContainer(
+            padding: const EdgeInsets.all(20),
+            child: Row(
+              children: [
+                Container(
+                  width: 24,
+                  height: 24,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: isSelected
+                          ? AppColors.electricBlue
+                          : AppColors.textSecondary,
+                      width: 2,
+                    ),
+                    color: isSelected
+                        ? AppColors.electricBlue
+                        : Colors.transparent,
+                  ),
+                  child: isSelected
+                      ? const Icon(Icons.check, size: 16, color: Colors.white)
+                      : null,
+                ),
+                const SizedBox(width: 16),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        label,
+                        style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                              color: AppColors.textPrimary,
+                              fontWeight: FontWeight.w600,
+                            ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        period,
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                              color: AppColors.textSecondary,
+                            ),
+                      ),
+                    ],
+                  ),
+                ),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Text(
+                      price,
+                      style:
+                          Theme.of(context).textTheme.headlineSmall?.copyWith(
+                                color: AppColors.electricBlue,
+                                fontWeight: FontWeight.w700,
+                              ),
+                    ),
+                    if (originalPrice != null) ...[
+                      const SizedBox(height: 4),
+                      Text(
+                        originalPrice,
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                              color: AppColors.textSecondary,
+                              decoration: TextDecoration.lineThrough,
+                            ),
+                      ),
+                    ],
+                  ],
+                ),
+              ],
+            ),
+          ),
+          if (badge != null)
+            Positioned(
+              top: -8,
+              right: 16,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: isPopular ? AppColors.proGold : AppColors.neonGreen,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  badge,
+                  style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 0.5,
+                      ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPurchaseButton() {
+    return Container(
+      width: double.infinity,
+      height: 56,
+      child: ElevatedButton(
+        onPressed: () => _purchase(context),
+        style: ElevatedButton.styleFrom(
+          backgroundColor: AppColors.electricBlue,
+          foregroundColor: AppColors.deepCharcoal,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+          ),
+          elevation: 0,
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.flash_on, size: 24),
+            const SizedBox(width: 12),
+            Text(
+              'Start Pro Experience',
+              style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                    color: AppColors.deepCharcoal,
+                    fontWeight: FontWeight.w700,
+                  ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDisclaimer() {
+    return Text(
+      'Subscriptions auto-renew unless canceled 24 hours before the current period ends. Manage subscriptions in App Store settings.',
+      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+            color: AppColors.textTertiary,
+            height: 1.4,
+          ),
+      textAlign: TextAlign.center,
+    );
+  }
+
+  void _purchase(BuildContext context) async {
+    // Show loading dialog
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => Dialog(
+        backgroundColor: Colors.transparent,
+        child: GlassContainer(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const CircularProgressIndicator(color: AppColors.electricBlue),
+              const SizedBox(height: 20),
+              Text(
+                'Processing purchase...',
+                style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                      color: AppColors.textPrimary,
+                    ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    try {
+      final appState = context.read<AppState>();
+      final success = await appState.purchasePro(_selectedTier);
+
+      Navigator.pop(context); // Close loading dialog
+
+      if (success) {
+        _showSuccessDialog(context);
+      } else {
+        _showErrorDialog(context, 'Purchase was canceled or failed');
+      }
+    } catch (e) {
+      Navigator.pop(context); // Close loading dialog
+      _showErrorDialog(context, 'Purchase failed: ${e.toString()}');
+    }
+  }
+
+  void _showSuccessDialog(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (context) => Dialog(
+        backgroundColor: Colors.transparent,
+        child: FrostedGlassCard(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 80,
+                height: 80,
+                decoration: BoxDecoration(
+                  color: AppColors.neonGreen.withValues(alpha: 0.1),
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(
+                  Icons.check_circle,
+                  color: AppColors.neonGreen,
+                  size: 48,
+                ),
+              ),
+              const SizedBox(height: 20),
+              Text(
+                'Welcome to Pro! 🎉',
+                style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                      color: AppColors.textPrimary,
+                      fontWeight: FontWeight.w700,
+                    ),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 12),
+              Text(
+                'You now have access to all Pro features. Enjoy the premium Flashback Cam experience!',
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      color: AppColors.textSecondary,
+                      height: 1.4,
+                    ),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 24),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: () {
+                    Navigator.pop(context); // Close success dialog
+                    Navigator.pop(context); // Close upgrade screen
+                  },
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: AppColors.electricBlue,
+                    foregroundColor: AppColors.deepCharcoal,
+                  ),
+                  child: const Text('Get Started'),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showErrorDialog(BuildContext context, String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: AppColors.recordRed,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      ),
+    );
+  }
+}
