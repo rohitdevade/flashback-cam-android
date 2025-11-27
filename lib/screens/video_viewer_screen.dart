@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:video_player/video_player.dart';
+import 'package:google_mobile_ads/google_mobile_ads.dart' hide AppState;
 import 'package:flashback_cam/models/video_recording.dart';
 import 'package:flashback_cam/providers/app_state.dart';
 import 'package:flashback_cam/theme.dart';
@@ -28,18 +29,34 @@ class _VideoViewerScreenState extends State<VideoViewerScreen> {
   Duration _duration = Duration.zero;
   Duration _position = Duration.zero;
   String? _error;
+  BannerAd? _bannerAd;
+  bool _isBannerAdLoaded = false;
 
   @override
   void initState() {
     super.initState();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     _initializePlayer();
+    _loadBannerAd();
+  }
+
+  void _loadBannerAd() {
+    final appState = context.read<AppState>();
+    if (appState.isPro) return; // Don't show ads for pro users
+
+    _bannerAd = appState.adService.createVideoPlayerBannerAd();
+    _bannerAd!.load().then((_) {
+      if (mounted) {
+        setState(() => _isBannerAdLoaded = true);
+      }
+    });
   }
 
   @override
   void dispose() {
     _controller?.removeListener(_videoListener);
     _controller?.dispose();
+    _bannerAd?.dispose();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     super.dispose();
   }
@@ -255,19 +272,41 @@ class _VideoViewerScreenState extends State<VideoViewerScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final appState = context.watch<AppState>();
+
     return Scaffold(
       backgroundColor: Colors.black,
-      body: GestureDetector(
-        onTap: _error == null ? _toggleControls : null,
-        child: Stack(
-          children: [
-            // Video player
-            _buildVideoPlayer(),
+      body: Column(
+        children: [
+          // Banner ad at top (only for non-pro users)
+          if (_isBannerAdLoaded && _bannerAd != null && !appState.isPro)
+            SafeArea(
+              bottom: false,
+              child: Container(
+                alignment: Alignment.center,
+                color: Colors.black,
+                width: _bannerAd!.size.width.toDouble(),
+                height: _bannerAd!.size.height.toDouble(),
+                child: AdWidget(ad: _bannerAd!),
+              ),
+            ),
 
-            // Controls overlay
-            if (_showControls && _error == null) _buildControlsOverlay(),
-          ],
-        ),
+          // Video player area
+          Expanded(
+            child: GestureDetector(
+              onTap: _error == null ? _toggleControls : null,
+              child: Stack(
+                children: [
+                  // Video player
+                  _buildVideoPlayer(),
+
+                  // Controls overlay
+                  if (_showControls && _error == null) _buildControlsOverlay(),
+                ],
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

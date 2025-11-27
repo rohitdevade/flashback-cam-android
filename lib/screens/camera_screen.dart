@@ -378,6 +378,9 @@ class _CameraScreenState extends State<CameraScreen> {
       await appState.stopBuffer();
     }
 
+    // Show interstitial ad (not every time - managed by AdService)
+    await appState.showGalleryAd();
+
     await Navigator.push(
       context,
       MaterialPageRoute(builder: (_) => const GalleryScreen()),

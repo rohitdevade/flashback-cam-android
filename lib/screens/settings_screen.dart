@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
+import 'package:google_mobile_ads/google_mobile_ads.dart' hide AppState;
 import 'package:flashback_cam/providers/app_state.dart';
 import 'package:flashback_cam/models/app_settings.dart';
 import 'package:flashback_cam/theme.dart';
@@ -23,6 +24,8 @@ class _SettingsScreenState extends State<SettingsScreen>
   int _versionTapCount = 0;
   Map<String, bool> _capabilities = {};
   bool _isLoadingCapabilities = true;
+  BannerAd? _bannerAd;
+  bool _isBannerAdLoaded = false;
 
   @override
   void initState() {
@@ -36,6 +39,19 @@ class _SettingsScreenState extends State<SettingsScreen>
     );
     _fadeController.forward();
     _loadCapabilities();
+    _loadBannerAd();
+  }
+
+  void _loadBannerAd() {
+    final appState = context.read<AppState>();
+    if (appState.isPro) return; // Don't show ads for pro users
+
+    _bannerAd = appState.adService.createSettingsBannerAd();
+    _bannerAd!.load().then((_) {
+      if (mounted) {
+        setState(() => _isBannerAdLoaded = true);
+      }
+    });
   }
 
   Future<void> _loadCapabilities() async {
@@ -53,6 +69,7 @@ class _SettingsScreenState extends State<SettingsScreen>
   @override
   void dispose() {
     _fadeController.dispose();
+    _bannerAd?.dispose();
     super.dispose();
   }
 
@@ -78,6 +95,15 @@ class _SettingsScreenState extends State<SettingsScreen>
                     _buildSettingsContent(context, appState, settings, isPro),
               ),
             ),
+
+            // Banner ad at bottom (only for non-pro users)
+            if (_isBannerAdLoaded && _bannerAd != null && !isPro)
+              Container(
+                alignment: Alignment.center,
+                width: _bannerAd!.size.width.toDouble(),
+                height: _bannerAd!.size.height.toDouble(),
+                child: AdWidget(ad: _bannerAd!),
+              ),
           ],
         ),
       ),

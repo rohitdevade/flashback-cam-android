@@ -28,6 +28,9 @@ class AppState extends ChangeNotifier {
   final AdService _adService = AdService();
   final SettingsService _settingsService = SettingsService();
 
+  // Expose AdService for screens that need banner ads
+  AdService get adService => _adService;
+
   bool _isInitialized = false;
   bool _isInitializing = false;
   CameraMode _cameraMode = CameraMode.idle;
@@ -393,6 +396,13 @@ class AppState extends ChangeNotifier {
   Future<void> _showAdIfNeeded() async {
     if (!isPro) {
       await _adService.showInterstitialAd();
+    }
+  }
+
+  /// Show interstitial ad when opening gallery (not every time)
+  Future<void> showGalleryAd() async {
+    if (!isPro) {
+      await _adService.showGalleryInterstitialAd();
     }
   }
 

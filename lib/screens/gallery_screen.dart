@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:google_mobile_ads/google_mobile_ads.dart' hide AppState;
 
 import 'package:flashback_cam/models/video_recording.dart';
 import 'package:flashback_cam/providers/app_state.dart';
@@ -28,6 +29,8 @@ class _GalleryScreenState extends State<GalleryScreen>
   late AnimationController _fadeController;
   late Animation<double> _fadeAnimation;
   bool _resumeBufferOnExit = false;
+  BannerAd? _bannerAd;
+  bool _isBannerAdLoaded = false;
 
   @override
   void initState() {
@@ -43,6 +46,19 @@ class _GalleryScreenState extends State<GalleryScreen>
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _pauseBufferIfNeeded();
+      _loadBannerAd();
+    });
+  }
+
+  void _loadBannerAd() {
+    final appState = context.read<AppState>();
+    if (appState.isPro) return; // Don't show ads for pro users
+
+    _bannerAd = appState.adService.createGalleryBannerAd();
+    _bannerAd!.load().then((_) {
+      if (mounted) {
+        setState(() => _isBannerAdLoaded = true);
+      }
     });
   }
 
@@ -53,6 +69,7 @@ class _GalleryScreenState extends State<GalleryScreen>
       unawaited(appState.startBuffer());
     }
     _fadeController.dispose();
+    _bannerAd?.dispose();
     super.dispose();
   }
 
@@ -86,6 +103,15 @@ class _GalleryScreenState extends State<GalleryScreen>
                       ? const EmptyGallery()
                       : _buildVideoGrid(filteredVideos),
             ),
+
+            // Banner ad at bottom (only for non-pro users)
+            if (_isBannerAdLoaded && _bannerAd != null && !appState.isPro)
+              Container(
+                alignment: Alignment.center,
+                width: _bannerAd!.size.width.toDouble(),
+                height: _bannerAd!.size.height.toDouble(),
+                child: AdWidget(ad: _bannerAd!),
+              ),
           ],
         ),
       ),
