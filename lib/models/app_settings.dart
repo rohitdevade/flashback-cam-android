@@ -6,6 +6,7 @@ class AppSettings {
   final String bitrate;
   final bool stabilization;
   final bool showGrid;
+  final bool hasSeenCameraInstructions;
   final DateTime updatedAt;
 
   AppSettings({
@@ -16,6 +17,7 @@ class AppSettings {
     required this.bitrate,
     required this.stabilization,
     required this.showGrid,
+    required this.hasSeenCameraInstructions,
     required this.updatedAt,
   });
 
@@ -26,6 +28,7 @@ class AppSettings {
         bitrate: 'Auto',
         stabilization: true,
         showGrid: false,
+        hasSeenCameraInstructions: false,
         updatedAt: DateTime.now(),
       );
 
@@ -36,6 +39,8 @@ class AppSettings {
         bitrate: json['bitrate'] as String? ?? 'Auto',
         stabilization: json['stabilization'] as bool? ?? true,
         showGrid: json['showGrid'] as bool? ?? false,
+        hasSeenCameraInstructions:
+            json['hasSeenCameraInstructions'] as bool? ?? false,
         updatedAt: json['updatedAt'] != null
             ? DateTime.parse(json['updatedAt'] as String)
             : DateTime.now(),
@@ -48,6 +53,7 @@ class AppSettings {
         'bitrate': bitrate,
         'stabilization': stabilization,
         'showGrid': showGrid,
+        'hasSeenCameraInstructions': hasSeenCameraInstructions,
         'updatedAt': updatedAt.toIso8601String(),
       };
 
@@ -58,6 +64,7 @@ class AppSettings {
     String? bitrate,
     bool? stabilization,
     bool? showGrid,
+    bool? hasSeenCameraInstructions,
     DateTime? updatedAt,
   }) =>
       AppSettings(
@@ -67,6 +74,8 @@ class AppSettings {
         bitrate: bitrate ?? this.bitrate,
         stabilization: stabilization ?? this.stabilization,
         showGrid: showGrid ?? this.showGrid,
+        hasSeenCameraInstructions:
+            hasSeenCameraInstructions ?? this.hasSeenCameraInstructions,
         updatedAt: updatedAt ?? this.updatedAt,
       );
 }

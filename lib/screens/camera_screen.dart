@@ -9,6 +9,7 @@ import 'package:flashback_cam/widgets/mode_chip.dart';
 import 'package:flashback_cam/widgets/record_button.dart';
 import 'package:flashback_cam/widgets/video_thumbnail.dart';
 import 'package:flashback_cam/widgets/debug_info_panel.dart';
+import 'package:flashback_cam/widgets/camera_instructions_overlay.dart';
 import 'package:flashback_cam/screens/gallery_screen.dart';
 import 'package:flashback_cam/screens/settings_screen.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -24,11 +25,68 @@ class _CameraScreenState extends State<CameraScreen> {
   double _baseZoomLevel = 1.0;
   Map<String, bool> _capabilities = {};
   bool _capabilitiesLoaded = false;
+  bool _showInstructions = false;
+  bool _instructionsChecked = false;
+  bool _lowMemoryWarningShown = false;
 
   @override
   void initState() {
     super.initState();
     _loadCapabilities();
+  }
+
+  /// Check if we should show instructions (only once after AppState is initialized)
+  void _checkShowInstructions(AppState appState) {
+    if (_instructionsChecked) return;
+    if (!appState.isInitialized) return;
+
+    _instructionsChecked = true;
+    if (!appState.hasSeenCameraInstructions) {
+      setState(() => _showInstructions = true);
+    }
+
+    // Check for low memory warning (less than 4GB = 4096MB)
+    _checkLowMemoryWarning(appState);
+  }
+
+  void _checkLowMemoryWarning(AppState appState) {
+    if (_lowMemoryWarningShown) return;
+
+    final deviceCaps = appState.deviceCapabilities;
+    if (deviceCaps != null && deviceCaps.ramMB < 4096) {
+      _lowMemoryWarningShown = true;
+      // Show warning after a short delay to not overlap with instructions
+      Future.delayed(const Duration(milliseconds: 500), () {
+        if (mounted && !_showInstructions) {
+          _showLowMemoryWarning(deviceCaps.ramMB);
+        }
+      });
+    }
+  }
+
+  void _showLowMemoryWarning(int ramMB) {
+    final ramGB = (ramMB / 1024).toStringAsFixed(1);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            const Icon(Icons.memory, color: Colors.white, size: 20),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                'Low memory detected (${ramGB}GB). For best performance, use shorter buffer times.',
+                style: const TextStyle(fontSize: 13),
+              ),
+            ),
+          ],
+        ),
+        duration: const Duration(seconds: 5),
+        backgroundColor: AppColors.warningOrange,
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.all(16),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      ),
+    );
   }
 
   Future<void> _loadCapabilities() async {
@@ -110,6 +168,9 @@ class _CameraScreenState extends State<CameraScreen> {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final settings = appState.settings;
 
+    // Check if we should show instructions (after AppState is initialized)
+    _checkShowInstructions(appState);
+
     return OrientationBuilder(
       builder: (context, orientation) {
         final isPortraitLayout = orientation == Orientation.portrait;
@@ -174,6 +235,14 @@ class _CameraScreenState extends State<CameraScreen> {
                   child: Center(
                     child: ZoomIndicator(zoom: appState.zoomLevel),
                   ),
+                ),
+              // Camera instructions overlay (shown on first launch)
+              if (_showInstructions)
+                CameraInstructionsOverlay(
+                  onDismiss: () {
+                    setState(() => _showInstructions = false);
+                    appState.markCameraInstructionsSeen();
+                  },
                 ),
             ],
           ),

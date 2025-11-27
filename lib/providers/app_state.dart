@@ -527,6 +527,20 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Mark camera instructions as seen (persisted)
+  Future<void> markCameraInstructionsSeen() async {
+    final currentSettings = _settingsService.settings;
+    if (!currentSettings.hasSeenCameraInstructions) {
+      await updateSettings(
+        currentSettings.copyWith(hasSeenCameraInstructions: true),
+      );
+    }
+  }
+
+  /// Check if user has seen camera instructions
+  bool get hasSeenCameraInstructions =>
+      _settingsService.settings.hasSeenCameraInstructions;
+
   Future<void> updateSettings(AppSettings settings) async {
     final normalizedSettings = settings.copyWith(
       resolution: settings.resolution.toUpperCase(),
@@ -677,6 +691,7 @@ class AppState extends ChangeNotifier {
     _progressTimer?.cancel();
     _cameraService.dispose();
     _adService.dispose();
+    _subscriptionService.dispose();
     super.dispose();
   }
 }

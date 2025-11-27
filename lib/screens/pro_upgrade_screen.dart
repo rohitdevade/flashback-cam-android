@@ -156,7 +156,7 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
             ),
             const SizedBox(height: 12),
             Text(
-              'Record in 4K60, 30s pre-roll, no ads\nPremium features & more',
+              'Record in 4K & 60fps*, 30s pre-roll, no ads\n*Device support required',
               style: Theme.of(context).textTheme.bodyLarge?.copyWith(
                     color: Colors.white.withValues(alpha: 0.9),
                     height: 1.4,
@@ -174,12 +174,12 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
       {
         'icon': Icons.video_settings,
         'title': '4K Recording',
-        'desc': 'Ultra-HD video capture'
+        'desc': 'Ultra-HD video (device support required)'
       },
       {
         'icon': Icons.speed,
         'title': '60 FPS',
-        'desc': 'Buttery smooth playback'
+        'desc': 'Smooth playback (device support required)'
       },
       {
         'icon': Icons.history,
@@ -284,6 +284,13 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
   }
 
   Widget _buildPricingSection() {
+    final appState = context.watch<AppState>();
+    final subscriptionService = appState.subscriptionService;
+
+    final monthlyProduct = subscriptionService.getProductDetails('monthly');
+    final yearlyProduct = subscriptionService.getProductDetails('yearly');
+    final lifetimeProduct = subscriptionService.getProductDetails('lifetime');
+
     return Column(
       children: [
         Text(
@@ -298,7 +305,7 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
         _buildPricingCard(
           tier: 'monthly',
           label: 'Monthly',
-          price: '\$3.00',
+          price: monthlyProduct?.price ?? 'Loading...',
           period: 'per month',
           originalPrice: null,
         ),
@@ -306,9 +313,9 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
         _buildPricingCard(
           tier: 'yearly',
           label: 'Yearly',
-          price: '\$8.00',
+          price: yearlyProduct?.price ?? 'Loading...',
           period: 'per year',
-          originalPrice: '\$36.00',
+          originalPrice: null,
           badge: 'SAVE 78%',
           isPopular: true,
         ),
@@ -316,7 +323,7 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
         _buildPricingCard(
           tier: 'lifetime',
           label: 'Lifetime',
-          price: '\$15.00',
+          price: lifetimeProduct?.price ?? 'Loading...',
           period: 'one-time payment',
           originalPrice: null,
           badge: 'BEST VALUE',

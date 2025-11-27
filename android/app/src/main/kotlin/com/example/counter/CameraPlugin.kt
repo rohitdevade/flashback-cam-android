@@ -670,13 +670,42 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
     private fun selectFpsRange(targetFps: Int): Range<Int> {
         val available = cameraCharacteristics?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
         if (available.isNullOrEmpty()) {
+            Log.w(TAG, "No FPS ranges available, using default [$targetFps, $targetFps]")
             return Range(targetFps, targetFps)
         }
-        return available.minByOrNull { range ->
+        
+        Log.d(TAG, "Available FPS ranges: ${available.joinToString { "[${it.lower}, ${it.upper}]" }}")
+        
+        // For 60fps, we need a range that has upper bound >= 60
+        // Prefer fixed ranges [60,60] or ranges that allow 60fps like [30,60]
+        if (targetFps == 60) {
+            // First try to find [60, 60] fixed range
+            val fixed60 = available.find { it.lower == 60 && it.upper == 60 }
+            if (fixed60 != null) {
+                Log.d(TAG, "Found fixed 60fps range: [${fixed60.lower}, ${fixed60.upper}]")
+                return fixed60
+            }
+            
+            // Next try any range where upper >= 60 (like [30, 60])
+            val rangeWith60 = available.filter { it.upper >= 60 }
+                .minByOrNull { it.upper - it.lower } // Prefer narrower ranges
+            if (rangeWith60 != null) {
+                Log.d(TAG, "Found range supporting 60fps: [${rangeWith60.lower}, ${rangeWith60.upper}]")
+                return rangeWith60
+            }
+            
+            Log.w(TAG, "No 60fps range found! Using best available range")
+        }
+        
+        // For 30fps or fallback, find the best matching range
+        val bestRange = available.minByOrNull { range ->
             val clamped = targetFps.coerceIn(range.lower, range.upper)
             val delta = abs(clamped - targetFps)
             (delta * 100) + (range.upper - range.lower)
         } ?: Range(targetFps, targetFps)
+        
+        Log.d(TAG, "Selected FPS range: [${bestRange.lower}, ${bestRange.upper}] for target $targetFps")
+        return bestRange
     }
 
     private fun createCameraPreviewSession() {
@@ -1048,22 +1077,23 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
     private fun buildVideoEncoderCandidateSettings(): List<VideoEncoderSettings> {
         val candidates = mutableListOf<VideoEncoderSettings>()
         val totalRamMb = getTotalRamMb()
-        val shouldForceSafeProfile = totalRamMb <= 6144 || currentRamTier != "high"
-
-        if (!shouldForceSafeProfile) {
-            createVideoEncoderSettings(
-                resolutionLabel = currentResolution,
-                fps = currentFps,
-                codec = currentCodec,
-                isFallback = false
-            )?.let { candidates.add(it) }
-        } else {
-            Log.i(
-                TAG,
-                "[Fallback] Forcing safe profile on ${totalRamMb}MB / $currentRamTier-tier device"
-            )
+        
+        // Always try the user's requested settings first
+        // Only use fallback if the primary fails
+        Log.d(TAG, "[VideoEncoder] Building candidates for: ${currentResolution}@${currentFps}fps, RAM: ${totalRamMb}MB")
+        
+        // Primary: User's selected settings
+        createVideoEncoderSettings(
+            resolutionLabel = currentResolution,
+            fps = currentFps,
+            codec = currentCodec,
+            isFallback = false
+        )?.let { 
+            candidates.add(it)
+            Log.d(TAG, "[VideoEncoder] Primary candidate: ${it.summary}")
         }
 
+        // Fallback: Safe settings (but preserve FPS if supported)
         candidates.add(buildSafeFallbackVideoSettings())
         return candidates
     }
@@ -1082,13 +1112,19 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
     }
 
     private fun determineBitRate(label: String, width: Int, height: Int): Int {
-        return when (label.uppercase(Locale.US)) {
+        // Base bitrate for 30fps
+        val baseBitrate = when (label.uppercase(Locale.US)) {
             "4K", "2160P" -> 45_000_000
             "1440P" -> 24_000_000
             "1080P" -> 12_000_000
             "720P" -> 6_000_000
             else -> (width * height * 4.5).toInt() // rough fallback
         }
+        // Increase bitrate for 60fps (roughly 1.5-2x more data)
+        val fpsFactor = if (currentFps >= 60) 1.8 else 1.0
+        val finalBitrate = (baseBitrate * fpsFactor).toInt()
+        Log.d(TAG, "[VideoEncoder] Bitrate: ${finalBitrate / 1_000_000}Mbps for ${label}@${currentFps}fps")
+        return finalBitrate
     }
 
     private fun buildSafeFallbackVideoSettings(): VideoEncoderSettings {
@@ -1098,9 +1134,12 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
             supportedResolutions.contains("720P") -> "720P"
             else -> supportedResolutions.lastOrNull() ?: "720P"
         }
-        val fps = if (currentFps >= 30) 30 else currentFps
+        // Preserve user's FPS choice - only fallback resolution, not FPS
+        // If 60fps fails, we'll fall back to 30fps in a subsequent candidate
+        val fps = if (currentFps > 0) currentFps else 30
+        Log.d(TAG, "[VideoEncoder] Fallback candidate: ${fallbackRes}@${fps}fps")
         return createVideoEncoderSettings(fallbackRes, fps, "H.264", true)
-            ?: VideoEncoderSettings(1920, 1080, 30, 12_000_000, "H.264", MediaFormat.MIMETYPE_VIDEO_AVC, true)
+            ?: VideoEncoderSettings(1920, 1080, currentFps.coerceIn(24, 60), 12_000_000, "H.264", MediaFormat.MIMETYPE_VIDEO_AVC, true)
     }
 
     private fun resolutionLabelToSize(label: String): Pair<Int, Int>? {
@@ -2486,23 +2525,33 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
             
             setOutputFile(liveRecordingFile!!.absolutePath)
             
-            // Configure video
+            // Configure video - increase bitrate for 60fps to prevent quality loss
+            val bitrateFactor = if (currentFps >= 60) 2.0 else 1.0
             when (currentResolution) {
                 "4K" -> {
                     setVideoSize(3840, 2160)
-                    setVideoEncodingBitRate(50_000_000)
+                    setVideoEncodingBitRate((50_000_000 * bitrateFactor).toInt())
                 }
                 "1080P" -> {
                     setVideoSize(1920, 1080)
-                    setVideoEncodingBitRate(10_000_000)
+                    // 60fps needs higher bitrate: 20Mbps instead of 10Mbps
+                    setVideoEncodingBitRate((10_000_000 * bitrateFactor).toInt())
                 }
                 else -> {
                     setVideoSize(1920, 1080)
-                    setVideoEncodingBitRate(8_000_000)
+                    setVideoEncodingBitRate((8_000_000 * bitrateFactor).toInt())
                 }
             }
             
+            // CRITICAL: Set frame rate before encoder
             setVideoFrameRate(currentFps)
+            
+            // For 60fps, also set capture rate to ensure proper timing
+            if (currentFps >= 60) {
+                setCaptureRate(currentFps.toDouble())
+                Log.d(TAG, "Set capture rate to $currentFps for high framerate recording")
+            }
+            
             setVideoEncoder(MediaRecorder.VideoEncoder.H264)
             
             // Configure audio
@@ -2513,7 +2562,7 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
             prepare()
         }
         
-        Log.d(TAG, "MediaRecorder configured with audio and surface: ${liveRecordingFile!!.absolutePath}")
+        Log.d(TAG, "MediaRecorder configured: ${currentResolution}@${currentFps}fps, file: ${liveRecordingFile!!.absolutePath}")
     }
 
     private fun createRecordingSession() {
@@ -2559,10 +2608,10 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                     // Configure capture request
                     builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                     
-                    // Set FPS range for recording
-                    val fpsRange = android.util.Range(currentFps, currentFps)
+                    // Set FPS range for recording - use the proper selected range
+                    val fpsRange = selectFpsRange(currentFps)
                     builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
-                    Log.d(TAG, "Recording FPS range set to: $fpsRange")
+                    Log.d(TAG, "Recording FPS range set to: [${fpsRange.lower}, ${fpsRange.upper}] for target $currentFps fps")
                     
                     if (stabilizationEnabled) {
                         builder.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, 
@@ -2899,6 +2948,13 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                 captureSession?.close()
                 captureSession = null
                 
+                // If FPS or resolution changed, we need to re-initialize the video encoder
+                if (fpsChanged || resolutionChanged) {
+                    Log.d(TAG, "⚙️ FPS/Resolution changed - reinitializing video encoder for ${currentResolution}@${currentFps}fps")
+                    releaseVideoEncoder()
+                    initializeVideoEncoder()
+                }
+                
                 // Recreate the appropriate session based on current mode
                 if (isBuffering) {
                     Log.d(TAG, "Recreating buffer preview session with new FPS: $currentFps, videoDeltaUs: ${videoDeltaUs}µs")
@@ -2967,15 +3023,60 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
             
             Log.d(TAG, "Normal FPS ranges: ${normalFpsRanges?.joinToString { "[${it.lower}, ${it.upper}]" }}")
             
-            // Check 60fps support
+            // Check 60fps support - look for ranges where upper bound is at least 60
+            // A range like [60,60] or [30,60] indicates 60fps support
             val has60fpsRange = normalFpsRanges?.any { range ->
-                range.upper >= 60 && range.lower <= 60
+                range.upper >= 60
             } ?: false
             
-            var supports1080p60fps = supports1080p && has60fpsRange
-            var supports4K60fps = supports4K && has60fpsRange
+            // Also check high-speed video sizes for 60fps support
+            val highSpeedSizes = try {
+                streamConfigMap.highSpeedVideoSizes?.toList() ?: emptyList()
+            } catch (e: Exception) {
+                emptyList()
+            }
             
-            // Additional verification with MediaRecorder
+            val highSpeedFpsRanges1080p = try {
+                val size1080p = android.util.Size(1920, 1080)
+                if (highSpeedSizes.any { it.width == 1920 && it.height == 1080 }) {
+                    streamConfigMap.getHighSpeedVideoFpsRangesFor(size1080p)?.toList() ?: emptyList()
+                } else {
+                    emptyList()
+                }
+            } catch (e: Exception) {
+                emptyList()
+            }
+            
+            val highSpeedFpsRanges4K = try {
+                val size4K = android.util.Size(3840, 2160)
+                if (highSpeedSizes.any { it.width == 3840 && it.height == 2160 }) {
+                    streamConfigMap.getHighSpeedVideoFpsRangesFor(size4K)?.toList() ?: emptyList()
+                } else {
+                    emptyList()
+                }
+            } catch (e: Exception) {
+                emptyList()
+            }
+            
+            Log.d(TAG, "High-speed video sizes: ${highSpeedSizes.joinToString { "${it.width}x${it.height}" }}")
+            Log.d(TAG, "High-speed 1080p FPS ranges: ${highSpeedFpsRanges1080p.joinToString { "[${it.lower}, ${it.upper}]" }}")
+            Log.d(TAG, "High-speed 4K FPS ranges: ${highSpeedFpsRanges4K.joinToString { "[${it.lower}, ${it.upper}]" }}")
+            
+            // Determine 60fps support for each resolution
+            // ONLY check normal FPS ranges - high-speed capture requires a different API
+            // that we don't support yet. High-speed ranges are logged for reference only.
+            // Device must have 60fps in NORMAL capture mode, not just high-speed mode.
+            val supports1080p60fpsFromRanges = has60fpsRange
+            val supports4K60fpsFromRanges = has60fpsRange
+            
+            Log.d(TAG, "60fps from normal ranges: $has60fpsRange (high-speed only NOT counted)")
+            Log.d(TAG, "High-speed 1080p has 60fps: ${highSpeedFpsRanges1080p.any { it.upper >= 60 }} (requires constrainedHighSpeedCaptureSession)")
+            Log.d(TAG, "High-speed 4K has 60fps: ${highSpeedFpsRanges4K.any { it.upper >= 60 }} (requires constrainedHighSpeedCaptureSession)")
+            
+            var supports1080p60fps = supports1080p && supports1080p60fpsFromRanges
+            var supports4K60fps = supports4K && supports4K60fpsFromRanges
+            
+            // Additional verification with MediaCodec capabilities
             if (supports1080p60fps) {
                 supports1080p60fps = checkMediaRecorderSupport(1920, 1080, 60)
             }
@@ -2991,7 +3092,8 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                 "supports1080p30fps" to supports1080p
             )
             
-            Log.d(TAG, "✅ Final capabilities: $capabilities")
+            Log.d(TAG, "✅ Final capabilities (normal capture mode only): $capabilities")
+            Log.d(TAG, "   Note: High-speed capture (120fps+) requires different API and is not supported")
             result.success(capabilities)
             
         } catch (e: Exception) {
@@ -3007,25 +3109,53 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
 
     private fun checkMediaRecorderSupport(width: Int, height: Int, fps: Int): Boolean {
         return try {
-            val recorder = MediaRecorder()
-            recorder.setVideoSource(MediaRecorder.VideoSource.CAMERA)
-            recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-            recorder.setVideoSize(width, height)
-            recorder.setVideoFrameRate(fps)
-            recorder.setVideoEncodingBitRate(width * height * fps / 10)
+            // For 60fps, check if the ENCODER can handle it
+            // Note: Camera FPS capability is checked separately via normal FPS ranges
+            // High-speed profiles are NOT used since they require constrainedHighSpeedCaptureSession
+            if (fps == 60) {
+                // Skip high-speed profile check - we don't support high-speed capture mode
+                // Only check MediaCodec encoder capabilities
+                val codecSupports60fps = try {
+                    val codecList = android.media.MediaCodecList(android.media.MediaCodecList.REGULAR_CODECS)
+                    val mimeType = "video/avc" // H.264
+                    var supports = false
+                    
+                    for (codecInfo in codecList.codecInfos) {
+                        if (!codecInfo.isEncoder) continue
+                        
+                        try {
+                            val capabilities = codecInfo.getCapabilitiesForType(mimeType)
+                            val videoCapabilities = capabilities.videoCapabilities
+                            
+                            if (videoCapabilities != null) {
+                                // Check if this resolution and framerate is supported
+                                val supportedFrameRates = videoCapabilities.getSupportedFrameRatesFor(width, height)
+                                if (supportedFrameRates != null && supportedFrameRates.upper >= fps) {
+                                    Log.d(TAG, "✅ ${codecInfo.name} supports ${width}x${height}@${fps}fps (range: ${supportedFrameRates.lower}-${supportedFrameRates.upper})")
+                                    supports = true
+                                    break
+                                }
+                            }
+                        } catch (e: Exception) {
+                            // This codec doesn't support the mime type
+                            continue
+                        }
+                    }
+                    supports
+                } catch (e: Exception) {
+                    Log.w(TAG, "MediaCodec capability check failed: ${e.message}")
+                    false
+                }
+                
+                Log.d(TAG, "60fps encoder check for ${width}x${height}: codecSupports=$codecSupports60fps")
+                Log.d(TAG, "Note: Camera must also support 60fps in NORMAL mode (not high-speed) for this to work")
+                return codecSupports60fps
+            }
             
-            val tempFile = File.createTempFile("test", ".mp4", context.cacheDir)
-            recorder.setOutputFile(tempFile.absolutePath)
-            
-            recorder.prepare()
-            recorder.release()
-            tempFile.delete()
-            
-            Log.d(TAG, "✅ MediaRecorder supports ${width}x${height}@${fps}fps")
+            // For 30fps, just check basic support
             true
         } catch (e: Exception) {
-            Log.w(TAG, "❌ MediaRecorder test failed for ${width}x${height}@${fps}fps: ${e.message}")
+            Log.w(TAG, "❌ Capability test failed for ${width}x${height}@${fps}fps: ${e.message}")
             false
         }
     }
@@ -3121,15 +3251,18 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
         val ranges = characteristics?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
         val fpsSet = sortedSetOf<Int>()
 
+        Log.d(TAG, "[FPS Detection] Raw FPS ranges from device: ${ranges?.joinToString { "[${it.lower}, ${it.upper}]" }}")
+
         ranges?.forEach { range ->
-            listOf(range.lower, range.upper).forEach { fps ->
-                val normalizedFps = if (fps >= 240 && fps % 1000 == 0) fps / 1000 else fps
-                when {
-                    normalizedFps >= 120 -> fpsSet.add(120)
-                    normalizedFps >= 60 -> fpsSet.add(60)
-                    normalizedFps >= 30 -> fpsSet.add(30)
-                    normalizedFps >= 24 -> fpsSet.add(24)
+            // Add exact upper FPS value if it's in common recording values
+            val upperFps = range.upper
+            when {
+                upperFps >= 60 -> {
+                    fpsSet.add(60)
+                    if (upperFps >= 120) fpsSet.add(120)
                 }
+                upperFps >= 30 -> fpsSet.add(30)
+                upperFps >= 24 -> fpsSet.add(24)
             }
         }
 
@@ -3137,6 +3270,7 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
             fpsSet.add(30)
         }
 
+        Log.d(TAG, "[FPS Detection] Supported FPS values: $fpsSet")
         return fpsSet.toList()
     }
 
@@ -3216,6 +3350,8 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
         val downgradeReasons = mutableListOf<String>()
         val characteristics = ensureCameraCharacteristics()
         val supportedResolutions = collectSupportedResolutions(characteristics)
+        
+        Log.d(TAG, "📊 [CaptureProfile] Requested: ${requestedResolution}@${requestedFps}fps, RAM: ${totalRamMb}MB ($ramTier tier)")
         val supportedFpsValues = collectSupportedFps(characteristics)
         val supportedCodecs = collectSupportedCodecs()
 
@@ -3249,12 +3385,13 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
             ?: sortedFps.lastOrNull()
             ?: 30
 
+        Log.d(TAG, "📊 [CaptureProfile] FPS: requested=$requestedFpsSanitized, supported=$sortedFps, resolved=$resolvedFps")
+
+        // Don't limit FPS based on RAM tier - let the user choose
+        // The encoder will handle it or fallback if needed
+        // Only log warnings for potential issues
         if (ramTier == "low" && resolvedFps > 30) {
-            downgradeReasons.add("FPS limited to 30 for $ramTier-tier device")
-            resolvedFps = 30
-        } else if (ramTier == "mid" && resolvedFps > 60) {
-            downgradeReasons.add("FPS limited to 60 for mid-tier device")
-            resolvedFps = 60
+            Log.w(TAG, "⚠️ High FPS ($resolvedFps) on low-tier device may affect performance")
         }
 
         if (!supportedFpsValues.contains(requestedFpsSanitized) && resolvedFps != requestedFpsSanitized) {

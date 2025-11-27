@@ -6,6 +6,7 @@ import 'package:flashback_cam/models/app_settings.dart';
 import 'package:flashback_cam/theme.dart';
 import 'package:flashback_cam/screens/pro_upgrade_screen.dart';
 import 'package:flashback_cam/widgets/glass_container.dart';
+import 'package:flashback_cam/widgets/camera_instructions_overlay.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -125,13 +126,6 @@ class _SettingsScreenState extends State<SettingsScreen>
 
           const SizedBox(height: 32),
 
-          // Device Capabilities Section
-          _buildSectionHeader('Device Capabilities'),
-          const SizedBox(height: 16),
-          _buildDeviceCapabilitiesSection(context, appState),
-
-          const SizedBox(height: 32),
-
           // Pro Plan Section
           _buildSectionHeader('Pro Plan'),
           const SizedBox(height: 16),
@@ -139,7 +133,15 @@ class _SettingsScreenState extends State<SettingsScreen>
 
           const SizedBox(height: 32),
 
-          // Device & Diagnostics Section
+          // Device Capabilities Section (debug mode only)
+          if (_showDeveloperOptions) ...[
+            _buildSectionHeader('Device Capabilities'),
+            const SizedBox(height: 16),
+            _buildDeviceCapabilitiesSection(context, appState),
+            const SizedBox(height: 32),
+          ],
+
+          // Device & Diagnostics Section (debug mode only)
           if (_showDeveloperOptions && appState.deviceCapabilities != null) ...[
             _buildSectionHeader('Device & Diagnostics'),
             const SizedBox(height: 16),
@@ -307,7 +309,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                       Text(
                         isPro
                             ? 'All features unlocked • No ads'
-                            : 'Limited to 1080p • 10s buffer • Ads',
+                            : 'Limited to 1080p 30fps • 10s buffer • Ads',
                         style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                               color: AppColors.textSecondary,
                             ),
@@ -606,6 +608,13 @@ class _SettingsScreenState extends State<SettingsScreen>
       padding: const EdgeInsets.all(0),
       child: Column(
         children: [
+          _buildSettingTile(
+            icon: Icons.help_outline,
+            title: 'How It Works',
+            subtitle: 'Learn how to use Flashback Cam',
+            onTap: () => _showHowItWorks(context),
+          ),
+          const Divider(height: 1, color: AppColors.glassBorder),
           _buildSettingTile(
             icon: Icons.privacy_tip_outlined,
             title: 'Privacy Policy',
@@ -1012,49 +1021,316 @@ class _SettingsScreenState extends State<SettingsScreen>
     );
   }
 
-  void _showInfo(BuildContext context, String title) {
+  void _showHowItWorks(BuildContext context) {
     showDialog(
       context: context,
+      barrierColor: Colors.black87,
       builder: (context) => Dialog(
         backgroundColor: Colors.transparent,
-        child: GlassContainer(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(
-                Icons.info_outline,
-                color: AppColors.electricBlue,
-                size: 48,
-              ),
-              const SizedBox(height: 16),
-              Text(
-                title,
-                style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                      color: AppColors.textPrimary,
-                      fontWeight: FontWeight.w600,
-                    ),
-              ),
-              const SizedBox(height: 12),
-              Text(
-                'This would open the $title in a web view or external browser.',
-                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      color: AppColors.textSecondary,
-                    ),
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 24),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  onPressed: () => Navigator.pop(context),
-                  child: const Text('Close'),
-                ),
-              ),
-            ],
-          ),
+        insetPadding: const EdgeInsets.all(16),
+        child: CameraInstructionsOverlay(
+          onDismiss: () => Navigator.pop(context),
         ),
       ),
+    );
+  }
+
+  void _showInfo(BuildContext context, String title) {
+    if (title == 'Privacy Policy') {
+      _showPrivacyPolicy(context);
+    } else if (title == 'Terms of Service') {
+      _showTermsOfService(context);
+    }
+  }
+
+  void _showPrivacyPolicy(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: AppColors.deepCharcoal,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) => DraggableScrollableSheet(
+        initialChildSize: 0.9,
+        minChildSize: 0.5,
+        maxChildSize: 0.95,
+        expand: false,
+        builder: (context, scrollController) => Column(
+          children: [
+            // Handle bar
+            Container(
+              margin: const EdgeInsets.only(top: 12),
+              width: 40,
+              height: 4,
+              decoration: BoxDecoration(
+                color: AppColors.glassBorder,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            // Header
+            Padding(
+              padding: const EdgeInsets.all(20),
+              child: Row(
+                children: [
+                  Icon(Icons.privacy_tip, color: AppColors.electricBlue),
+                  const SizedBox(width: 12),
+                  Text(
+                    'Privacy Policy',
+                    style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                          color: AppColors.textPrimary,
+                          fontWeight: FontWeight.w700,
+                        ),
+                  ),
+                  const Spacer(),
+                  IconButton(
+                    onPressed: () => Navigator.pop(context),
+                    icon:
+                        const Icon(Icons.close, color: AppColors.textSecondary),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1, color: AppColors.glassBorder),
+            // Content
+            Expanded(
+              child: SingleChildScrollView(
+                controller: scrollController,
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _buildPolicyHeader('PRIVACY POLICY — Flashback Cam'),
+                    const SizedBox(height: 8),
+                    _buildPolicyText('Last Updated: 2025/28/11'),
+                    _buildPolicyText('Developer: Roch Enterprises'),
+                    _buildPolicyText('App Name: Flashback Cam'),
+                    _buildPolicyText(
+                        'Contact Email: contact@rochenterprises.in'),
+                    const SizedBox(height: 24),
+                    _buildPolicySection('1. Introduction'),
+                    _buildPolicyText(
+                        'Flashback Cam ("we", "our", "us") is a video recording application developed by Roch Enterprises. This Privacy Policy explains what information we collect, how we use it, how it is protected, and your rights as a user.\n\nBy using Flashback Cam, you agree to the practices described in this Privacy Policy.'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('2. Information We Collect'),
+                    _buildPolicySubsection('2.1 Camera & Microphone'),
+                    _buildPolicyText(
+                        'The app requires access to:\n• Your device camera to capture video\n• Your microphone to record audio\n\nWe do not collect, store, or upload any photos or videos to our servers. All recordings stay on your device only.'),
+                    const SizedBox(height: 12),
+                    _buildPolicySubsection('2.2 Device Information'),
+                    _buildPolicyText(
+                        'We may collect non-personal, technical information such as:\n• Device model\n• Operating system version\n• App version\n• Crash logs\n• Performance analytics\n\nThis data is used solely to improve app stability and performance.'),
+                    const SizedBox(height: 12),
+                    _buildPolicySubsection('2.3 Usage Data'),
+                    _buildPolicyText(
+                        'We may collect anonymous usage data, including:\n• Feature usage (buffer time, recording duration, etc.)\n• App interactions\n• Subscription activity (Pro/Free status)\n\nThis data is anonymous and cannot identify you.'),
+                    const SizedBox(height: 12),
+                    _buildPolicySubsection('2.4 Ads Data (AdMob)'),
+                    _buildPolicyText(
+                        'Flashback Cam uses Google AdMob, which may collect:\n• Advertising ID\n• Approximate location\n• Device information\n• App interactions\n• Analytics for ad performance\n\nAdMob operates under Google\'s Privacy Policy:\nhttps://policies.google.com/privacy'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('3. How We Use Your Information'),
+                    _buildPolicyText(
+                        'We use collected data to:\n• Provide camera and recording functionality\n• Process videos locally on your device\n• Improve app performance\n• Fix crashes and bugs\n• Show personalized or non-personalized ads (AdMob)\n• Manage subscription status\n\nWe do not sell or trade your personal data.'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('4. Data Storage & Security'),
+                    _buildPolicyText(
+                        '• We do not upload your photos or videos to any server.\n• All recordings remain locally stored on your device.\n• Analytics and crash data are securely processed through Google services.'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('5. Data Sharing'),
+                    _buildPolicyText(
+                        'We do not share your data with third parties, except:\n• Google AdMob (for ads)\n• Google Play Billing (for purchases)\n• Firebase/Google (for crash logs & analytics, if enabled)\n\nWe never sell your information.'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('6. Children\'s Privacy'),
+                    _buildPolicyText(
+                        'Flashback Cam is not intended for children under 13. We do not knowingly collect personal data from minors.'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('7. Permissions Explained'),
+                    _buildPolicyText(
+                        'Flashback Cam requests the following permissions:\n\n📷 Camera\nTo show camera preview and record videos.\n\n🎤 Microphone\nTo record audio for your videos.\n\n💾 Storage / Media Access\nTo save videos and show them in the gallery.\n\n🌐 Internet\nUsed only for:\n• Loading ads\n• Verifying subscriptions\n• Crash analytics\n\nFlashback Cam never records secretly and stops recording when the device is locked.'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('8. Subscription & Purchases'),
+                    _buildPolicyText(
+                        'Flashback Cam offers optional Pro subscriptions. All payments are processed securely by Google Play Billing.\n\nWe do not store your payment details.'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('9. Changes to This Policy'),
+                    _buildPolicyText(
+                        'We may update this Privacy Policy occasionally. If changes are significant, we will notify you within the app.'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('10. Contact Us'),
+                    _buildPolicyText(
+                        'For questions or concerns:\n\n📧 Email: contact@rochenterprises.in\n🏢 Developer: Roch Enterprises'),
+                    const SizedBox(height: 40),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showTermsOfService(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: AppColors.deepCharcoal,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) => DraggableScrollableSheet(
+        initialChildSize: 0.9,
+        minChildSize: 0.5,
+        maxChildSize: 0.95,
+        expand: false,
+        builder: (context, scrollController) => Column(
+          children: [
+            // Handle bar
+            Container(
+              margin: const EdgeInsets.only(top: 12),
+              width: 40,
+              height: 4,
+              decoration: BoxDecoration(
+                color: AppColors.glassBorder,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            // Header
+            Padding(
+              padding: const EdgeInsets.all(20),
+              child: Row(
+                children: [
+                  Icon(Icons.description_outlined,
+                      color: AppColors.electricBlue),
+                  const SizedBox(width: 12),
+                  Text(
+                    'Terms of Service',
+                    style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                          color: AppColors.textPrimary,
+                          fontWeight: FontWeight.w700,
+                        ),
+                  ),
+                  const Spacer(),
+                  IconButton(
+                    onPressed: () => Navigator.pop(context),
+                    icon:
+                        const Icon(Icons.close, color: AppColors.textSecondary),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1, color: AppColors.glassBorder),
+            // Content
+            Expanded(
+              child: SingleChildScrollView(
+                controller: scrollController,
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _buildPolicyHeader('TERMS OF SERVICE — Flashback Cam'),
+                    const SizedBox(height: 8),
+                    _buildPolicyText('Last Updated: 2025/28/11'),
+                    _buildPolicyText('Developer: Roch Enterprises'),
+                    const SizedBox(height: 24),
+                    _buildPolicySection('1. Acceptance of Terms'),
+                    _buildPolicyText(
+                        'By downloading or using Flashback Cam, you agree to these Terms of Service.\nIf you do not agree, please uninstall the app immediately.'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('2. Use of the App'),
+                    _buildPolicyText(
+                        'You agree to:\n• Use the app only for lawful purposes\n• Not attempt to reverse engineer or modify the app\n• Not record individuals without consent (where required by law)\n• Not exploit any loopholes or misuse app features'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('3. User Content'),
+                    _buildPolicyText(
+                        'All videos you record using Flashback Cam:\n• Remain your property\n• Are stored only on your device\n• Are not uploaded or transmitted by us\n\nWe are not responsible for loss of user data.'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('4. Pro Subscription'),
+                    _buildPolicyText(
+                        'Flashback Cam offers optional Pro features:\n• Higher resolutions (up to device capability)\n• No ads\n• Extended buffer\n• Faster processing\n• Lifetime unlock'),
+                    const SizedBox(height: 12),
+                    _buildPolicySubsection('Billing & Refunds'),
+                    _buildPolicyText(
+                        '• Payments are processed by Google Play\n• We do not manage refunds directly\n• Users may request refunds through Google Play support\n• Subscription auto-renews unless canceled'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('5. App Updates'),
+                    _buildPolicyText(
+                        'We may update or modify features at any time.\nUpdates may:\n• Add features\n• Improve performance\n• Fix issues\n• Remove deprecated or unsafe functions\n\nYou agree to use the most current version of the app.'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('6. Device Compatibility'),
+                    _buildPolicyText(
+                        'Flashback Cam supports devices based on:\n• Hardware capability\n• Camera support\n• Operating system version\n• Google Play policies\n\nSome features (like 1080p/4K/60fps) depend on device hardware.'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('7. Limitation of Liability'),
+                    _buildPolicyText(
+                        'Roch Enterprises is not liable for:\n• Data loss\n• Device issues caused by hardware limitations\n• Improper usage\n• Recording done without consent\n• Any damage resulting from misuse\n\nUse the app at your own risk.'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('8. Prohibited Activities'),
+                    _buildPolicyText(
+                        'You must not:\n• Use the app for unlawful surveillance\n• Circumvent subscription or licensing checks\n• Modify or redistribute the app illegally\n• Misuse buffer or background behavior to violate others\' privacy\n\nDoing so may result in termination of your rights to use the app.'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('9. Termination'),
+                    _buildPolicyText(
+                        'We may suspend access if you:\n• Abuse the app\n• Attempt fraud\n• Tamper with subscriptions\n• Violate laws'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('10. Contact Information'),
+                    _buildPolicyText(
+                        'For legal or support queries:\n\n📧 Email: contact@rochenterprises.in\n🏢 Developer: Roch Enterprises'),
+                    const SizedBox(height: 40),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPolicyHeader(String text) {
+    return Text(
+      text,
+      style: Theme.of(context).textTheme.titleLarge?.copyWith(
+            color: AppColors.electricBlue,
+            fontWeight: FontWeight.w700,
+          ),
+    );
+  }
+
+  Widget _buildPolicySection(String text) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Text(
+        text,
+        style: Theme.of(context).textTheme.titleMedium?.copyWith(
+              color: AppColors.textPrimary,
+              fontWeight: FontWeight.w600,
+            ),
+      ),
+    );
+  }
+
+  Widget _buildPolicySubsection(String text) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Text(
+        text,
+        style: Theme.of(context).textTheme.titleSmall?.copyWith(
+              color: AppColors.electricBlue.withOpacity(0.9),
+              fontWeight: FontWeight.w500,
+            ),
+      ),
+    );
+  }
+
+  Widget _buildPolicyText(String text) {
+    return Text(
+      text,
+      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+            color: AppColors.textSecondary,
+            height: 1.6,
+          ),
     );
   }
 
@@ -1100,6 +1376,9 @@ class _SettingsScreenState extends State<SettingsScreen>
 
   void _showLifetimeUpgradeDialog(BuildContext context, AppState appState) {
     final currentTier = appState.subscriptionService.currentUser.proTier;
+    final lifetimeProduct =
+        appState.subscriptionService.getProductDetails('lifetime');
+    final lifetimePrice = lifetimeProduct?.price ?? 'Loading...';
 
     showDialog(
       context: context,
@@ -1146,7 +1425,7 @@ class _SettingsScreenState extends State<SettingsScreen>
               ),
               const SizedBox(height: 12),
               Text(
-                'Switch from your ${currentTier?.toLowerCase()} plan to lifetime access for just \$15.00.',
+                'Switch from your ${currentTier?.toLowerCase()} plan to lifetime access for just $lifetimePrice.',
                 style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                       color: AppColors.textSecondary,
                       height: 1.4,
