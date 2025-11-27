@@ -1,0 +1,3522 @@
+package com.mycompany.CounterApp
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.content.Context
+import android.app.ActivityManager
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.ImageFormat
+import android.graphics.SurfaceTexture
+import android.hardware.camera2.*
+import android.hardware.camera2.params.StreamConfigurationMap
+import android.hardware.display.DisplayManager
+import android.location.Location
+import android.media.Image
+import android.media.ImageReader
+import android.media.MediaRecorder
+import android.media.MediaMuxer
+import android.media.MediaCodec
+import android.media.MediaCodecList
+import android.media.MediaFormat
+import android.media.MediaCodecInfo
+import android.media.MediaMetadataRetriever
+import android.media.AudioRecord
+import android.media.AudioFormat as AndroidAudioFormat
+import android.media.MediaScannerConnection
+import java.nio.ByteBuffer
+import java.util.concurrent.ArrayBlockingQueue
+import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.Looper
+import android.util.Log
+import android.util.Range
+import android.util.SparseIntArray
+import android.util.Size
+import android.view.Surface
+import android.view.Display
+import android.view.WindowManager
+import androidx.core.app.ActivityCompat
+import io.flutter.embedding.engine.plugins.FlutterPlugin
+import io.flutter.plugin.common.EventChannel
+import io.flutter.plugin.common.MethodCall
+import io.flutter.plugin.common.MethodChannel
+import io.flutter.view.TextureRegistry
+import java.io.File
+import java.io.IOException
+import java.util.*
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
+import kotlin.collections.HashMap
+import kotlin.math.abs
+import kotlin.math.max
+
+// Data class to hold encoded samples in the buffer
+data class EncodedSample(
+    val data: ByteArray,
+    val info: MediaCodec.BufferInfo,
+    val isVideo: Boolean,
+    val globalPtsUs: Long
+) {
+    // Create a copy of BufferInfo to avoid reference issues
+    fun getBufferInfoCopy(): MediaCodec.BufferInfo {
+        val copy = MediaCodec.BufferInfo()
+        copy.set(info.offset, info.size, globalPtsUs, info.flags)
+        return copy
+    }
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+        other as EncodedSample
+        return data.contentEquals(other.data) && isVideo == other.isVideo
+    }
+    
+    override fun hashCode(): Int {
+        var result = data.contentHashCode()
+        result = 31 * result + isVideo.hashCode()
+        return result
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIMPLE ROLLING BUFFER - Keeps last N seconds of encoded samples
+// ═══════════════════════════════════════════════════════════════════════════════
+class RollingMediaBuffer(private var maxDurationUs: Long) {
+    private val samples = LinkedList<EncodedSample>()
+    
+    @Synchronized
+    fun addSample(sample: EncodedSample) {
+        samples.offer(sample)
+        
+        // Trim old samples to maintain time window
+        while (samples.size > 1) {
+            val oldestPts = samples.first.globalPtsUs
+            val newestPts = samples.last.globalPtsUs
+            val durationUs = newestPts - oldestPts
+            
+            if (durationUs > maxDurationUs) {
+                samples.poll() // Remove oldest
+            } else {
+                break
+            }
+        }
+    }
+    
+    @Synchronized
+    fun getSnapshot(): List<EncodedSample> {
+        return samples.toList()
+    }
+    
+    @Synchronized
+    fun clear() {
+        samples.clear()
+    }
+    
+    @Synchronized
+    fun getSampleCount(): Int = samples.size
+    
+    @Synchronized
+    fun getDurationSeconds(): Double {
+        if (samples.size < 2) return 0.0
+        val oldestPts = samples.first.globalPtsUs
+        val newestPts = samples.last.globalPtsUs
+        return (newestPts - oldestPts) / 1_000_000.0
+    }
+    
+    @Synchronized
+    fun getVideoSampleCount(): Int = samples.count { it.isVideo }
+    
+    @Synchronized
+    fun getAudioSampleCount(): Int = samples.count { !it.isVideo }
+    
+    @Synchronized
+    fun updateMaxDuration(newMaxDurationUs: Long) {
+        maxDurationUs = newMaxDurationUs
+    }
+}
+
+class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChannel.StreamHandler {
+    private val TAG = "CameraPlugin"
+    
+    private lateinit var channel: MethodChannel
+    private lateinit var eventChannel: EventChannel
+    private var eventSink: EventChannel.EventSink? = null
+    private lateinit var context: Context
+    private lateinit var textureRegistry: TextureRegistry
+    
+    // Camera components
+    private var cameraManager: CameraManager? = null
+    private var cameraCharacteristics: CameraCharacteristics? = null
+    private var cameraDevice: CameraDevice? = null
+    private var captureSession: CameraCaptureSession? = null
+    private var backgroundThread: HandlerThread? = null
+    private var backgroundHandler: Handler? = null
+    private val cameraOpenCloseLock = Semaphore(1)
+    
+    // Recording components
+    private var mediaRecorder: MediaRecorder? = null
+    private var previewRequestBuilder: CaptureRequest.Builder? = null
+    private var previewRequest: CaptureRequest? = null
+    private var isRecording = false
+    private var isBuffering = false
+    
+    // Preview components
+    private var previewSize = Size(1920, 1080) // Will be updated based on resolution
+    private var textureEntry: TextureRegistry.SurfaceTextureEntry? = null
+    private var previewSurface: Surface? = null
+    private var activeFpsRange: Range<Int>? = null
+    
+    // Continuous Pre-roll Buffer System with MediaCodec
+    // ═══════════════════════════════════════════════════════════════════════
+    // SYNCHRONIZATION STRATEGY:
+    // - Video and audio encoders are created during buffer initialization
+    // - Both encoders are configured but NOT started during initialization
+    // - Both encoders start TOGETHER when camera session is configured
+    // - This ensures frame-accurate A/V sync across ALL resolutions and FPS
+    // - Timestamps are captured using nowUs() for consistent timing
+    // - Works with any resolution (720P, 1080P, 4K), any FPS (30, 60, etc.)
+    // - Works with zoom enabled/disabled - sync is maintained
+    // ═══════════════════════════════════════════════════════════════════════
+    private var videoEncoder: MediaCodec? = null
+    private var audioEncoder: MediaCodec? = null
+    private var audioRecord: AudioRecord? = null
+    private var videoEncoderSurface: Surface? = null
+    private val rollingBuffer = RollingMediaBuffer(5_000_000L) // 5 seconds in microseconds (default)
+    private var encoderThread: HandlerThread? = null
+    private var encoderHandler: Handler? = null
+    private var audioThread: HandlerThread? = null
+    private var audioHandler: Handler? = null
+    private var bufferLoggingTimer: Timer? = null
+    private var selectedBufferSeconds = 5 // User-selected buffer duration (default 5s)
+    private var isAudioCapturing = false
+    private var activeCaptureProfile: CaptureProfile? = null
+    
+    // Device orientation at recording time (for video metadata only, not preview)
+    private var recordingOrientation: Int = 0
+    
+    // Track formats for muxing later
+    private var videoFormat: MediaFormat? = null
+    private var audioFormat: MediaFormat? = null
+    
+    // Recording with pre-roll - single muxer approach
+    private var recordingMuxer: MediaMuxer? = null
+    private var recordingVideoTrack: Int = -1
+    private var recordingAudioTrack: Int = -1
+    private var prerollWritten = false
+    private var recordingBasePtsUs: Long = -1
+    private var recordingStartTimeUs: Long = -1  // Timestamp when recording was initiated
+    private var lastPrerollVideoPts: Long = -1  // Last video PTS written in pre-roll
+    private var lastPrerollAudioPts: Long = -1  // Last audio PTS written in pre-roll
+    private var currentOutputFile: File? = null
+    private var liveVideoSampleCount: Int = 0  // Counter for live video samples written
+    private var liveAudioSampleCount: Int = 0  // Counter for live audio samples written
+    
+    // CRITICAL: FPS-dependent timing constants
+    private var videoDeltaUs: Long = 33333L // Microseconds per frame (default 30fps, updated based on currentFps)
+    private val audioDeltaUs: Long = 23220L // Microseconds per audio frame (constant for 44.1kHz AAC)
+    
+    // Settings and state
+    private var isProUser = false
+    private var bufferDurationMs: Long = 5000
+    private var isBufferInitialized = false
+    private var currentRamTier: String = "mid"
+    private var currentBufferMode: String = "ram"
+    private var usingFallbackVideoProfile: Boolean = false
+    private var activeVideoEncoderSettings: VideoEncoderSettings? = null
+    private val minValidFileBytes: Long = 50L * 1024L
+    
+    // Legacy buffer management (keeping for UI indicators)
+    private var bufferImageReader: ImageReader? = null
+    private val bufferFrames = LinkedList<ByteArray>()
+    private val maxBufferFrames = 30 // For UI indicators
+    private var bufferSeconds = 0
+    private val bufferTimer = Timer()
+    private var bufferUpdateTask: TimerTask? = null
+
+    private fun nowUs(): Long = System.nanoTime() / 1000
+    
+    /**
+     * Updates videoDeltaUs based on currentFps.
+     * CRITICAL for proper video timing at different frame rates.
+     * Must be called whenever currentFps changes.
+     */
+    private fun updateVideoDelta() {
+        val fps = if (currentFps > 0) currentFps else 30
+        videoDeltaUs = 1_000_000L / fps.toLong()
+        Log.d(TAG, "🎬 Video delta updated: ${videoDeltaUs}µs per frame (${fps} fps)")
+    }
+    
+    // Settings
+    private var currentResolution = "1080P"
+    private var currentFps = 30
+    private var currentCodec = "H.264"
+    private var preRollSeconds = 3
+    private var stabilizationEnabled = true
+    private var flashMode = "off"
+    private var cameraFacing = CameraCharacteristics.LENS_FACING_BACK
+    
+    // Zoom
+    private var currentZoomLevel = 1.0f
+    private var maxZoom = 1.0f
+    private var minZoom = 1.0f
+    
+    // Current recording info
+    private var currentRecordingId: String? = null
+    private var recordingStartTime: Long = 0
+    private var liveRecordingFile: File? = null
+    private var pendingBufferFile: File? = null // Temporary file holding buffered samples
+
+    override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
+        context = flutterPluginBinding.applicationContext
+        textureRegistry = flutterPluginBinding.textureRegistry
+        
+        channel = MethodChannel(flutterPluginBinding.binaryMessenger, "flashback_cam/camera")
+        channel.setMethodCallHandler(this)
+        
+        eventChannel = EventChannel(flutterPluginBinding.binaryMessenger, "flashback_cam/camera_events")
+        eventChannel.setStreamHandler(this)
+        
+        cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        
+        Log.d(TAG, "CameraPlugin attached")
+    }
+
+    override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        channel.setMethodCallHandler(null)
+        eventChannel.setStreamHandler(null)
+        dispose()
+    }
+
+    override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+        eventSink = events
+        Log.d(TAG, "Event sink connected")
+    }
+
+    override fun onCancel(arguments: Any?) {
+        eventSink = null
+        Log.d(TAG, "Event sink disconnected")
+    }
+
+    override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
+        Log.d(TAG, "Method call received: ${call.method}")
+        
+        when (call.method) {
+            "initialize" -> initialize(call, result)
+            "createPreview" -> createPreview(result)
+            "disposePreview" -> disposePreview(call, result)
+            "startPreview" -> startPreview(result)
+            "startBuffer" -> startBuffer(result)
+            "stopBuffer" -> stopBuffer(result)
+            "startRecording" -> startRecording(result)
+            "stopRecording" -> stopRecording(result)
+            "switchCamera" -> switchCamera(result)
+            "setFlashMode" -> setFlashMode(call, result)
+            "setZoom" -> setZoom(call, result)
+            "getMaxZoom" -> getMaxZoom(result)
+            "updateSettings" -> updateSettings(call, result)
+            "updateSubscription" -> updateSubscription(call, result)
+            "getDeviceCapabilities" -> getDeviceCapabilities(result)
+            "checkDetailedCapabilities" -> checkDetailedCapabilities(result)
+            "dispose" -> {
+                dispose()
+                result.success(null)
+            }
+            else -> result.notImplemented()
+        }
+    }
+
+    private fun initialize(call: MethodCall, result: MethodChannel.Result) {
+        try {
+            currentResolution = call.argument<String>("resolution") ?: "1080P"
+            currentFps = call.argument<Int>("fps") ?: 30
+            currentCodec = call.argument<String>("codec") ?: "H.264"
+            preRollSeconds = call.argument<Int>("preRollSeconds") ?: 3
+            stabilizationEnabled = call.argument<Boolean>("stabilization") ?: true
+
+            // CRITICAL: Update video delta based on FPS
+            updateVideoDelta()
+
+            applyCaptureProfileFromCurrentState()
+            updatePreviewDefaults()
+            Log.d(TAG, "Initialized with resolution: $currentResolution, FPS: $currentFps, Preview size: ${previewSize.width}x${previewSize.height}, videoDeltaUs: ${videoDeltaUs}µs")
+            
+            startBackgroundThread()
+            openCamera()
+            
+            // Don't return success immediately - let camera open first
+            // The openCamera callback will handle session creation
+            result.success(null)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to initialize camera", e)
+            result.error("INIT_ERROR", "Failed to initialize camera: ${e.message}", null)
+        }
+    }
+
+    private fun createPreview(result: MethodChannel.Result) {
+        try {
+            textureEntry = textureRegistry.createSurfaceTexture()
+            val surfaceTexture = textureEntry!!.surfaceTexture()
+            surfaceTexture.setDefaultBufferSize(previewSize.width, previewSize.height)
+            previewSurface = Surface(surfaceTexture)
+            
+            Log.d(TAG, "Camera preview created with texture ID: ${textureEntry!!.id()}")
+            result.success(textureEntry!!.id())
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create preview", e)
+            result.error("PREVIEW_ERROR", "Failed to create preview: ${e.message}", null)
+        }
+    }
+
+    private fun startPreview(result: MethodChannel.Result) {
+        try {
+            // If preview session already exists, just update it
+            if (captureSession != null) {
+                updatePreview()
+                Log.d(TAG, "Preview restarted (session exists)")
+                result.success(null)
+                return
+            }
+            
+            // If camera device exists but no session, create one
+            if (cameraDevice != null && previewSurface != null) {
+                Log.d(TAG, "Creating preview session...")
+                createCameraPreviewSession()
+                
+                // Wait a bit for session to configure
+                backgroundHandler?.postDelayed({
+                    if (captureSession != null) {
+                        Log.d(TAG, "Preview started successfully")
+                        result.success(null)
+                    } else {
+                        Log.w(TAG, "Preview session still not ready after wait")
+                        result.success(null) // Don't fail, session will be ready soon
+                    }
+                }, 300)
+            } else {
+                Log.w(TAG, "Cannot start preview: camera=${cameraDevice != null}, surface=${previewSurface != null}")
+                // Don't fail if camera is still opening, it will auto-start preview
+                result.success(null)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start preview", e)
+            result.error("PREVIEW_ERROR", "Failed to start preview: ${e.message}", null)
+        }
+    }
+
+    private fun createBufferPreviewSession() {
+        try {
+            val camera = cameraDevice ?: return
+            val surfaces = mutableListOf<Surface>()
+            
+            // Add preview surface for display
+            previewSurface?.let { 
+                surfaces.add(it) 
+                Log.d(TAG, "Added preview surface to buffer session")
+            }
+            
+            // Add video encoder surface for continuous encoding
+            videoEncoderSurface?.let {
+                surfaces.add(it)
+                Log.d(TAG, "Added video encoder surface to buffer session")
+            }
+            
+            // Add buffer surface for UI indicators (legacy)
+            bufferImageReader?.surface?.let { 
+                surfaces.add(it)
+                Log.d(TAG, "Added buffer surface to buffer session")
+            }
+            
+            camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(session: CameraCaptureSession) {
+                    captureSession = session
+                    
+                    previewRequestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+                    previewSurface?.let { previewRequestBuilder?.addTarget(it) }
+                    videoEncoderSurface?.let {
+                        previewRequestBuilder?.addTarget(it)
+                        Log.d(TAG, "Added video encoder surface to preview request")
+                    }
+                    bufferImageReader?.surface?.let {
+                        previewRequestBuilder?.addTarget(it)
+                        Log.d(TAG, "Added buffer surface to preview request")
+                    }
+
+                    previewRequestBuilder?.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                    val fpsRange = activeFpsRange ?: Range(currentFps, currentFps)
+                    previewRequestBuilder?.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
+                    Log.d(TAG, "Set FPS range to: $fpsRange")
+                    if (stabilizationEnabled) {
+                        previewRequestBuilder?.set(
+                            CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                            CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                        )
+                    }
+
+                    // Apply current zoom level if not at default
+                    if (currentZoomLevel > 1.0f) {
+                        val characteristics = cameraCharacteristics
+                        val sensorArraySize = characteristics?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                        if (sensorArraySize != null) {
+                            val cropWidth = sensorArraySize.width() / currentZoomLevel
+                            val cropHeight = sensorArraySize.height() / currentZoomLevel
+                            val cropLeft = ((sensorArraySize.width() - cropWidth) / 2).toInt()
+                            val cropTop = ((sensorArraySize.height() - cropHeight) / 2).toInt()
+                            val cropRegion = android.graphics.Rect(
+                                cropLeft,
+                                cropTop,
+                                (cropLeft + cropWidth).toInt(),
+                                (cropTop + cropHeight).toInt()
+                            )
+                            previewRequestBuilder?.set(CaptureRequest.SCALER_CROP_REGION, cropRegion)
+                            Log.d(TAG, "🔍 Applied zoom level $currentZoomLevel to buffer session, cropRegion=$cropRegion")
+                        }
+                    }
+
+                    previewRequest = previewRequestBuilder?.build()
+                    previewRequest?.let { session.setRepeatingRequest(it, null, backgroundHandler) }
+                    
+                    // ⚠️ CRITICAL: Start BOTH video and audio encoders together AFTER session is configured!
+                    // This ensures perfect A/V sync across all resolutions and FPS settings
+                    val syncStartTimeUs = nowUs()
+                    Log.d(TAG, "🎬 ═══ STARTING ENCODERS TOGETHER ═══")
+                    Log.d(TAG, "🎬 Sync timestamp: ${syncStartTimeUs}µs (resolution: $currentResolution, fps: $currentFps)")
+                    
+                    // Start video encoder
+                    if (videoEncoder != null && videoEncoderSurface != null) {
+                        try {
+                            val encoder = videoEncoder
+                            if (encoder != null) {
+                                try {
+                                    encoder.start()
+                                    encoderHandler?.post { drainVideoEncoderLoop() }
+                                    Log.d(TAG, "🎬 ✅ Video encoder STARTED")
+                                } catch (e: IllegalStateException) {
+                                    // Encoder already started, just continue draining
+                                    Log.d(TAG, "🎬 Video encoder already running, continuing")
+                                    encoderHandler?.post { drainVideoEncoderLoop() }
+                                }
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "❌ Failed to start video encoder", e)
+                        }
+                    }
+                    
+                    // Start audio encoder and recording simultaneously
+                    if (audioEncoder != null && audioRecord != null) {
+                        try {
+                            // Start audio encoder
+                            audioEncoder?.start()
+                            Log.d(TAG, "🎬 ✅ Audio encoder STARTED")
+                            
+                            // Start audio recording
+                            audioRecord?.startRecording()
+                            val recordingState = audioRecord?.recordingState
+                            Log.d(TAG, "🎬 ✅ AudioRecord started - state: $recordingState")
+                            
+                            if (recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                                isAudioCapturing = true
+                                // Start feeding audio to encoder
+                                audioHandler?.post { feedAudioToEncoder() }
+                                // Start draining audio encoder output
+                                encoderHandler?.post { drainAudioEncoderLoop() }
+                                Log.d(TAG, "🎬 ✅ Audio feed and drain loops started")
+                            } else {
+                                Log.e(TAG, "❌ AudioRecord failed to start recording! State: $recordingState")
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "❌ Failed to start audio encoder", e)
+                        }
+                    }
+                    
+                    Log.d(TAG, "🎬 ═══ ENCODERS STARTED - A/V SYNC LOCKED ═══")
+                    
+                    Log.d(TAG, "Buffer preview session started with continuous encoding")
+                    sendEvent("previewStarted", null)
+                }
+
+                override fun onConfigureFailed(session: CameraCaptureSession) {
+                    Log.e(TAG, "Failed to configure buffer preview session")
+                }
+            }, backgroundHandler)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create buffer preview session", e)
+        }
+    }
+
+    private fun disposePreview(call: MethodCall, result: MethodChannel.Result) {
+        try {
+            previewSurface?.release()
+            previewSurface = null
+            textureEntry?.release()
+            textureEntry = null
+            result.success(null)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to dispose preview", e)
+            result.error("DISPOSE_ERROR", "Failed to dispose preview: ${e.message}", null)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun openCamera() {
+        try {
+            val cameraId = getCameraId()
+            updatePreviewDefaults()
+            if (!cameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) {
+                throw RuntimeException("Time out waiting to lock camera opening.")
+            }
+            
+            cameraManager?.openCamera(cameraId, object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) {
+                    cameraOpenCloseLock.release()
+                    cameraDevice = camera
+                    
+                    // Only create session if preview surface already exists
+                    // Otherwise wait for startPreview() to be called
+                    if (previewSurface != null) {
+                        if (isBuffering) {
+                            createBufferPreviewSession()
+                        } else {
+                            createCameraPreviewSession()
+                        }
+                        Log.d(TAG, "Camera opened - preview session created immediately")
+                    } else {
+                        Log.d(TAG, "Camera opened - waiting for preview surface before creating session")
+                    }
+                }
+
+                override fun onDisconnected(camera: CameraDevice) {
+                    cameraOpenCloseLock.release()
+                    camera.close()
+                    cameraDevice = null
+                    Log.w(TAG, "Camera disconnected")
+                }
+
+                override fun onError(camera: CameraDevice, error: Int) {
+                    cameraOpenCloseLock.release()
+                    camera.close()
+                    cameraDevice = null
+                    Log.e(TAG, "Camera error: $error")
+                }
+            }, backgroundHandler)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to open camera", e)
+        }
+    }
+
+    private fun getCameraId(): String {
+        val cameraManager = this.cameraManager ?: throw IllegalStateException("Camera manager not initialized")
+        
+        for (cameraId in cameraManager.cameraIdList) {
+            val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+            val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
+            if (facing == cameraFacing) {
+                cameraCharacteristics = characteristics
+                initializeZoomCapabilities(characteristics)
+                return cameraId
+            }
+        }
+        val fallbackId = cameraManager.cameraIdList[0]
+        cameraCharacteristics = cameraManager.getCameraCharacteristics(fallbackId)
+        initializeZoomCapabilities(cameraCharacteristics!!)
+        return fallbackId
+    }
+
+    private fun updatePreviewDefaults() {
+        previewSize = selectPreviewSize(currentResolution)
+        activeFpsRange = selectFpsRange(currentFps)
+        applyPreviewSizeToSurface()
+        Log.d(TAG, "Preview defaults -> size: ${previewSize.width}x${previewSize.height}, fpsRange: $activeFpsRange")
+    }
+
+    private fun applyPreviewSizeToSurface() {
+        try {
+            textureEntry?.surfaceTexture()?.setDefaultBufferSize(previewSize.width, previewSize.height)
+        } catch (_: Exception) {
+            // Texture might not exist yet; safe to ignore.
+        }
+    }
+
+    private fun selectPreviewSize(resolution: String): Size {
+        val defaultSize = Size(1920, 1080)
+        val map = cameraCharacteristics?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?: return defaultSize
+        val availableSizes = map.getOutputSizes(SurfaceTexture::class.java) ?: return defaultSize
+        if (availableSizes.isEmpty()) return defaultSize
+        val normalized = resolution.uppercase(Locale.US)
+        val targetSize = when (normalized) {
+            "4K", "UHD" -> Size(3840, 2160)
+            "720P" -> Size(1280, 720)
+            else -> Size(1920, 1080)
+        }
+        val aspectRatio = targetSize.width.toFloat() / targetSize.height.toFloat()
+        val ratioTolerance = 0.02f
+        val ratioMatches = availableSizes.filter { size ->
+            val ratio = size.width.toFloat() / size.height.toFloat()
+            abs(ratio - aspectRatio) <= ratioTolerance
+        }
+        val filtered = if (ratioMatches.isNotEmpty()) ratioMatches else availableSizes.toList()
+        val notBigger = filtered.filter { it.width <= targetSize.width && it.height <= targetSize.height }
+        return when {
+            notBigger.isNotEmpty() -> notBigger.maxByOrNull { it.width * it.height } ?: defaultSize
+            else -> filtered.minByOrNull { abs((it.width * it.height) - (targetSize.width * targetSize.height)) }
+                ?: defaultSize
+        }
+    }
+
+    private fun selectFpsRange(targetFps: Int): Range<Int> {
+        val available = cameraCharacteristics?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+        if (available.isNullOrEmpty()) {
+            return Range(targetFps, targetFps)
+        }
+        return available.minByOrNull { range ->
+            val clamped = targetFps.coerceIn(range.lower, range.upper)
+            val delta = abs(clamped - targetFps)
+            (delta * 100) + (range.upper - range.lower)
+        } ?: Range(targetFps, targetFps)
+    }
+
+    private fun createCameraPreviewSession() {
+        try {
+            val camera = cameraDevice ?: return
+            val surfaces = mutableListOf<Surface>()
+            
+            // Add preview surface
+            previewSurface?.let { 
+                surfaces.add(it)
+                Log.d(TAG, "Added preview surface to session")
+            }
+            
+            // Create buffer ImageReader (not needed since we use encoder)
+            /*bufferImageReader = ImageReader.newInstance(
+                previewSize.width, previewSize.height, 
+                ImageFormat.YUV_420_888, maxBufferFrames
+            )
+            
+            bufferImageReader?.setOnImageAvailableListener({ reader ->
+                val image = reader.acquireLatestImage()
+                image?.let { processBufferFrame(it) }
+            }, backgroundHandler)
+            
+            bufferImageReader?.surface?.let { surfaces.add(it) }*/
+            
+            previewRequestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            surfaces.forEach { previewRequestBuilder?.addTarget(it) }
+            
+            camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(session: CameraCaptureSession) {
+                    captureSession = session
+                    updatePreview()
+                    Log.d(TAG, "Capture session configured successfully with ${surfaces.size} surfaces (preview-only)")
+                }
+
+                override fun onConfigureFailed(session: CameraCaptureSession) {
+                    Log.e(TAG, "Failed to configure capture session")
+                }
+            }, backgroundHandler)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create camera preview session", e)
+        }
+    }
+
+    private fun updatePreview() {
+        try {
+            val session = captureSession ?: return
+            val builder = previewRequestBuilder ?: return
+            
+            // CRITICAL FIX: Ensure encoder surface stays in targets during preview updates
+            if (isBuffering || isRecording) {
+                videoEncoderSurface?.let { 
+                    builder.addTarget(it)
+                    Log.d(TAG, "updatePreview: Ensured video encoder surface is in targets for continuous encoding")
+                }
+            }
+            
+            // Auto focus
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            
+            // Set FPS range for preview to match selected FPS
+            val fpsRange = activeFpsRange ?: Range(currentFps, currentFps)
+            builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
+            Log.d(TAG, "Preview FPS range set to: $fpsRange")
+            
+            // Flash mode
+            when (flashMode) {
+                "on" -> builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
+                "off" -> builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
+            }
+            
+            // Image stabilization
+            if (stabilizationEnabled) {
+                builder.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, 
+                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
+            }
+            
+            // Apply zoom if set
+            if (currentZoomLevel > 1.0f) {
+                val characteristics = cameraCharacteristics
+                val sensorArraySize = characteristics?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                if (sensorArraySize != null) {
+                    val cropWidth = sensorArraySize.width() / currentZoomLevel
+                    val cropHeight = sensorArraySize.height() / currentZoomLevel
+                    val cropLeft = ((sensorArraySize.width() - cropWidth) / 2).toInt()
+                    val cropTop = ((sensorArraySize.height() - cropHeight) / 2).toInt()
+                    
+                    val cropRegion = android.graphics.Rect(
+                        cropLeft,
+                        cropTop,
+                        (cropLeft + cropWidth).toInt(),
+                        (cropTop + cropHeight).toInt()
+                    )
+                    builder.set(CaptureRequest.SCALER_CROP_REGION, cropRegion)
+                }
+            }
+            
+            previewRequest = builder.build()
+            session.setRepeatingRequest(previewRequest!!, null, backgroundHandler)
+            
+            sendEvent("previewStarted", null)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to update preview", e)
+        }
+    }
+
+    private fun processBufferFrame(image: Image) {
+        try {
+            // Convert image to byte array (simplified)
+            val buffer = image.planes[0].buffer
+            val bytes = ByteArray(buffer.remaining())
+            buffer.get(bytes)
+            
+            synchronized(bufferFrames) {
+                bufferFrames.offer(bytes)
+                if (bufferFrames.size > maxBufferFrames) {
+                    bufferFrames.poll()
+                }
+            }
+            
+            image.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to process buffer frame", e)
+            image.close()
+        }
+    }
+
+    private fun startBuffer(result: MethodChannel.Result) {
+        try {
+            if (isBuffering) {
+                result.success(null)
+                return
+            }
+            isBuffering = true
+            bufferSeconds = 0
+
+            activeCaptureProfile?.let {
+                Log.d(
+                    TAG,
+                    "[Buffer] Applying profile -> tier=${it.ramTier}, res=${it.resolution}, fps=${it.fps}, codec=${it.codec}, buffer=${it.bufferSeconds}s, mode=${it.bufferMode}"
+                )
+            }
+            
+            // Initialize continuous pre-roll buffer
+            initializeContinuousBuffer()
+            
+            // Start buffer timer - this creates the animated buffer ring
+            bufferUpdateTask?.cancel()
+            bufferUpdateTask = object : TimerTask() {
+                override fun run() {
+                    if (isBuffering) {
+                        bufferSeconds++
+                        sendEvent("bufferUpdate", mapOf(
+                            "seconds" to bufferSeconds,
+                            "isBuffering" to true,
+                            "bufferDuration" to (bufferDurationMs / 1000).toInt()
+                        ))
+                    }
+                }
+            }
+            bufferTimer.schedule(bufferUpdateTask, 1000, 1000)
+            
+            result.success(null)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start buffer", e)
+            result.error("BUFFER_ERROR", "Failed to start buffer: ${e.message}", null)
+        }
+    }
+    
+    private fun initializeContinuousBuffer() {
+        try {
+            if (isBufferInitialized) {
+                Log.d(TAG, "Buffer already initialized; skipping re-init")
+                return
+            }
+            // Use preRollSeconds from settings as selectedBufferSeconds
+            selectedBufferSeconds = preRollSeconds
+            val bufferDurationUs = (selectedBufferSeconds * 1_000_000).toLong()
+            
+            Log.d(TAG, "🎬 ═══════════ INITIALIZING BUFFER ═══════════")
+            Log.d(TAG, "   Target buffer duration: ${selectedBufferSeconds}s (${bufferDurationUs}us)")
+            
+            // Update rolling buffer max duration
+            rollingBuffer.updateMaxDuration(bufferDurationUs)
+            rollingBuffer.clear()
+            
+            // Create encoder thread
+            encoderThread = HandlerThread("EncoderThread").apply { start() }
+            encoderHandler = Handler(encoderThread!!.looper)
+            
+            // Initialize video encoder
+            Log.d(TAG, "   Initializing video encoder...")
+            initializeVideoEncoder()
+            
+            // Initialize audio encoder
+            Log.d(TAG, "   Initializing audio encoder...")
+            initializeAudioEncoder()
+            
+            // Start buffer monitoring with periodic logging
+            startBufferMonitoring()
+            
+            isBufferInitialized = true
+            
+            Log.d(TAG, "✅ Buffer initialized with encoders")
+            Log.d(TAG, "   videoEncoder: ${if (videoEncoder != null) "ready" else "FAILED"}")
+            Log.d(TAG, "   audioEncoder: ${if (audioEncoder != null) "ready" else "FAILED"}")
+            Log.d(TAG, "   videoEncoderSurface: ${if (videoEncoderSurface != null) "created" else "FAILED"}")
+            Log.d(TAG, "══════════════════════════════════════════════")
+            
+            // 🔍 CRITICAL: If camera is already open, close and recreate session with encoder surface
+            if (cameraDevice != null && videoEncoderSurface != null) {
+                Log.d(TAG, "⚠️ Camera already open! Closing current session and recreating with encoder surface...")
+                
+                backgroundHandler?.post {
+                    try {
+                        // Close existing session
+                        captureSession?.close()
+                        captureSession = null
+                        
+                        // Wait a moment for cleanup
+                        Thread.sleep(100)
+                        
+                        // Recreate with encoder surface included
+                        createBufferPreviewSession()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "❌ Error recreating session", e)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Failed to initialize continuous buffer", e)
+            e.printStackTrace()
+        }
+    }
+
+    private fun shutdownContinuousBuffer() {
+        try {
+            if (!isBufferInitialized) {
+                rollingBuffer.clear()
+                return
+            }
+
+            Log.d(TAG, "Shutting down continuous buffer and encoders")
+            isBufferInitialized = false
+            rollingBuffer.clear()
+            bufferLoggingTimer?.cancel()
+            bufferLoggingTimer = null
+
+            // Stop audio capture first so encoder stops receiving data
+            isAudioCapturing = false
+            
+            // Wait for threads to finish processing
+            Thread.sleep(100)
+            
+            try {
+                audioRecord?.let {
+                    if (it.state == AudioRecord.STATE_INITIALIZED) {
+                        it.stop()
+                    }
+                    it.release()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to stop AudioRecord", e)
+            } finally {
+                audioRecord = null
+            }
+
+            try {
+                audioEncoder?.let {
+                    try {
+                        it.stop()
+                    } catch (_: IllegalStateException) {
+                        // Encoder may already be stopped
+                    }
+                    it.release()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to release audio encoder", e)
+            } finally {
+                audioEncoder = null
+                audioFormat = null  // Reset format for next cycle
+            }
+
+            try {
+                videoEncoder?.let {
+                    try {
+                        it.stop()
+                    } catch (_: IllegalStateException) {
+                        // Encoder may already be stopped
+                    }
+                    it.release()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to release video encoder", e)
+            } finally {
+                videoEncoder = null
+                videoFormat = null  // Reset format for next cycle
+            }
+
+            try {
+                videoEncoderSurface?.release()
+            } catch (_: Exception) {
+                // Surface may already be released
+            }
+            videoEncoderSurface = null
+
+            // Properly quit threads and wait for them to finish
+            encoderThread?.quitSafely()
+            encoderThread?.join(500)  // Wait up to 500ms for thread to finish
+            encoderThread = null
+            encoderHandler = null
+
+            audioThread?.quitSafely()
+            audioThread?.join(500)  // Wait up to 500ms for thread to finish
+            audioThread = null
+            audioHandler = null
+
+            audioDrainCount = 0
+            audioFeedCount = 0
+            liveVideoSampleCount = 0
+            liveAudioSampleCount = 0
+
+            Log.d(TAG, "Continuous buffer stopped and threads cleaned up")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to shut down buffer", e)
+        }
+    }
+    
+    private fun initializeVideoEncoder() {
+        try {
+            val candidates = buildVideoEncoderCandidateSettings()
+            var configured = false
+            usingFallbackVideoProfile = false
+
+            for ((index, settings) in candidates.withIndex()) {
+                try {
+                    releaseVideoEncoder()
+                    configureVideoEncoder(settings)
+                    usingFallbackVideoProfile = settings.isFallback
+                    activeVideoEncoderSettings = settings
+                    configured = true
+                    Log.i(
+                        TAG,
+                        "[Record] using format: container=MP4, videoCodec=${settings.codec}, audioCodec=AAC, width=${settings.width}, height=${settings.height}, fps=${settings.fps}, bitrate=${settings.bitRate / 1_000_000}Mbps"
+                    )
+                    if (settings.isFallback && index > 0) {
+                        Log.w(TAG, "[Fallback] High-profile encoder failed, using safe profile ${settings.summary}")
+                    }
+                    break
+                } catch (e: Exception) {
+                    Log.e(TAG, "[VideoEncoder] Failed to configure (${settings.summary})", e)
+                }
+            }
+
+            if (!configured) {
+                throw IllegalStateException("Unable to configure video encoder with any profile")
+            }
+            
+            Log.d(TAG, "🎬 Video encoder created, surface ready. Encoder state: CONFIGURED (not started yet)")
+            Log.d(TAG, "   Waiting for camera session to include this surface before starting encoder...")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to initialize video encoder", e)
+        }
+    }
+
+    private fun buildVideoEncoderCandidateSettings(): List<VideoEncoderSettings> {
+        val candidates = mutableListOf<VideoEncoderSettings>()
+        val totalRamMb = getTotalRamMb()
+        val shouldForceSafeProfile = totalRamMb <= 6144 || currentRamTier != "high"
+
+        if (!shouldForceSafeProfile) {
+            createVideoEncoderSettings(
+                resolutionLabel = currentResolution,
+                fps = currentFps,
+                codec = currentCodec,
+                isFallback = false
+            )?.let { candidates.add(it) }
+        } else {
+            Log.i(
+                TAG,
+                "[Fallback] Forcing safe profile on ${totalRamMb}MB / $currentRamTier-tier device"
+            )
+        }
+
+        candidates.add(buildSafeFallbackVideoSettings())
+        return candidates
+    }
+
+    private fun createVideoEncoderSettings(
+        resolutionLabel: String,
+        fps: Int,
+        codec: String,
+        isFallback: Boolean
+    ): VideoEncoderSettings? {
+        val (width, height) = resolutionLabelToSize(resolutionLabel) ?: return null
+        val bitRate = determineBitRate(resolutionLabel, width, height)
+        val sanitizedFps = if (fps > 0) fps else 30
+        val mimeType = codecToMime(codec)
+        return VideoEncoderSettings(width, height, sanitizedFps, bitRate, codec, mimeType, isFallback)
+    }
+
+    private fun determineBitRate(label: String, width: Int, height: Int): Int {
+        return when (label.uppercase(Locale.US)) {
+            "4K", "2160P" -> 45_000_000
+            "1440P" -> 24_000_000
+            "1080P" -> 12_000_000
+            "720P" -> 6_000_000
+            else -> (width * height * 4.5).toInt() // rough fallback
+        }
+    }
+
+    private fun buildSafeFallbackVideoSettings(): VideoEncoderSettings {
+        val supportedResolutions = ensureCameraCharacteristics()?.let { collectSupportedResolutions(it) } ?: emptyList()
+        val fallbackRes = when {
+            supportedResolutions.contains("1080P") -> "1080P"
+            supportedResolutions.contains("720P") -> "720P"
+            else -> supportedResolutions.lastOrNull() ?: "720P"
+        }
+        val fps = if (currentFps >= 30) 30 else currentFps
+        return createVideoEncoderSettings(fallbackRes, fps, "H.264", true)
+            ?: VideoEncoderSettings(1920, 1080, 30, 12_000_000, "H.264", MediaFormat.MIMETYPE_VIDEO_AVC, true)
+    }
+
+    private fun resolutionLabelToSize(label: String): Pair<Int, Int>? {
+        return when (label.uppercase(Locale.US)) {
+            "4K", "2160P" -> 3840 to 2160
+            "1440P" -> 2560 to 1440
+            "1080P" -> 1920 to 1080
+            "720P" -> 1280 to 720
+            else -> 1920 to 1080
+        }
+    }
+
+    private fun codecToMime(codec: String): String {
+        return if (codec.equals("HEVC", ignoreCase = true)) {
+            MediaFormat.MIMETYPE_VIDEO_HEVC
+        } else {
+            MediaFormat.MIMETYPE_VIDEO_AVC
+        }
+    }
+
+    private fun configureVideoEncoder(settings: VideoEncoderSettings) {
+        val format = MediaFormat.createVideoFormat(settings.mimeType, settings.width, settings.height).apply {
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            setInteger(MediaFormat.KEY_BIT_RATE, settings.bitRate)
+            setInteger(MediaFormat.KEY_FRAME_RATE, settings.fps)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+        }
+
+        videoEncoder = MediaCodec.createEncoderByType(settings.mimeType)
+        videoEncoder?.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        videoEncoderSurface = videoEncoder?.createInputSurface()
+        Log.d(TAG, "Video encoder config: ${settings.summary}")
+    }
+
+    private fun releaseVideoEncoder() {
+        try {
+            videoEncoderSurface?.release()
+        } catch (_: Exception) {
+        }
+        videoEncoderSurface = null
+        try {
+            videoEncoder?.stop()
+        } catch (_: Exception) {
+        }
+        try {
+            videoEncoder?.release()
+        } catch (_: Exception) {
+        }
+        videoEncoder = null
+    }
+    
+    private fun initializeAudioEncoder() {
+        try {
+            Log.d(TAG, "[Audio Init] Starting audio encoder initialization...")
+            
+            // Check microphone permission first
+            if (ActivityCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                Log.e(TAG, "❌ Microphone permission not granted, cannot initialize audio encoder")
+                return
+            }
+            
+            // Ensure any previous instances are cleaned up
+            audioRecord?.release()
+            audioRecord = null
+            audioEncoder?.release()
+            audioEncoder = null
+            audioFormat = null
+            
+            val sampleRate = 44100
+            val channelCount = 1 // Mono
+            val channelConfig = AndroidAudioFormat.CHANNEL_IN_MONO
+            val audioEncoding = AndroidAudioFormat.ENCODING_PCM_16BIT
+            
+            // Calculate buffer size
+            val minBufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioEncoding)
+            if (minBufferSize == AudioRecord.ERROR || minBufferSize == AudioRecord.ERROR_BAD_VALUE) {
+                Log.e(TAG, "❌ AudioRecord.getMinBufferSize failed: $minBufferSize")
+                return
+            }
+            val bufferSize = minBufferSize * 2
+            Log.d(TAG, "[Audio Init] Buffer size calculated: $bufferSize bytes (min=$minBufferSize)")
+            
+            // Create AudioRecord
+            audioRecord = AudioRecord(
+                android.media.MediaRecorder.AudioSource.MIC,
+                sampleRate,
+                channelConfig,
+                audioEncoding,
+                bufferSize
+            )
+            
+            // Validate AudioRecord initialization
+            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                Log.e(TAG, "❌ AudioRecord failed to initialize! State: ${audioRecord?.state}")
+                audioRecord?.release()
+                audioRecord = null
+                return
+            }
+            
+            Log.d(TAG, "✅ AudioRecord initialized successfully")
+            
+            // Create audio format - simplified configuration
+            val audioFormat = MediaFormat.createAudioFormat(
+                MediaFormat.MIMETYPE_AUDIO_AAC,
+                sampleRate,
+                channelCount
+            ).apply {
+                setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+                setInteger(MediaFormat.KEY_BIT_RATE, 64000) // 64 kbps
+            }
+            
+            // Create and configure audio encoder
+            val codecList = MediaCodecList(MediaCodecList.ALL_CODECS)
+            val codecInfo = codecList.findEncoderForFormat(audioFormat)
+            Log.d(TAG, "Selected audio codec: $codecInfo")
+            
+            audioEncoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+            Log.d(TAG, "✅ Audio encoder created: ${audioEncoder?.name}")
+            audioEncoder?.configure(audioFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            Log.d(TAG, "✅ Audio encoder configured (not started yet)")
+            
+            // Store the audio format for later muxing
+            this.audioFormat = audioFormat
+            
+            Log.d(TAG, "✅ Audio encoder created and configured")
+            
+            // Start audio capture thread - ensure old thread is completely gone
+            if (audioThread != null) {
+                Log.w(TAG, "[Audio Init] ⚠️ Audio thread still exists, cleaning up first...")
+                audioThread?.quitSafely()
+                audioThread?.join(500)
+                audioThread = null
+                audioHandler = null
+            }
+            
+            audioThread = HandlerThread("AudioCaptureThread").apply { start() }
+            audioHandler = Handler(audioThread!!.looper)
+            Log.d(TAG, "[Audio Init] ✅ Audio capture thread created")
+            
+            // Reset counters
+            audioFeedCount = 0
+            audioDrainCount = 0
+            
+            // Don't start recording yet - wait for camera session to be ready
+            Log.d(TAG, "[Audio Init] ⏸️ Audio encoder ready but not started - waiting for camera session")
+            
+            Log.d(TAG, "✅ Audio encoder initialized: ${sampleRate}Hz mono AAC")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to initialize audio encoder", e)
+        }
+    }
+    
+    private var audioFeedCount = 0
+    private var audioDrainCount = 0
+    
+    private fun feedAudioToEncoder() {
+        try {
+            val encoder = audioEncoder ?: return
+            val recorder = audioRecord ?: return
+            
+            // ALWAYS capture audio to buffer (both during idle and recording)
+            if (!isAudioCapturing) {
+                audioHandler?.postDelayed({ feedAudioToEncoder() }, 100)
+                return
+            }
+            
+            if (audioFeedCount == 0 || audioFeedCount % 50 == 0) {
+                Log.d(TAG, "[Audio Feed] Attempt #$audioFeedCount - AudioRecord state: ${recorder.recordingState}")
+            }
+            
+            val inputBufferId = encoder.dequeueInputBuffer(0) // Non-blocking
+            if (inputBufferId >= 0) {
+                val inputBuffer = encoder.getInputBuffer(inputBufferId)
+                if (inputBuffer != null) {
+                    inputBuffer.clear()
+                    val readBytes = recorder.read(inputBuffer, inputBuffer.capacity())
+                    
+                    if (readBytes > 0) {
+                        val presentationTimeUs = nowUs()
+                        encoder.queueInputBuffer(inputBufferId, 0, readBytes, presentationTimeUs, 0)
+                        
+                        audioFeedCount++
+                        if (audioFeedCount <= 5 || audioFeedCount % 100 == 0) {
+                            Log.d(TAG, "[Audio Feed] ✅ #$audioFeedCount: $readBytes bytes read, PTS=${presentationTimeUs}µs")
+                        }
+                    } else {
+                        encoder.queueInputBuffer(inputBufferId, 0, 0, 0, 0)
+                        if (audioFeedCount < 10) {
+                            Log.w(TAG, "[Audio Feed] ⚠️ AudioRecord.read returned $readBytes bytes (no data available)")
+                        }
+                    }
+                } else {
+                    Log.w(TAG, "[Audio Feed] ⚠️ Could not get input buffer $inputBufferId")
+                }
+            } else {
+                if (audioFeedCount < 10) {
+                    Log.w(TAG, "[Audio Feed] ⚠️ No input buffer available from encoder (result: $inputBufferId)")
+                }
+            }
+            
+            // Continue feeding if still capturing
+            if (isAudioCapturing) {
+                audioHandler?.post { feedAudioToEncoder() }
+            }
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "[Audio Feed] ❌ Exception in feedAudioToEncoder", e)
+            if (isAudioCapturing) {
+                audioHandler?.postDelayed({ feedAudioToEncoder() }, 100)
+            }
+        }
+    }
+    
+    private fun drainVideoEncoderLoop() {
+        try {
+            val encoder = videoEncoder ?: return
+            if (!isBufferInitialized) return
+
+            val bufferInfo = MediaCodec.BufferInfo()
+            var processedAnything = false
+
+            while (isBufferInitialized && videoEncoder === encoder) {
+                val outputBufferId = encoder.dequeueOutputBuffer(bufferInfo, 0)
+
+                when {
+                    outputBufferId == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                        break
+                    }
+                    outputBufferId == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        val newFormat = encoder.outputFormat
+                        val hasCsd0 = try { newFormat?.getByteBuffer("csd-0") != null } catch (_: Exception) { false }
+                        val hasCsd1 = try { newFormat?.getByteBuffer("csd-1") != null } catch (_: Exception) { false }
+                        Log.d(TAG, "Video encoder format changed: $newFormat")
+                        Log.d(TAG, "Video format CSD buffers: csd-0=$hasCsd0, csd-1=$hasCsd1")
+                        
+                        // Only update videoFormat if it has valid CSD data
+                        if (hasCsd0 && hasCsd1) {
+                            videoFormat = newFormat
+                            Log.d(TAG, "✅ Video format updated with valid CSD data")
+                        } else {
+                            Log.w(TAG, "⚠️ Video format missing CSD buffers, waiting for complete format")
+                        }
+                    }
+                    outputBufferId >= 0 -> {
+                        processedAnything = true
+                        val outputBuffer = encoder.getOutputBuffer(outputBufferId)
+                        if (outputBuffer != null && bufferInfo.size > 0) {
+                            val data = ByteArray(bufferInfo.size)
+                            outputBuffer.position(bufferInfo.offset)
+                            outputBuffer.get(data)
+
+                            val globalPtsUs = nowUs()
+                            val adjustedBufferInfo = MediaCodec.BufferInfo().apply {
+                                set(0, bufferInfo.size, globalPtsUs, bufferInfo.flags)
+                            }
+
+                            val videoSampleCount = rollingBuffer.getVideoSampleCount() + 1
+                            if (videoSampleCount <= 5 || videoSampleCount % 100 == 0) {
+                                Log.d(TAG, "📹 Video sample #$videoSampleCount: size=${bufferInfo.size}, globalPTS=${globalPtsUs}µs")
+                            }
+
+                            val sample = EncodedSample(data, adjustedBufferInfo, isVideo = true, globalPtsUs = globalPtsUs)
+                            rollingBuffer.addSample(sample)
+
+                            // SIMPLIFIED: Write live samples with continuous counter
+                            if (isRecording && recordingMuxer != null && prerollWritten && recordingVideoTrack >= 0) {
+                                try {
+                                    // Use next sequential PTS based on current FPS
+                                    val nextPts = lastPrerollVideoPts + (videoDeltaUs * (liveVideoSampleCount + 1))
+                                    
+                                    val bufferInfo = MediaCodec.BufferInfo().apply {
+                                        set(0, sample.data.size, nextPts, sample.info.flags)
+                                    }
+                                    
+                                    val buffer = ByteBuffer.wrap(sample.data)
+                                    recordingMuxer?.writeSampleData(recordingVideoTrack, buffer, bufferInfo)
+                                    liveVideoSampleCount++
+                                    
+                                    if (liveVideoSampleCount <= 5 || liveVideoSampleCount % 30 == 0) {
+                                        Log.d(TAG, "[Live] VIDEO #$liveVideoSampleCount: PTS=${nextPts}µs (delta=${videoDeltaUs}µs)")
+                                    }
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "[Live] Failed to write video sample #$liveVideoSampleCount", e)
+                                }
+                            }
+                        }
+
+                        encoder.releaseOutputBuffer(outputBufferId, false)
+                    }
+                }
+            }
+
+            if (isBufferInitialized && videoEncoder === encoder) {
+                val delayMs = if (processedAnything) 0L else 10L
+                encoderHandler?.postDelayed({ drainVideoEncoderLoop() }, delayMs)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error draining video encoder", e)
+            if (isBufferInitialized) {
+                encoderHandler?.postDelayed({ drainVideoEncoderLoop() }, 100)
+            }
+        }
+    }
+    
+    private fun drainAudioEncoderLoop() {
+        try {
+            val encoder = audioEncoder ?: return
+            if (!isBufferInitialized) return
+
+            val bufferInfo = MediaCodec.BufferInfo()
+            var processedAnything = false
+
+            while (isBufferInitialized && audioEncoder === encoder) {
+                val outputBufferId = encoder.dequeueOutputBuffer(bufferInfo, 0)
+
+                when {
+                    outputBufferId == MediaCodec.INFO_TRY_AGAIN_LATER -> break
+                    outputBufferId == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        audioFormat = encoder.outputFormat
+                        // Note: AAC encoders often don't provide CSD buffers upfront
+                        // CSD data may be embedded in the first encoded frame instead
+                        Log.d(TAG, "Audio encoder format changed: $audioFormat")
+                    }
+                    outputBufferId >= 0 -> {
+                        processedAnything = true
+                        val outputBuffer = encoder.getOutputBuffer(outputBufferId)
+                        if (outputBuffer != null && bufferInfo.size > 0) {
+                            val data = ByteArray(bufferInfo.size)
+                            outputBuffer.position(bufferInfo.offset)
+                            outputBuffer.get(data)
+
+                            val globalPtsUs = nowUs()
+                            val adjustedBufferInfo = MediaCodec.BufferInfo().apply {
+                                set(0, bufferInfo.size, globalPtsUs, bufferInfo.flags)
+                            }
+
+                            audioDrainCount++
+                            if (audioDrainCount <= 10 || audioDrainCount % 100 == 0) {
+                                val isConfig = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                                Log.d(TAG, "[Audio Drain] ✅ #$audioDrainCount: size=${bufferInfo.size}b, PTS=${globalPtsUs}µs, isConfig=$isConfig")
+                            }
+
+                            val sample = EncodedSample(data, adjustedBufferInfo, isVideo = false, globalPtsUs = globalPtsUs)
+                            rollingBuffer.addSample(sample)
+
+                            // SIMPLIFIED: Write live samples with continuous counter
+                            if (isRecording && recordingMuxer != null && prerollWritten && recordingAudioTrack >= 0) {
+                                try {
+                                    // Use next sequential PTS
+                                    val nextPts = lastPrerollAudioPts + (23220L * (liveAudioSampleCount + 1))
+                                    
+                                    val bufferInfo = MediaCodec.BufferInfo().apply {
+                                        set(0, sample.data.size, nextPts, sample.info.flags)
+                                    }
+                                    
+                                    val buffer = ByteBuffer.wrap(sample.data)
+                                    recordingMuxer?.writeSampleData(recordingAudioTrack, buffer, bufferInfo)
+                                    liveAudioSampleCount++
+                                    
+                                    if (liveAudioSampleCount <= 5 || liveAudioSampleCount % 50 == 0) {
+                                        Log.d(TAG, "[Live] AUDIO #$liveAudioSampleCount: PTS=${nextPts}µs")
+                                    }
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "[Live] Failed to write audio sample #$liveAudioSampleCount", e)
+                                }
+                            }
+                        }
+
+                        encoder.releaseOutputBuffer(outputBufferId, false)
+                    }
+                }
+            }
+
+            if (isBufferInitialized && audioEncoder === encoder) {
+                val delayMs = if (processedAnything) 0L else 10L
+                encoderHandler?.postDelayed({ drainAudioEncoderLoop() }, delayMs)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error draining audio encoder", e)
+            if (isBufferInitialized) {
+                encoderHandler?.postDelayed({ drainAudioEncoderLoop() }, 100)
+            }
+        }
+    }
+    
+    private fun startBufferMonitoring() {
+        bufferLoggingTimer?.cancel()
+        bufferLoggingTimer = Timer()
+        bufferLoggingTimer?.schedule(object : TimerTask() {
+            override fun run() {
+                if (isBufferInitialized) {
+                    val duration = rollingBuffer.getDurationSeconds()
+                    val sampleCount = rollingBuffer.getSampleCount()
+                    val videoCount = rollingBuffer.getVideoSampleCount()
+                    val audioCount = rollingBuffer.getAudioSampleCount()
+                    
+                    Log.d(TAG, "Buffer state: selectedBufferSeconds=${selectedBufferSeconds}s, " +
+                            "currentBuffered=${String.format("%.2f", duration)}s, " +
+                            "samples=${sampleCount} (video=$videoCount, audio=$audioCount)")
+                }
+            }
+        }, 1000, 1000) // Log every second
+    }
+    
+    private fun startContinuousEncoding() {
+        // This method is now deprecated - encoding starts automatically when encoders are initialized
+        // Keeping for backward compatibility but it does nothing
+        Log.d(TAG, "startContinuousEncoding called (deprecated - encoders start automatically)")
+    }
+
+    private fun stopBuffer(result: MethodChannel.Result) {
+        try {
+            if (!isBuffering) {
+                result.success(null)
+                return
+            }
+            isBuffering = false
+            bufferUpdateTask?.cancel()
+            bufferUpdateTask = null
+            
+            synchronized(bufferFrames) {
+                bufferFrames.clear()
+            }
+            shutdownContinuousBuffer()
+            backgroundHandler?.post {
+                try {
+                    captureSession?.close()
+                    captureSession = null
+                    createCameraPreviewSession()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to recreate preview session after stopping buffer", e)
+                }
+            }
+            
+            result.success(null)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to stop buffer", e)
+            result.error("BUFFER_ERROR", "Failed to stop buffer: ${e.message}", null)
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // FRESH PRE-ROLL RECORDING IMPLEMENTATION
+    // Write buffer samples FIRST, then live samples - all into single MediaMuxer
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    private fun startRecording(result: MethodChannel.Result) {
+        try {
+            if (isRecording) {
+                result.error("ALREADY_RECORDING", "Recording already in progress", null)
+                return
+            }
+            
+            // Capture current device orientation for video metadata
+            recordingOrientation = getDeviceOrientationForRecording()
+            Log.d(TAG, "[Record] Device orientation captured: $recordingOrientation°")
+            
+            // Generate fresh recording ID and timestamp for THIS recording
+            currentRecordingId = UUID.randomUUID().toString()
+            recordingStartTime = System.currentTimeMillis()
+            
+            Log.d(TAG, "═══════════════════════════════════════════════════════════")
+            Log.d(TAG, "[Record] NEW RECORDING STARTED")
+            Log.d(TAG, "[Record] - ID: $currentRecordingId")
+            Log.d(TAG, "[Record] - Start time: $recordingStartTime")
+            
+            // [Buffer] Log buffer state
+            val bufferDuration = rollingBuffer.getDurationSeconds()
+            val bufferSamples = rollingBuffer.getSampleCount()
+            val videoCount = rollingBuffer.getVideoSampleCount()
+            val audioCount = rollingBuffer.getAudioSampleCount()
+            Log.d(TAG, "[Buffer] State: ${String.format("%.2f", bufferDuration)}s, samples=$bufferSamples (video=$videoCount, audio=$audioCount)")
+            Log.d(TAG, "═══════════════════════════════════════════════════════════")
+            
+            // Instant response
+            result.success(currentRecordingId)
+            
+            // Start recording in background
+            startRecordingWithPreroll()
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start recording", e)
+            result.error("RECORDING_ERROR", "Failed to start recording: ${e.message}", null)
+        }
+    }
+    
+    private fun startRecordingWithPreroll() {
+        encoderHandler?.post { startRecordingWithPrerollInternal(0) }
+    }
+
+    private fun startRecordingWithPrerollInternal(attempt: Int) {
+        val maxAttempts = 200
+        val retryDelayMs = 15L
+
+        // Step 1: Validate encoder formats are ready
+        if (!areEncoderFormatsReady()) {
+            captureEncoderFormatsIfAvailable()
+
+            if (!areEncoderFormatsReady()) {
+                if (attempt >= maxAttempts) {
+                    Log.e(TAG, "[Record] ❌ Encoder formats unavailable after ${attempt + 1} attempts")
+                    Log.e(TAG, "[Record] Video format: ${videoFormat}")
+                    Log.e(TAG, "[Record] Audio format: ${audioFormat}")
+                    sendEvent("recordingError", mapOf("error" to "Encoder formats not ready"))
+                    return
+                }
+
+                if (attempt == 0 || (attempt + 1) % 20 == 0) {
+                    Log.d(TAG, "[Record] ⏳ Waiting for encoder formats (attempt ${attempt + 1}/$maxAttempts)")
+                }
+
+                encoderHandler?.postDelayed({
+                    startRecordingWithPrerollInternal(attempt + 1)
+                }, retryDelayMs)
+                return
+            }
+        }
+
+        // Step 2: Get buffer snapshot and validate
+        val bufferedSamples = rollingBuffer.getSnapshot()
+        val sortedSamples = bufferedSamples.sortedBy { it.globalPtsUs }
+        val videoSamples = sortedSamples.filter { it.isVideo }
+        val audioSamples = sortedSamples.filter { !it.isVideo }
+        
+        Log.d(TAG, "[Record] 📋 Buffer snapshot: total=${sortedSamples.size}, video=${videoSamples.size}, audio=${audioSamples.size}")
+        
+        if (sortedSamples.isNotEmpty()) {
+            val firstPts = sortedSamples.first().globalPtsUs
+            val lastPts = sortedSamples.last().globalPtsUs
+            val durationUs = lastPts - firstPts
+            Log.d(TAG, "[Record] Buffer PTS range: ${firstPts}µs to ${lastPts}µs (duration: ${durationUs / 1_000_000.0}s)")
+            
+            // Check for timestamp gaps
+            var maxGap = 0L
+            sortedSamples.zipWithNext().forEach { (sample1, sample2) ->
+                val gap = sample2.globalPtsUs - sample1.globalPtsUs
+                if (gap > maxGap) maxGap = gap
+            }
+            Log.d(TAG, "[Record] Maximum timestamp gap in buffer: ${maxGap}µs (${maxGap / 1000.0}ms)")
+        }
+        
+        if (videoSamples.isEmpty()) {
+            Log.e(TAG, "[Record] ❌ Cannot start recording: No video samples in buffer")
+            sendEvent("recordingError", mapOf("error" to "No video data"))
+            return
+        }
+        
+        if (audioSamples.isEmpty()) {
+            Log.w(TAG, "[Record] ⚠️ Warning: No audio samples in buffer, video-only recording")
+        }
+        
+        try {
+            // Step 3: Calculate base timestamp from first sample
+            val basePtsUs = sortedSamples.firstOrNull()?.globalPtsUs ?: 0L
+            val endPrerollPtsUs = sortedSamples.lastOrNull()?.globalPtsUs ?: basePtsUs
+            val prerollDurationUs = endPrerollPtsUs - basePtsUs
+            
+            Log.d(TAG, "[Record] 🎬 Starting recording ID: $currentRecordingId")
+            Log.d(TAG, "[Record] Base PTS: ${basePtsUs}µs")
+            Log.d(TAG, "[Record] Pre-roll duration: ${prerollDurationUs}µs (${prerollDurationUs / 1_000_000.0}s)")
+            
+            // Step 4: Create output file and muxer
+            val outputFile = getOutputFile()
+            currentOutputFile = outputFile
+            Log.d(TAG, "[Record] Output: ${outputFile.absolutePath}")
+            
+            val muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            
+            // Step 5: Ensure video format has CSD (extract from CODEC_CONFIG frame if needed)
+            val videoFormatWithCsd = ensureVideoFormatHasCsd(videoFormat, videoSamples)
+            if (videoFormatWithCsd == null) {
+                Log.e(TAG, "[Record] ❌ Failed to get valid video format with CSD")
+                muxer.release()
+                outputFile.delete()
+                sendEvent("recordingError", mapOf("error" to "Invalid video format"))
+                return
+            }
+            
+            // Step 6: Add tracks to muxer
+            val videoTrackIndex = try {
+                val trackIndex = muxer.addTrack(videoFormatWithCsd)
+                Log.d(TAG, "[Record] ✅ Video track added: index=$trackIndex")
+                trackIndex
+            } catch (e: Exception) {
+                Log.e(TAG, "[Record] ❌ Failed to add video track", e)
+                muxer.release()
+                outputFile.delete()
+                sendEvent("recordingError", mapOf("error" to "Failed to add video track"))
+                return
+            }
+            
+            val audioTrackIndex = if (audioSamples.isNotEmpty() && audioFormat != null) {
+                try {
+                    val trackIndex = muxer.addTrack(audioFormat!!)
+                    Log.d(TAG, "[Record] ✅ Audio track added: index=$trackIndex")
+                    trackIndex
+                } catch (e: Exception) {
+                    Log.w(TAG, "[Record] ⚠️ Failed to add audio track, continuing video-only", e)
+                    -1
+                }
+            } else {
+                -1
+            }
+            
+            // Step 6: Set orientation and start muxer
+            muxer.setOrientationHint(recordingOrientation)
+            
+            try {
+                muxer.start()
+                Log.d(TAG, "[Record] ✅ Muxer started")
+            } catch (e: Exception) {
+                Log.e(TAG, "[Record] ❌ Failed to start muxer", e)
+                muxer.release()
+                outputFile.delete()
+                sendEvent("recordingError", mapOf("error" to "Muxer start failed: ${e.message}"))
+                return
+            }
+            
+            // Step 7: SIMPLIFIED - Write pre-roll with continuous counter per track
+            var prerollVideoCount = 0
+            var prerollAudioCount = 0
+            var nextVideoPts = 0L
+            var nextAudioPts = 0L
+            // Use the class member videoDeltaUs which is updated based on currentFps
+            Log.d(TAG, "[Record] Using videoDeltaUs=${videoDeltaUs}µs (${currentFps} fps), audioDeltaUs=${audioDeltaUs}µs")
+            
+            // Separate samples by type
+            val prerollVideoSamples = sortedSamples.filter { it.isVideo }
+            val prerollAudioSamples = sortedSamples.filter { !it.isVideo }
+            
+            Log.d(TAG, "[Record] Writing ${prerollVideoSamples.size} video + ${prerollAudioSamples.size} audio samples to pre-roll")
+            
+            // Find first keyframe in buffer
+            val firstKeyframeIndex = prerollVideoSamples.indexOfFirst { 
+                (it.info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0 
+            }
+            
+            if (firstKeyframeIndex < 0) {
+                Log.e(TAG, "[Record] ❌ No keyframe found in buffer! Recording will fail.")
+                muxer.stop()
+                muxer.release()
+                outputFile.delete()
+                sendEvent("recordingError", mapOf("error" to "No keyframe in buffer"))
+                return
+            }
+            
+            // Get the timestamp of the first keyframe
+            val firstKeyframeTimestamp = prerollVideoSamples[firstKeyframeIndex].globalPtsUs
+            
+            if (firstKeyframeIndex > 0) {
+                Log.w(TAG, "[Record] ⚠️ First keyframe at index $firstKeyframeIndex (timestamp ${firstKeyframeTimestamp}µs), skipping ${firstKeyframeIndex} video frames")
+            }
+            
+            // Write video samples starting from first keyframe
+            for (i in firstKeyframeIndex until prerollVideoSamples.size) {
+                val sample = prerollVideoSamples[i]
+                val isKeyframe = (sample.info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+                
+                val bufferInfo = MediaCodec.BufferInfo()
+                bufferInfo.set(0, sample.data.size, nextVideoPts, sample.info.flags)
+                
+                val byteBuffer = ByteBuffer.wrap(sample.data)
+                muxer.writeSampleData(videoTrackIndex, byteBuffer, bufferInfo)
+                
+                if (prerollVideoCount < 5 || isKeyframe) {
+                    Log.d(TAG, "[Record] Video #${prerollVideoCount}: keyframe=$isKeyframe, pts=${nextVideoPts}µs, size=${sample.data.size}b")
+                }
+                
+                prerollVideoCount++
+                nextVideoPts += videoDeltaUs
+            }
+            
+            if (prerollVideoCount == 0) {
+                Log.e(TAG, "[Record] ❌ No video frames written to pre-roll")
+                muxer.stop()
+                muxer.release()
+                outputFile.delete()
+                sendEvent("recordingError", mapOf("error" to "No video frames"))
+                return
+            }
+            
+            // CRITICAL FIX: Write audio samples starting from same timestamp as first keyframe
+            // This ensures audio/video sync even when video starts from middle of buffer
+            if (audioTrackIndex >= 0) {
+                val syncedAudioSamples = prerollAudioSamples.filter { it.globalPtsUs >= firstKeyframeTimestamp }
+                val skippedAudioCount = prerollAudioSamples.size - syncedAudioSamples.size
+                
+                if (skippedAudioCount > 0) {
+                    Log.d(TAG, "[Record] Skipping $skippedAudioCount audio samples to sync with video (audio starts at ${firstKeyframeTimestamp}µs)")
+                }
+                
+                syncedAudioSamples.forEach { sample ->
+                    val bufferInfo = MediaCodec.BufferInfo()
+                    bufferInfo.set(0, sample.data.size, nextAudioPts, sample.info.flags)
+                    
+                    val byteBuffer = ByteBuffer.wrap(sample.data)
+                    muxer.writeSampleData(audioTrackIndex, byteBuffer, bufferInfo)
+                    
+                    if (prerollAudioCount < 5) {
+                        Log.d(TAG, "[Record] Audio #${prerollAudioCount}: pts=${nextAudioPts}µs, size=${sample.data.size}b")
+                    }
+                    
+                    prerollAudioCount++
+                    nextAudioPts += audioDeltaUs
+                }
+                
+                Log.d(TAG, "[Record] Written ${prerollAudioCount} audio samples (skipped $skippedAudioCount for sync)")
+            }
+            
+            val prerollDurationSec = nextVideoPts / 1_000_000.0
+            Log.d(TAG, "[Record] ✅ Pre-roll written: ${prerollVideoCount}v + ${prerollAudioCount}a frames (${String.format("%.2f", prerollDurationSec)}s)")
+            
+            if (prerollVideoCount < 3) {
+                Log.w(TAG, "[Record] ⚠️ WARNING: Only $prerollVideoCount video samples in pre-roll (very short!)")
+            }
+            
+            // Step 8: Set up for live recording with continuous counters
+            val recordingStartTime = nowUs()
+            
+            recordingMuxer = muxer
+            recordingVideoTrack = videoTrackIndex
+            recordingAudioTrack = audioTrackIndex
+            recordingBasePtsUs = basePtsUs
+            recordingStartTimeUs = recordingStartTime
+            lastPrerollVideoPts = nextVideoPts - videoDeltaUs // Last written PTS
+            lastPrerollAudioPts = nextAudioPts - audioDeltaUs // Last written PTS
+            prerollWritten = true
+            isRecording = true
+            liveVideoSampleCount = 0
+            liveAudioSampleCount = 0
+            
+            Log.d(TAG, "[Record] ✅ Ready for live samples")
+            Log.d(TAG, "[Record] Recording started at: ${recordingStartTime}µs")
+            Log.d(TAG, "[Record] Next video PTS: ${nextVideoPts}µs")
+            Log.d(TAG, "[Record] Next audio PTS: ${nextAudioPts}µs")
+            
+            // Notify Flutter that recording started
+            sendEvent("recordingStarted", mapOf("id" to currentRecordingId))
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "[Record] ❌ Fatal error during recording start", e)
+            currentOutputFile?.delete()
+            currentOutputFile = null
+            sendEvent("recordingError", mapOf("error" to "Recording failed: ${e.message}"))
+        }
+    }
+
+    private fun areEncoderFormatsReady(): Boolean {
+        // Just check if we have formats - CSD will be extracted if needed
+        if (videoFormat == null) {
+            Log.d(TAG, "[Record] Video format not ready")
+            return false
+        }
+        
+        if (audioFormat == null) {
+            Log.d(TAG, "[Record] Audio format not ready")
+            return false
+        }
+        
+        return true
+    }
+
+    private fun captureEncoderFormatsIfAvailable() {
+        if (videoFormat == null) {
+            try {
+                videoEncoder?.outputFormat?.let {
+                    videoFormat = it
+                    Log.d(TAG, "[Record] Captured video format while waiting: $it")
+                }
+            } catch (_: IllegalStateException) {
+                // Encoder not ready yet
+            }
+        }
+
+        if (audioFormat == null) {
+            try {
+                audioEncoder?.outputFormat?.let {
+                    audioFormat = it
+                    Log.d(TAG, "[Record] Captured audio format while waiting: $it")
+                }
+            } catch (_: IllegalStateException) {
+                // Encoder not ready yet
+            }
+        }
+    }
+
+    /**
+     * Ensures video format has CSD (Codec Specific Data) buffers.
+     * If format doesn't have CSD, extracts it from first CODEC_CONFIG frame.
+     */
+    private fun ensureVideoFormatHasCsd(format: MediaFormat?, videoSamples: List<EncodedSample>): MediaFormat? {
+        if (format == null) return null
+        
+        // Check if format already has CSD buffers
+        val hasCsd0 = try { format.getByteBuffer("csd-0") != null } catch (_: Exception) { false }
+        val hasCsd1 = try { format.getByteBuffer("csd-1") != null } catch (_: Exception) { false }
+        
+        if (hasCsd0 && hasCsd1) {
+            Log.d(TAG, "[Record] ✅ Video format has CSD buffers from encoder")
+            return format
+        }
+        
+        // CSD missing - try to extract from first CODEC_CONFIG frame
+        Log.w(TAG, "[Record] ⚠️ Video format missing CSD, searching encoded frames...")
+        
+        val csdFrame = videoSamples.firstOrNull { 
+            (it.info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0 
+        }
+        
+        if (csdFrame != null) {
+            Log.d(TAG, "[Record] Found CODEC_CONFIG frame, size=${csdFrame.data.size}b")
+            
+            // For H.264, CSD contains SPS and PPS NAL units
+            // They're separated by start codes (0x00000001 or 0x000001)
+            val csdData = csdFrame.data
+            val spsAndPps = extractSpsAndPps(csdData)
+            
+            if (spsAndPps != null) {
+                val (sps, pps) = spsAndPps
+                Log.d(TAG, "[Record] ✅ Extracted SPS (${sps.size}b) and PPS (${pps.size}b) from CODEC_CONFIG")
+                
+                // Create new format with CSD
+                val newFormat = MediaFormat.createVideoFormat(
+                    format.getString(MediaFormat.KEY_MIME) ?: MediaFormat.MIMETYPE_VIDEO_AVC,
+                    format.getInteger(MediaFormat.KEY_WIDTH),
+                    format.getInteger(MediaFormat.KEY_HEIGHT)
+                )
+                
+                // Copy all keys from original format
+                try {
+                    if (format.containsKey(MediaFormat.KEY_FRAME_RATE)) {
+                        newFormat.setInteger(MediaFormat.KEY_FRAME_RATE, format.getInteger(MediaFormat.KEY_FRAME_RATE))
+                    }
+                    if (format.containsKey(MediaFormat.KEY_BIT_RATE)) {
+                        newFormat.setInteger(MediaFormat.KEY_BIT_RATE, format.getInteger(MediaFormat.KEY_BIT_RATE))
+                    }
+                    if (format.containsKey(MediaFormat.KEY_I_FRAME_INTERVAL)) {
+                        newFormat.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, format.getInteger(MediaFormat.KEY_I_FRAME_INTERVAL))
+                    }
+                    if (format.containsKey(MediaFormat.KEY_COLOR_FORMAT)) {
+                        newFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT, format.getInteger(MediaFormat.KEY_COLOR_FORMAT))
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "[Record] Some format keys not copied: ${e.message}")
+                }
+                
+                // Add CSD buffers
+                newFormat.setByteBuffer("csd-0", ByteBuffer.wrap(sps))
+                newFormat.setByteBuffer("csd-1", ByteBuffer.wrap(pps))
+                
+                return newFormat
+            }
+        }
+        
+        Log.e(TAG, "[Record] ❌ Could not extract CSD from frames")
+        return null
+    }
+    
+    /**
+     * Extracts SPS and PPS NAL units from H.264 CSD buffer.
+     * H.264 CSD format: [start code] [SPS] [start code] [PPS]
+     * Start codes: 0x00000001 (4 bytes) or 0x000001 (3 bytes)
+     */
+    private fun extractSpsAndPps(csdData: ByteArray): Pair<ByteArray, ByteArray>? {
+        try {
+            val startCodes = mutableListOf<Int>()
+            
+            // Find all start codes
+            for (i in 0 until csdData.size - 3) {
+                if (csdData[i] == 0.toByte() && csdData[i + 1] == 0.toByte()) {
+                    if (csdData[i + 2] == 0.toByte() && csdData[i + 3] == 1.toByte()) {
+                        startCodes.add(i) // 4-byte start code
+                    } else if (csdData[i + 2] == 1.toByte()) {
+                        startCodes.add(i) // 3-byte start code
+                    }
+                }
+            }
+            
+            if (startCodes.size < 2) {
+                Log.w(TAG, "[Record] Found ${startCodes.size} start codes, need at least 2")
+                return null
+            }
+            
+            // First NAL unit is SPS (starts after first start code)
+            val firstStartCodeLen = if (csdData[startCodes[0] + 2] == 0.toByte()) 4 else 3
+            val spsStart = startCodes[0] + firstStartCodeLen
+            val spsEnd = startCodes[1]
+            val sps = csdData.copyOfRange(spsStart, spsEnd)
+            
+            // Second NAL unit is PPS (starts after second start code)
+            val secondStartCodeLen = if (csdData[startCodes[1] + 2] == 0.toByte()) 4 else 3
+            val ppsStart = startCodes[1] + secondStartCodeLen
+            val ppsEnd = if (startCodes.size > 2) startCodes[2] else csdData.size
+            val pps = csdData.copyOfRange(ppsStart, ppsEnd)
+            
+            // Validate NAL unit types
+            // SPS = 0x67 (NAL type 7), PPS = 0x68 (NAL type 8)
+            val spsType = (sps[0].toInt() and 0x1F)
+            val ppsType = (pps[0].toInt() and 0x1F)
+            
+            if (spsType != 7 || ppsType != 8) {
+                Log.w(TAG, "[Record] Invalid NAL types: SPS=$spsType (expected 7), PPS=$ppsType (expected 8)")
+                return null
+            }
+            
+            return Pair(sps, pps)
+        } catch (e: Exception) {
+            Log.e(TAG, "[Record] Failed to extract SPS/PPS", e)
+            return null
+        }
+    }
+
+    private fun stopRecording(result: MethodChannel.Result) {
+        try {
+            if (!isRecording) {
+                Log.w(TAG, "stopRecording called with no active recording; ignoring")
+                result.success(null)
+                return
+            }
+            
+            Log.i(TAG, "[Record] stopRecording called")
+            // Instant response
+            sendEvent("recordingStopped", null)
+            result.success(null)
+            
+            // Stop recording in background
+            stopRecordingAndFinalize()
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to stop recording", e)
+            result.error("RECORDING_ERROR", "Failed to stop recording: ${e.message}", null)
+        }
+    }
+    
+    private fun stopRecordingAndFinalize() {
+        encoderHandler?.post {
+            try {
+                Log.d(TAG, "[Record] stopRecording called")
+                
+                // Stop and finalize muxer
+                val muxer = recordingMuxer
+                val outputFile = currentOutputFile
+                
+                // Reset state FIRST to stop new samples from being written
+                recordingMuxer = null
+                recordingVideoTrack = -1
+                recordingAudioTrack = -1
+                recordingBasePtsUs = -1
+                recordingStartTimeUs = -1
+                lastPrerollVideoPts = -1
+                lastPrerollAudioPts = -1
+                prerollWritten = false
+                isRecording = false
+                
+                val finalVideoCount = liveVideoSampleCount
+                val finalAudioCount = liveAudioSampleCount
+                liveVideoSampleCount = 0
+                liveAudioSampleCount = 0
+                
+                // Log final statistics
+                Log.d(TAG, "[Record] Final statistics:")
+                Log.d(TAG, "[Record] - Live VIDEO samples written: $finalVideoCount")
+                Log.d(TAG, "[Record] - Live AUDIO samples written: $finalAudioCount")
+                
+                if (muxer != null) {
+                    // Validate that we have written some samples
+                    if (finalVideoCount == 0 && finalAudioCount == 0) {
+                        Log.w(TAG, "[Record] ⚠️ WARNING: No live samples were written to muxer!")
+                    }
+                    
+                    Log.d(
+                        TAG,
+                        "[Record] Finalizing muxer with ${finalVideoCount} live video samples and ${finalAudioCount} live audio samples"
+                    )
+                    try {
+                        Log.d(TAG, "[Record] Stopping muxer...")
+                        muxer.stop()
+                        Log.d(TAG, "[Record] ✅ Muxer stop complete")
+                    } catch (e: Exception) {
+                        Log.e(TAG, "[Record] ❌ ERROR while stopping muxer - file may be corrupted", e)
+                        Log.e(TAG, "[Record] Error details: ${e::class.simpleName}: ${e.message}")
+                        // Try to delete potentially corrupted file
+                        outputFile?.let { file ->
+                            if (file.exists()) {
+                                file.delete()
+                                Log.d(TAG, "[Record] Deleted corrupted file: ${file.absolutePath}")
+                            }
+                        }
+                        sendEvent("recordingError", mapOf("error" to "Failed to finalize recording: ${e.message}"))
+                        return@post
+                    } finally {
+                        try {
+                            Log.d(TAG, "[Record] Releasing muxer")
+                            muxer.release()
+                            Log.d(TAG, "[Record] Muxer released")
+                        } catch (e: Exception) {
+                            Log.e(TAG, "[Record] finalize ERROR while releasing muxer", e)
+                        }
+                    }
+                }
+                
+                // Calculate approximate duration
+                if (outputFile != null && outputFile.exists()) {
+                    val fileSizeBytes = outputFile.length()
+                    val fileSizeKB = fileSizeBytes / 1024.0
+                    val fileSizeMB = fileSizeKB / 1024.0
+                    Log.d(TAG, "[Record] Output file size: ${String.format("%.2f", fileSizeMB)} MB")
+                    
+                    // Estimate duration based on sample count (at 30fps)
+                    val estimatedVideoSeconds = finalVideoCount / 30.0
+                    Log.d(TAG, "[Record] Estimated live duration from video samples: ${String.format("%.2f", estimatedVideoSeconds)}s")
+                    
+                    // Validate minimum file size
+                    if (fileSizeBytes < minValidFileBytes) {
+                        Log.e(TAG, "[Record] ❌ File too small: ${fileSizeBytes} bytes (min: ${minValidFileBytes})")
+                        outputFile.delete()
+                        sendEvent("recordingError", mapOf("error" to "Recording file too small"))
+                        return@post
+                    }
+                }
+                
+                // Buffer keeps running - ready for next recording
+                Log.d(TAG, "[Record] Recording finalized, buffer continues running")
+                
+                // Notify completion
+                finalizeRecording(outputFile)
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "[Record] Error stopping recording", e)
+                sendEvent("recordingError", mapOf("error" to e.message))
+            }
+        }
+    }
+
+    private fun finalizeRecordingWithPreroll(liveRecordingFile: File, bufferFile: File?) {
+        try {
+            Log.d(TAG, "Finalizing recording with pre-roll buffer")
+
+            // Create final output file with unique name
+            val finalOutputFile = getOutputFile()
+            Log.d(TAG, "Final output file: ${finalOutputFile.absolutePath}")
+
+            if (bufferFile == null || !bufferFile.exists() || bufferFile.length() == 0L) {
+                // No pre-roll buffer, just use live recording
+                Log.w(TAG, "No buffer file available, using live recording only")
+                
+                if (liveRecordingFile.exists() && liveRecordingFile.length() > 0) {
+                    liveRecordingFile.copyTo(finalOutputFile, overwrite = true)
+                    liveRecordingFile.delete()
+                    
+                    Log.d(TAG, "Recording finalized (no buffer): ${finalOutputFile.absolutePath}, size: ${finalOutputFile.length()}")
+                    sendVideoCompletedEvent(finalOutputFile)
+                } else {
+                    Log.e(TAG, "Live recording file is empty or doesn't exist")
+                    sendEvent("recordingError", mapOf("error" to "Recording file is empty"))
+                }
+                return
+            }
+
+            // Concatenate buffer + live recording using MediaMuxer
+            Log.d(TAG, "Concatenating buffer (${bufferFile.length()} bytes) + live recording (${liveRecordingFile.length()} bytes)")
+            
+            concatenateVideoFilesWithMuxer(bufferFile, liveRecordingFile, finalOutputFile)
+
+            // Clean up temporary files
+            bufferFile.delete()
+            liveRecordingFile.delete()
+            Log.d(TAG, "Deleted temporary files")
+
+            Log.d(TAG, "Recording finalized with pre-roll: ${finalOutputFile.absolutePath}, size: ${finalOutputFile.length()}")
+            sendVideoCompletedEvent(finalOutputFile)
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to finalize recording with pre-roll", e)
+            // Try to at least save the live recording
+            try {
+                val finalOutputFile = getOutputFile()
+                if (liveRecordingFile.exists() && liveRecordingFile.length() > 0) {
+                    liveRecordingFile.copyTo(finalOutputFile, overwrite = true)
+                    sendVideoCompletedEvent(finalOutputFile)
+                }
+            } catch (fallbackError: Exception) {
+                Log.e(TAG, "Fallback save also failed", fallbackError)
+                sendEvent("recordingError", mapOf("error" to "Failed to save recording"))
+            }
+        } finally {
+            resumePreviewAfterRecording()
+        }
+    }
+    
+    private fun concatenateVideoFilesWithMuxer(bufferFile: File, liveFile: File, outputFile: File) {
+        try {
+            // For now, use simple approach: just copy live file since proper muxing is complex
+            // TODO: Implement proper frame-by-frame concatenation with MediaExtractor + MediaMuxer
+            
+            // Extract samples from buffer file
+            val bufferExtractor = android.media.MediaExtractor()
+            bufferExtractor.setDataSource(bufferFile.absolutePath)
+            
+            // Extract samples from live file
+            val liveExtractor = android.media.MediaExtractor()
+            liveExtractor.setDataSource(liveFile.absolutePath)
+            
+            // Create output muxer
+            val muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            
+            // Track indices
+            val trackIndices = mutableMapOf<Int, Int>()
+            
+            // Add tracks from buffer file
+            for (i in 0 until bufferExtractor.trackCount) {
+                val format = bufferExtractor.getTrackFormat(i)
+                val trackIndex = muxer.addTrack(format)
+                trackIndices[i] = trackIndex
+            }
+            
+            // Start muxer
+            muxer.start()
+            
+            // Write buffer samples
+            val bufferInfo = MediaCodec.BufferInfo()
+            val buffer = ByteBuffer.allocate(1024 * 1024) // 1MB buffer
+            
+            for (trackIndex in 0 until bufferExtractor.trackCount) {
+                bufferExtractor.selectTrack(trackIndex)
+            }
+            
+            var lastPts = 0L
+            while (true) {
+                val sampleSize = bufferExtractor.readSampleData(buffer, 0)
+                if (sampleSize < 0) break
+                
+                val trackIndex = bufferExtractor.sampleTrackIndex
+                val pts = bufferExtractor.sampleTime
+                val flags = bufferExtractor.sampleFlags
+                
+                bufferInfo.set(0, sampleSize, pts, flags)
+                muxer.writeSampleData(trackIndices[trackIndex]!!, buffer, bufferInfo)
+                
+                lastPts = max(lastPts, pts)
+                bufferExtractor.advance()
+            }
+            
+            Log.d(TAG, "Wrote buffer samples, last PTS: $lastPts")
+            
+            // Write live recording samples with adjusted timestamps
+            for (trackIndex in 0 until liveExtractor.trackCount) {
+                liveExtractor.selectTrack(trackIndex)
+            }
+            
+            val ptsOffset = lastPts + 33333 // ~1 frame at 30fps to avoid overlap
+            while (true) {
+                val sampleSize = liveExtractor.readSampleData(buffer, 0)
+                if (sampleSize < 0) break
+                
+                val trackIndex = liveExtractor.sampleTrackIndex
+                val pts = liveExtractor.sampleTime + ptsOffset
+                val flags = liveExtractor.sampleFlags
+                
+                bufferInfo.set(0, sampleSize, pts, flags)
+                muxer.writeSampleData(trackIndices[trackIndex]!!, buffer, bufferInfo)
+                
+                liveExtractor.advance()
+            }
+            
+            Log.d(TAG, "Wrote live recording samples with offset: $ptsOffset")
+            
+            // Cleanup
+            muxer.stop()
+            muxer.release()
+            bufferExtractor.release()
+            liveExtractor.release()
+            
+            Log.d(TAG, "Concatenation complete: ${outputFile.absolutePath}, size: ${outputFile.length()}")
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to concatenate with muxer, falling back to live only", e)
+            // Fallback: just copy live file
+            liveFile.copyTo(outputFile, overwrite = true)
+        }
+    }
+    
+    private fun sendVideoCompletedEvent(outputFile: File) {
+        val recordingId = currentRecordingId ?: UUID.randomUUID().toString()
+        
+        Log.d(TAG, "sendVideoCompletedEvent: Starting for ${outputFile.absolutePath}")
+        Log.d(TAG, "sendVideoCompletedEvent: File exists: ${outputFile.exists()}, size: ${outputFile.length()}")
+
+        if (!outputFile.exists()) {
+            Log.e(TAG, "[Record] invalid file reference, skipping gallery insert")
+            sendEvent("recordingError", mapOf("error" to "RECORDING_FILE_MISSING"))
+            return
+        }
+
+        val sizeBytes = outputFile.length()
+        if (sizeBytes < minValidFileBytes) {
+            Log.w(TAG, "[Record] invalid file (size too small: ${sizeBytes} bytes), not adding to gallery")
+            outputFile.delete()
+            sendEvent("recordingError", mapOf("error" to "RECORDING_FILE_TOO_SMALL"))
+            return
+        }
+        refreshMediaStore(outputFile)
+        
+        // Generate thumbnail for the video
+        val thumbnailPath = generateVideoThumbnail(outputFile)
+        Log.d(TAG, "sendVideoCompletedEvent: Thumbnail path result: $thumbnailPath")
+        
+        val videoData = mapOf(
+            "id" to recordingId,
+            "filePath" to outputFile.absolutePath,
+            "thumbnailPath" to thumbnailPath,
+            "duration" to (System.currentTimeMillis() - recordingStartTime),
+            "resolution" to currentResolution,
+            "fps" to currentFps,
+            "codec" to currentCodec,
+            "preRollSeconds" to preRollSeconds,
+            "size" to outputFile.length(),
+            "timestamp" to recordingStartTime
+        )
+        
+        Log.i(TAG, "[Record] finalize SUCCESS: path=${outputFile.absolutePath}, sizeBytes=${outputFile.length()}")
+        Log.d(TAG, "sendVideoCompletedEvent: Sending event with data: $videoData")
+        sendEvent("finalizeCompleted", mapOf("video" to videoData))
+    }
+    
+    private fun generateVideoThumbnail(videoFile: File): String? {
+        try {
+            Log.d(TAG, "==================== THUMBNAIL GENERATION START ====================")
+            Log.d(TAG, "generateVideoThumbnail: Starting for ${videoFile.absolutePath}")
+            Log.d(TAG, "generateVideoThumbnail: File exists: ${videoFile.exists()}, size: ${videoFile.length()}")
+            
+            if (!videoFile.exists()) {
+                Log.e(TAG, "Video file does not exist, cannot generate thumbnail")
+                return null
+            }
+            
+            if (videoFile.length() == 0L) {
+                Log.e(TAG, "Video file is empty, cannot generate thumbnail")
+                return null
+            }
+            
+            val retriever = MediaMetadataRetriever()
+            
+            try {
+                retriever.setDataSource(videoFile.absolutePath)
+                Log.d(TAG, "generateVideoThumbnail: MediaMetadataRetriever initialized successfully")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to set data source for MediaMetadataRetriever", e)
+                retriever.release()
+                return null
+            }
+            
+            // Get duration to determine best time to extract frame
+            val durationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+            val duration = durationStr?.toLongOrNull() ?: 0L
+            Log.d(TAG, "generateVideoThumbnail: Video duration: ${duration}ms")
+            
+            if (duration == 0L) {
+                Log.w(TAG, "Video duration is 0, trying to extract first frame")
+            }
+            
+            // Try to get frame at 500ms, if that fails try 0ms (first frame)
+            var bitmap = retriever.getFrameAtTime(
+                500_000L, // 0.5 seconds in microseconds
+                MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+            )
+            
+            if (bitmap == null) {
+                Log.w(TAG, "Failed to get frame at 500ms, trying first frame")
+                bitmap = retriever.getFrameAtTime(
+                    0L,
+                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+                )
+            }
+            
+            Log.d(TAG, "generateVideoThumbnail: Bitmap extracted: ${bitmap != null}")
+            if (bitmap != null) {
+                Log.d(TAG, "generateVideoThumbnail: Bitmap size: ${bitmap.width}x${bitmap.height}")
+            }
+            
+            retriever.release()
+            
+            if (bitmap != null) {
+                // Create thumbnail file
+                val thumbDir = File(context.getExternalFilesDir(null), "thumbnails")
+                Log.d(TAG, "generateVideoThumbnail: Thumbnail directory: ${thumbDir.absolutePath}")
+                
+                if (!thumbDir.exists()) {
+                    val created = thumbDir.mkdirs()
+                    Log.d(TAG, "generateVideoThumbnail: Created thumbnail directory: $created")
+                }
+                
+                val thumbFile = File(thumbDir, "${videoFile.nameWithoutExtension}_thumb.jpg")
+                Log.d(TAG, "generateVideoThumbnail: Saving to: ${thumbFile.absolutePath}")
+                
+                // Save bitmap as JPEG
+                var success = false
+                thumbFile.outputStream().use { out ->
+                    success = bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
+                    Log.d(TAG, "generateVideoThumbnail: Bitmap compressed: $success")
+                }
+                bitmap.recycle()
+                
+                if (success && thumbFile.exists()) {
+                    Log.d(TAG, "==================== THUMBNAIL GENERATED SUCCESSFULLY ====================")
+                    Log.d(TAG, "Thumbnail path: ${thumbFile.absolutePath}")
+                    Log.d(TAG, "Thumbnail file exists: ${thumbFile.exists()}, size: ${thumbFile.length()}")
+                    return thumbFile.absolutePath
+                } else {
+                    Log.e(TAG, "Failed to save thumbnail file")
+                    return null
+                }
+            } else {
+                Log.w(TAG, "Failed to extract video frame for thumbnail - bitmap is null after all attempts")
+                return null
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "==================== THUMBNAIL GENERATION FAILED ====================")
+            Log.e(TAG, "Error generating thumbnail", e)
+            e.printStackTrace()
+            return null
+        }
+    }
+
+    private fun refreshMediaStore(file: File) {
+        try {
+            MediaScannerConnection.scanFile(
+                context,
+                arrayOf(file.absolutePath),
+                arrayOf("video/mp4")
+            ) { path, uri ->
+                Log.d(TAG, "[Record] MediaStore scan complete: path=$path uri=$uri")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "[Record] Failed to refresh MediaStore", e)
+        }
+    }
+    
+    private fun concatenateVideoFiles(inputFiles: List<File>, outputFile: File) {
+        try {
+            Log.d(TAG, "Concatenating ${inputFiles.size} video files")
+            
+            // Verify all input files exist and are not empty
+            val validFiles = inputFiles.filter { file ->
+                val exists = file.exists()
+                val size = if (exists) file.length() else 0
+                Log.d(TAG, "Input file: ${file.name}, exists: $exists, size: $size")
+                exists && size > 0
+            }
+            
+            if (validFiles.isEmpty()) {
+                Log.e(TAG, "No valid input files to concatenate")
+                throw IOException("No valid input files")
+            }
+            
+            // For now, use simple file copy of the last (live recording) file
+            // TODO: Implement proper video concatenation with MediaMuxer for pre-roll support
+            val mainFile = validFiles.lastOrNull()
+            if (mainFile != null) {
+                mainFile.copyTo(outputFile, overwrite = true)
+                Log.d(TAG, "Video saved: ${outputFile.absolutePath}, size: ${outputFile.length()}")
+            } else {
+                throw IOException("No main recording file found")
+            }
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to concatenate video files", e)
+            throw e
+        }
+    }
+
+    private fun setupMediaRecorder() {
+        // Create a temporary file for live recording
+        val timestamp = System.currentTimeMillis()
+        liveRecordingFile = File(context.getExternalFilesDir(null), "live_${timestamp}.mp4")
+        
+        mediaRecorder = MediaRecorder().apply {
+            // Set audio source FIRST
+            setAudioSource(MediaRecorder.AudioSource.MIC)
+            setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            
+            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            
+            setOutputFile(liveRecordingFile!!.absolutePath)
+            
+            // Configure video
+            when (currentResolution) {
+                "4K" -> {
+                    setVideoSize(3840, 2160)
+                    setVideoEncodingBitRate(50_000_000)
+                }
+                "1080P" -> {
+                    setVideoSize(1920, 1080)
+                    setVideoEncodingBitRate(10_000_000)
+                }
+                else -> {
+                    setVideoSize(1920, 1080)
+                    setVideoEncodingBitRate(8_000_000)
+                }
+            }
+            
+            setVideoFrameRate(currentFps)
+            setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            
+            // Configure audio
+            setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+            setAudioEncodingBitRate(128000)
+            setAudioSamplingRate(44100)
+            
+            prepare()
+        }
+        
+        Log.d(TAG, "MediaRecorder configured with audio and surface: ${liveRecordingFile!!.absolutePath}")
+    }
+
+    private fun createRecordingSession() {
+        try {
+            val camera = cameraDevice ?: return
+            val surfaces = mutableListOf<Surface>()
+            
+            // Add preview surface
+            previewSurface?.let { 
+                surfaces.add(it) 
+                Log.d(TAG, "Added preview surface to session")
+            }
+            
+            // Add recording surface
+            mediaRecorder?.surface?.let { 
+                surfaces.add(it)
+                Log.d(TAG, "Added recording surface to session")
+            }
+            
+            // Add buffer surface
+            bufferImageReader?.surface?.let { 
+                surfaces.add(it)
+                Log.d(TAG, "Added buffer surface to session")
+            }
+            
+            camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(session: CameraCaptureSession) {
+                    captureSession = session
+                    
+                    val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+                    
+                    // Add all targets to the request
+                    previewSurface?.let { builder.addTarget(it) }
+                    mediaRecorder?.surface?.let { 
+                        builder.addTarget(it)
+                        Log.d(TAG, "Added recording surface to preview request")
+                    }
+                    bufferImageReader?.surface?.let { 
+                        builder.addTarget(it)
+                        Log.d(TAG, "Added buffer surface to preview request")
+                    }
+                    
+                    // Configure capture request
+                    builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                    
+                    // Set FPS range for recording
+                    val fpsRange = android.util.Range(currentFps, currentFps)
+                    builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
+                    Log.d(TAG, "Recording FPS range set to: $fpsRange")
+                    
+                    if (stabilizationEnabled) {
+                        builder.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, 
+                            CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
+                    }
+                    
+                    val request = builder.build()
+                    session.setRepeatingRequest(request, null, backgroundHandler)
+                    
+                    Log.d(TAG, "Preview started with recording: $isRecording, buffering: $isBuffering")
+                    Log.d(TAG, "Capture session configured successfully")
+                }
+
+                override fun onConfigureFailed(session: CameraCaptureSession) {
+                    Log.e(TAG, "Failed to configure capture session")
+                }
+            }, backgroundHandler)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create recording session", e)
+        }
+    }
+
+    private fun finalizeRecording(outputFile: File?) {
+        Thread {
+            try {
+                val recordingId = currentRecordingId ?: return@Thread
+                
+                if (outputFile == null || !outputFile.exists()) {
+                    Log.e(TAG, "[Record] ERROR: Output file not found: ${outputFile?.absolutePath ?: "null"}")
+                    sendEvent("recordingError", mapOf("error" to "Recording file not found"))
+                    currentRecordingId = null
+                    recordingStartTime = 0
+                    currentOutputFile = null
+                    return@Thread
+                }
+                
+                val fileSizeBytes = outputFile.length()
+                val fileSizeKB = fileSizeBytes / 1024.0
+                val fileSizeMB = fileSizeKB / 1024.0
+                
+                Log.d(TAG, "[Record] ═══════════════════════════════════════════════════════")
+                Log.d(TAG, "[Record] FINALIZATION SUMMARY:")
+                Log.d(TAG, "[Record] - Recording ID: $recordingId")
+                Log.d(TAG, "[Record] - File path: ${outputFile.absolutePath}")
+                Log.d(TAG, "[Record] - File name: ${outputFile.name}")
+                Log.d(TAG, "[Record] - File exists: ${outputFile.exists()}")
+                Log.d(TAG, "[Record] - File size: ${String.format("%.2f", fileSizeMB)} MB ($fileSizeBytes bytes)")
+                Log.d(TAG, "[Record] - File last modified: ${outputFile.lastModified()}")
+                Log.d(TAG, "[Record] - Duration: ${(System.currentTimeMillis() - recordingStartTime) / 1000.0}s")
+                Log.d(TAG, "[Record] - Timestamp for video data: $recordingStartTime")
+                Log.d(TAG, "[Record] ═══════════════════════════════════════════════════════")
+
+                if (fileSizeBytes < minValidFileBytes) {
+                    Log.w(TAG, "[Record] invalid file (size too small: ${fileSizeBytes} bytes), not adding to gallery")
+                    outputFile.delete()
+                    sendEvent("recordingError", mapOf("error" to "RECORDING_FILE_TOO_SMALL"))
+                    resumePreviewAfterRecording()
+                    currentRecordingId = null
+                    recordingStartTime = 0
+                    currentOutputFile = null
+                    return@Thread
+                }
+                
+                // Simulate finalization progress
+                for (i in 1..5) {
+                    Thread.sleep(200)
+                    sendEvent("finalizeProgress", mapOf("progress" to (i * 0.2)))
+                }
+
+                // Generate thumbnail before sending event
+                Log.d(TAG, "[Record] Generating thumbnail for finalized video")
+                val thumbnailPath = generateVideoThumbnail(outputFile)
+                Log.d(TAG, "[Record] Thumbnail generation result: $thumbnailPath")
+
+                // Use file's last modified time as the definitive timestamp
+                val fileTimestamp = outputFile.lastModified()
+                val actualDuration = System.currentTimeMillis() - recordingStartTime
+
+                val videoData = mapOf(
+                    "id" to recordingId,
+                    "filePath" to outputFile.absolutePath,
+                    "thumbnailPath" to thumbnailPath,
+                    "duration" to actualDuration,
+                    "resolution" to currentResolution,
+                    "fps" to currentFps,
+                    "codec" to currentCodec,
+                    "preRollSeconds" to preRollSeconds,
+                    "size" to outputFile.length(),
+                    "timestamp" to fileTimestamp  // Use file's actual timestamp, not recordingStartTime
+                )
+
+                Log.d(TAG, "[Record] Video data being sent:")
+                Log.d(TAG, "[Record]   - id: $recordingId")
+                Log.d(TAG, "[Record]   - filePath: ${outputFile.absolutePath}")
+                Log.d(TAG, "[Record]   - thumbnailPath: $thumbnailPath")
+                Log.d(TAG, "[Record]   - timestamp: $fileTimestamp (file modified time)")
+                Log.d(TAG, "[Record]   - size: ${outputFile.length()} bytes")
+                Log.d(TAG, "[Record] Sending finalizeCompleted event")
+
+                refreshMediaStore(outputFile)
+                Log.i(TAG, "[Record] finalize SUCCESS: path=${outputFile.absolutePath}, sizeBytes=${outputFile.length()}")
+                sendEvent("finalizeCompleted", mapOf("video" to videoData))
+                
+                // Reset recording state
+                currentRecordingId = null
+                recordingStartTime = 0
+                currentOutputFile = null
+                
+                // Restart preview session
+                resumePreviewAfterRecording()
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "[Record] finalize ERROR", e)
+                sendEvent("recordingError", mapOf("error" to "Failed to save recording: ${e.message}"))
+            }
+        }.start()
+    }
+
+    private fun resumePreviewAfterRecording() {
+        backgroundHandler?.post {
+            if (!isRecording) {
+                try {
+                    // If buffer was running before recording, recreate buffer session
+                    // Otherwise just recreate preview session
+                    if (isBuffering) {
+                        Log.d(TAG, "Resuming buffer session after recording")
+                        createBufferPreviewSession()
+                    } else {
+                        Log.d(TAG, "Resuming preview session after recording")
+                        createCameraPreviewSession()
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to resume preview after recording", e)
+                }
+            }
+        }
+    }
+
+    private fun getOutputFile(): File {
+        // Generate unique filename using human-readable timestamp for testing
+        val timestamp = System.currentTimeMillis()
+        val dateFormat = java.text.SimpleDateFormat("yyyy-MM-dd_HH-mm-ss-SSS", java.util.Locale.US)
+        val dateStr = dateFormat.format(java.util.Date(timestamp))
+        val uniqueId = UUID.randomUUID().toString().take(6)
+        val fileName = "rec_${dateStr}_${uniqueId}.mp4"
+        val file = File(context.getExternalFilesDir(null), fileName)
+        Log.d(TAG, "[Record] Generated output file: ${file.name}")
+        return file
+    }
+
+    private fun switchCamera(result: MethodChannel.Result) {
+        try {
+            cameraFacing = if (cameraFacing == CameraCharacteristics.LENS_FACING_BACK) {
+                CameraCharacteristics.LENS_FACING_FRONT
+            } else {
+                CameraCharacteristics.LENS_FACING_BACK
+            }
+            
+            closeCamera()
+            openCamera()
+            result.success(null)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to switch camera", e)
+            result.error("SWITCH_ERROR", "Failed to switch camera: ${e.message}", null)
+        }
+    }
+
+    private fun setFlashMode(call: MethodCall, result: MethodChannel.Result) {
+        try {
+            flashMode = call.argument<String>("mode") ?: "off"
+            updatePreview()
+            result.success(null)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to set flash mode", e)
+            result.error("FLASH_ERROR", "Failed to set flash mode: ${e.message}", null)
+        }
+    }
+
+    private fun initializeZoomCapabilities(characteristics: CameraCharacteristics) {
+        try {
+            val maxZoomValue = characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)
+            maxZoom = maxZoomValue ?: 1.0f
+            minZoom = 1.0f
+            currentZoomLevel = 1.0f
+            Log.d(TAG, "🔍 Zoom capabilities initialized: min=$minZoom, max=$maxZoom")
+            Log.d(TAG, "🔍 Zoom range available: ${if (maxZoom > 1.0f) "YES" else "NO"}")
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Failed to initialize zoom capabilities", e)
+            maxZoom = 1.0f
+            minZoom = 1.0f
+            currentZoomLevel = 1.0f
+        }
+    }
+
+    private fun setZoom(call: MethodCall, result: MethodChannel.Result) {
+        try {
+            val zoomLevel = call.argument<Double>("zoom")?.toFloat() ?: 1.0f
+            Log.d(TAG, "🔍 setZoom called: requested=$zoomLevel, min=$minZoom, max=$maxZoom")
+            currentZoomLevel = zoomLevel.coerceIn(minZoom, maxZoom)
+            Log.d(TAG, "🔍 setZoom: clamped zoom level=$currentZoomLevel")
+            applyZoom()
+            Log.d(TAG, "🔍 setZoom: zoom applied successfully, returning $currentZoomLevel")
+            result.success(currentZoomLevel.toDouble())
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Failed to set zoom", e)
+            result.error("ZOOM_ERROR", "Failed to set zoom: ${e.message}", null)
+        }
+    }
+
+    private fun getMaxZoom(result: MethodChannel.Result) {
+        try {
+            Log.d(TAG, "🔍 getMaxZoom called: returning maxZoom=$maxZoom")
+            result.success(maxZoom.toDouble())
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Failed to get max zoom", e)
+            result.error("ZOOM_ERROR", "Failed to get max zoom: ${e.message}", null)
+        }
+    }
+
+    private fun applyZoom() {
+        try {
+            Log.d(TAG, "🔍 applyZoom: Starting, currentZoomLevel=$currentZoomLevel")
+            
+            val characteristics = cameraCharacteristics
+            if (characteristics == null) {
+                Log.w(TAG, "🔍 applyZoom: characteristics is null, returning")
+                return
+            }
+            
+            val session = captureSession
+            if (session == null) {
+                Log.w(TAG, "🔍 applyZoom: captureSession is null, returning")
+                return
+            }
+            
+            val builder = previewRequestBuilder
+            if (builder == null) {
+                Log.w(TAG, "🔍 applyZoom: previewRequestBuilder is null, returning")
+                return
+            }
+
+            // Get the active sensor array size
+            val sensorArraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            if (sensorArraySize == null) {
+                Log.w(TAG, "🔍 applyZoom: sensorArraySize is null, returning")
+                return
+            }
+
+            Log.d(TAG, "🔍 applyZoom: sensorArraySize=$sensorArraySize")
+
+            // Calculate crop region for zoom
+            val cropWidth = sensorArraySize.width() / currentZoomLevel
+            val cropHeight = sensorArraySize.height() / currentZoomLevel
+            val cropLeft = ((sensorArraySize.width() - cropWidth) / 2).toInt()
+            val cropTop = ((sensorArraySize.height() - cropHeight) / 2).toInt()
+
+            val cropRegion = android.graphics.Rect(
+                cropLeft,
+                cropTop,
+                (cropLeft + cropWidth).toInt(),
+                (cropTop + cropHeight).toInt()
+            )
+
+            Log.d(TAG, "🔍 applyZoom: cropRegion=$cropRegion")
+
+            // CRITICAL FIX: Ensure encoder surface is added if buffering/recording
+            // Note: We don't remove targets, just ensure encoder surface is present
+            if (isBuffering || isRecording) {
+                videoEncoderSurface?.let { 
+                    builder.addTarget(it)
+                    Log.d(TAG, "🔍 applyZoom: Ensured video encoder surface is in targets for continuous encoding")
+                }
+            }
+
+            // Apply crop region to the request builder
+            builder.set(CaptureRequest.SCALER_CROP_REGION, cropRegion)
+
+            // Update the repeating request
+            previewRequest = builder.build()
+            session.setRepeatingRequest(previewRequest!!, null, backgroundHandler)
+
+            Log.d(TAG, "✅ Zoom applied successfully: level=$currentZoomLevel, cropRegion=$cropRegion")
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Failed to apply zoom", e)
+            e.printStackTrace()
+        }
+    }
+
+    private fun updateSettings(call: MethodCall, result: MethodChannel.Result) {
+        try {
+            var needsPreviewUpdate = false
+            var resolutionChanged = false
+            var fpsChanged = false
+            
+            call.argument<String>("resolution")?.let { 
+                currentResolution = it
+                resolutionChanged = true
+                needsPreviewUpdate = true
+            }
+            call.argument<Int>("fps")?.let { 
+                currentFps = it
+                fpsChanged = true
+                needsPreviewUpdate = true // FPS change requires preview update
+                // CRITICAL: Update video delta when FPS changes
+                updateVideoDelta()
+            }
+            call.argument<String>("codec")?.let { currentCodec = it }
+            call.argument<Int>("preRollSeconds")?.let { 
+                preRollSeconds = it
+                // Update buffer duration if currently buffering
+                if (isBuffering) {
+                    selectedBufferSeconds = preRollSeconds
+                    val bufferDurationUs = (selectedBufferSeconds * 1_000_000).toLong()
+                    rollingBuffer.updateMaxDuration(bufferDurationUs)
+                    Log.d(TAG, "📝 Updated buffer duration to ${selectedBufferSeconds}s while buffering")
+                }
+            }
+            call.argument<Boolean>("stabilization")?.let { 
+                stabilizationEnabled = it
+                needsPreviewUpdate = true // Stabilization change requires preview update
+            }
+            
+            applyCaptureProfileFromCurrentState()
+
+            if (resolutionChanged || needsPreviewUpdate) {
+                updatePreviewDefaults()
+            }
+            
+            // Recreate session to apply new FPS or stabilization settings
+            if (needsPreviewUpdate && captureSession != null) {
+                // Close current session first
+                captureSession?.close()
+                captureSession = null
+                
+                // Recreate the appropriate session based on current mode
+                if (isBuffering) {
+                    Log.d(TAG, "Recreating buffer preview session with new FPS: $currentFps, videoDeltaUs: ${videoDeltaUs}µs")
+                    createBufferPreviewSession()
+                } else {
+                    Log.d(TAG, "Recreating preview session with new FPS: $currentFps")
+                    createCameraPreviewSession()
+                }
+            }
+            
+            sendEvent("settingsUpdated", null)
+            result.success(null)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to update settings", e)
+            result.error("SETTINGS_ERROR", "Failed to update settings: ${e.message}", null)
+        }
+    }
+
+    private fun checkDetailedCapabilities(result: MethodChannel.Result) {
+        try {
+            val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val cameraId = cameraManager.cameraIdList.firstOrNull { id ->
+                val characteristics = cameraManager.getCameraCharacteristics(id)
+                characteristics.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+            } ?: run {
+                result.success(hashMapOf(
+                    "supports4K" to false,
+                    "supports1080p60fps" to false,
+                    "supports4K60fps" to false,
+                    "supports1080p30fps" to true
+                ))
+                return
+            }
+            
+            val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+            val streamConfigMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            
+            if (streamConfigMap == null) {
+                Log.e(TAG, "Stream configuration map is null")
+                result.success(hashMapOf(
+                    "supports4K" to false,
+                    "supports1080p60fps" to false,
+                    "supports4K60fps" to false,
+                    "supports1080p30fps" to true
+                ))
+                return
+            }
+            
+            // Get all supported sizes for MediaRecorder
+            val outputSizes = streamConfigMap.getOutputSizes(MediaRecorder::class.java)
+            
+            // Check for 4K support (3840x2160)
+            val supports4K = outputSizes?.any { size ->
+                size.width == 3840 && size.height == 2160
+            } ?: false
+            
+            // Check for 1080p support (1920x1080)
+            val supports1080p = outputSizes?.any { size ->
+                size.width == 1920 && size.height == 1080
+            } ?: false
+            
+            Log.d(TAG, "Available sizes: ${outputSizes?.joinToString { "${it.width}x${it.height}" }}")
+            
+            // Get FPS ranges
+            val normalFpsRanges = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            
+            Log.d(TAG, "Normal FPS ranges: ${normalFpsRanges?.joinToString { "[${it.lower}, ${it.upper}]" }}")
+            
+            // Check 60fps support
+            val has60fpsRange = normalFpsRanges?.any { range ->
+                range.upper >= 60 && range.lower <= 60
+            } ?: false
+            
+            var supports1080p60fps = supports1080p && has60fpsRange
+            var supports4K60fps = supports4K && has60fpsRange
+            
+            // Additional verification with MediaRecorder
+            if (supports1080p60fps) {
+                supports1080p60fps = checkMediaRecorderSupport(1920, 1080, 60)
+            }
+            
+            if (supports4K60fps) {
+                supports4K60fps = checkMediaRecorderSupport(3840, 2160, 60)
+            }
+            
+            val capabilities = hashMapOf<String, Boolean>(
+                "supports4K" to supports4K,
+                "supports1080p60fps" to supports1080p60fps,
+                "supports4K60fps" to supports4K60fps,
+                "supports1080p30fps" to supports1080p
+            )
+            
+            Log.d(TAG, "✅ Final capabilities: $capabilities")
+            result.success(capabilities)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error checking detailed capabilities", e)
+            result.success(hashMapOf(
+                "supports4K" to false,
+                "supports1080p60fps" to false,
+                "supports4K60fps" to false,
+                "supports1080p30fps" to true
+            ))
+        }
+    }
+
+    private fun checkMediaRecorderSupport(width: Int, height: Int, fps: Int): Boolean {
+        return try {
+            val recorder = MediaRecorder()
+            recorder.setVideoSource(MediaRecorder.VideoSource.CAMERA)
+            recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            recorder.setVideoSize(width, height)
+            recorder.setVideoFrameRate(fps)
+            recorder.setVideoEncodingBitRate(width * height * fps / 10)
+            
+            val tempFile = File.createTempFile("test", ".mp4", context.cacheDir)
+            recorder.setOutputFile(tempFile.absolutePath)
+            
+            recorder.prepare()
+            recorder.release()
+            tempFile.delete()
+            
+            Log.d(TAG, "✅ MediaRecorder supports ${width}x${height}@${fps}fps")
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "❌ MediaRecorder test failed for ${width}x${height}@${fps}fps: ${e.message}")
+            false
+        }
+    }
+
+    private fun getDeviceCapabilities(result: MethodChannel.Result) {
+        try {
+            val totalRamMb = getTotalRamMb()
+            val ramTier = classifyRamTier(totalRamMb)
+
+            val characteristics = ensureCameraCharacteristics()
+            val supportedResolutions = collectSupportedResolutions(characteristics)
+            val supportedFpsValues = collectSupportedFps(characteristics)
+            val supportedCodecs = collectSupportedCodecs()
+            val preferredBufferMode = resolveBufferModeForTier(ramTier)
+
+            val capabilities = hashMapOf<String, Any>(
+                "ramMB" to totalRamMb,
+                "supportedResolutions" to ArrayList(supportedResolutions),
+                "supportedFps" to ArrayList(supportedFpsValues),
+                "supportedCodecs" to ArrayList(supportedCodecs),
+                "deviceTier" to ramTier,
+                "preferredBufferMode" to preferredBufferMode
+            )
+
+            Log.i(
+                TAG,
+                "[DeviceTier][$ramTier] RAM=${totalRamMb}MB buffer=$preferredBufferMode res=$supportedResolutions fps=$supportedFpsValues codecs=$supportedCodecs"
+            )
+
+            result.success(capabilities)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get device capabilities", e)
+            result.error("CAPABILITIES_ERROR", "Failed to get capabilities: ${e.message}", null)
+        }
+    }
+
+    private fun closeCamera() {
+        try {
+            cameraOpenCloseLock.acquire()
+            captureSession?.close()
+            captureSession = null
+            cameraDevice?.close()
+            cameraDevice = null
+            bufferImageReader?.close()
+            bufferImageReader = null
+        } catch (e: InterruptedException) {
+            throw RuntimeException("Interrupted while trying to lock camera closing.", e)
+        } finally {
+            cameraOpenCloseLock.release()
+        }
+    }
+
+    private fun ensureCameraCharacteristics(): CameraCharacteristics? {
+        if (cameraCharacteristics != null) return cameraCharacteristics
+        return try {
+            val cameraId = getCameraId()
+            val characteristics = cameraManager?.getCameraCharacteristics(cameraId)
+            cameraCharacteristics = characteristics
+            characteristics
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to load camera characteristics", e)
+            null
+        }
+    }
+
+    private fun collectSupportedResolutions(characteristics: CameraCharacteristics?): List<String> {
+        val buckets = linkedSetOf<String>()
+        val streamConfig = characteristics?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val sizes = streamConfig?.getOutputSizes(MediaRecorder::class.java)
+            ?: streamConfig?.getOutputSizes(SurfaceTexture::class.java)
+
+        sizes?.forEach { size ->
+            when {
+                size.width >= 3800 || size.height >= 2100 -> buckets.add("4K")
+                size.width >= 1900 || size.height >= 1050 -> buckets.add("1080P")
+                size.width >= 1200 || size.height >= 700 -> buckets.add("720P")
+            }
+        }
+
+        if (buckets.isEmpty()) {
+            buckets.add("1080P")
+            buckets.add("720P")
+        }
+
+        val preferredOrder = listOf("4K", "1080P", "720P")
+        return buckets.sortedWith(compareBy { value ->
+            val index = preferredOrder.indexOf(value)
+            if (index >= 0) index else preferredOrder.size
+        })
+    }
+
+    private fun collectSupportedFps(characteristics: CameraCharacteristics?): List<Int> {
+        val ranges = characteristics?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+        val fpsSet = sortedSetOf<Int>()
+
+        ranges?.forEach { range ->
+            listOf(range.lower, range.upper).forEach { fps ->
+                val normalizedFps = if (fps >= 240 && fps % 1000 == 0) fps / 1000 else fps
+                when {
+                    normalizedFps >= 120 -> fpsSet.add(120)
+                    normalizedFps >= 60 -> fpsSet.add(60)
+                    normalizedFps >= 30 -> fpsSet.add(30)
+                    normalizedFps >= 24 -> fpsSet.add(24)
+                }
+            }
+        }
+
+        if (fpsSet.isEmpty()) {
+            fpsSet.add(30)
+        }
+
+        return fpsSet.toList()
+    }
+
+    private fun collectSupportedCodecs(): List<String> {
+        val codecs = linkedSetOf("H.264")
+        try {
+            val codecList = MediaCodecList(MediaCodecList.ALL_CODECS)
+            codecList.codecInfos.filter { it.isEncoder }.forEach { info ->
+                info.supportedTypes.forEach { type ->
+                    when (type) {
+                        MediaFormat.MIMETYPE_VIDEO_HEVC -> codecs.add("HEVC")
+                        MediaFormat.MIMETYPE_VIDEO_AVC -> codecs.add("H.264")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to enumerate codecs", e)
+        }
+
+        return codecs.toList()
+    }
+
+    private fun getTotalRamMb(): Int {
+        return try {
+            val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val memoryInfo = ActivityManager.MemoryInfo()
+            activityManager.getMemoryInfo(memoryInfo)
+            (memoryInfo.totalMem / (1024 * 1024)).toInt()
+        } catch (e: Exception) {
+            Log.w(TAG, "Unable to read total RAM", e)
+            4096
+        }
+    }
+
+    private fun classifyRamTier(ramMb: Int): String = when {
+        ramMb >= 6144 -> "high"
+        ramMb >= 3072 -> "mid"
+        else -> "low"
+    }
+
+    private fun resolveBufferModeForTier(ramTier: String): String = if (ramTier == "high") "ram" else "disk"
+
+    private fun selectAutoResolution(ramTier: String, options: List<String>): String {
+        return when (ramTier) {
+            "high" -> options.firstOrNull() ?: "1080P"
+            "mid" -> when {
+                options.contains("1080P") -> "1080P"
+                else -> options.lastOrNull() ?: "1080P"
+            }
+            else -> when {
+                options.contains("720P") -> "720P"
+                options.contains("1080P") -> "1080P"
+                else -> options.lastOrNull() ?: "720P"
+            }
+        }
+    }
+
+    private fun applyCaptureProfileFromCurrentState() {
+        val profile = selectCaptureProfile(
+            requestedResolution = currentResolution,
+            requestedFps = currentFps,
+            requestedCodec = currentCodec,
+            requestedPreRollSeconds = preRollSeconds
+        )
+        applyCaptureProfile(profile)
+    }
+
+    private fun selectCaptureProfile(
+        requestedResolution: String,
+        requestedFps: Int,
+        requestedCodec: String,
+        requestedPreRollSeconds: Int
+    ): CaptureProfile {
+        val totalRamMb = getTotalRamMb()
+        val ramTier = classifyRamTier(totalRamMb)
+        val bufferMode = resolveBufferModeForTier(ramTier)
+        val downgradeReasons = mutableListOf<String>()
+        val characteristics = ensureCameraCharacteristics()
+        val supportedResolutions = collectSupportedResolutions(characteristics)
+        val supportedFpsValues = collectSupportedFps(characteristics)
+        val supportedCodecs = collectSupportedCodecs()
+
+        val normalizedResolution = requestedResolution.uppercase(Locale.US)
+        val resolvedResolution = when (normalizedResolution) {
+            "AUTO" -> {
+                val autoResolution = selectAutoResolution(ramTier, supportedResolutions)
+                if (supportedResolutions.isNotEmpty() && autoResolution != supportedResolutions.first()) {
+                    downgradeReasons.add("Auto resolution chose $autoResolution for $ramTier-tier device")
+                }
+                autoResolution
+            }
+            else -> {
+                if (supportedResolutions.contains(normalizedResolution)) {
+                    normalizedResolution
+                } else {
+                    val fallback = when {
+                        ramTier == "low" && supportedResolutions.contains("720P") -> "720P"
+                        supportedResolutions.contains("1080P") -> "1080P"
+                        else -> supportedResolutions.lastOrNull() ?: "1080P"
+                    }
+                    downgradeReasons.add("Resolution fallback: $normalizedResolution -> $fallback")
+                    fallback
+                }
+            }
+        }
+
+        val requestedFpsSanitized = requestedFps.takeIf { it > 0 } ?: 30
+        val sortedFps = supportedFpsValues.sorted()
+        var resolvedFps = sortedFps.lastOrNull { it <= requestedFpsSanitized }
+            ?: sortedFps.lastOrNull()
+            ?: 30
+
+        if (ramTier == "low" && resolvedFps > 30) {
+            downgradeReasons.add("FPS limited to 30 for $ramTier-tier device")
+            resolvedFps = 30
+        } else if (ramTier == "mid" && resolvedFps > 60) {
+            downgradeReasons.add("FPS limited to 60 for mid-tier device")
+            resolvedFps = 60
+        }
+
+        if (!supportedFpsValues.contains(requestedFpsSanitized) && resolvedFps != requestedFpsSanitized) {
+            downgradeReasons.add("Requested FPS $requestedFpsSanitized not available, using $resolvedFps")
+        }
+
+        val normalizedCodec = requestedCodec.uppercase(Locale.US)
+        var resolvedCodec = when (normalizedCodec) {
+            "AUTO" -> if (ramTier == "high" && supportedCodecs.contains("HEVC")) "HEVC" else "H.264"
+            else -> if (supportedCodecs.contains(normalizedCodec)) normalizedCodec else "H.264"
+        }
+
+        if (ramTier != "high" && resolvedCodec == "HEVC") {
+            downgradeReasons.add("Codec forced to H.264 for $ramTier-tier device")
+            resolvedCodec = "H.264"
+        }
+
+        // Allow user's requested buffer duration without clamping
+        // The rolling buffer will handle memory efficiently regardless of duration
+        val bufferClamp = requestedPreRollSeconds
+
+        // Only log if we would have clamped (for debugging)
+        val wouldClamp = when (ramTier) {
+            "high" -> requestedPreRollSeconds > 30
+            "mid" -> requestedPreRollSeconds > 20
+            else -> requestedPreRollSeconds > 10
+        }
+        if (wouldClamp) {
+            Log.d(TAG, "Note: Using ${requestedPreRollSeconds}s buffer on $ramTier-tier device (user selected)")
+        }
+
+        return CaptureProfile(
+            resolution = resolvedResolution,
+            fps = resolvedFps,
+            codec = resolvedCodec,
+            bufferSeconds = bufferClamp,
+            bufferMode = bufferMode,
+            ramTier = ramTier,
+            downgradeReasons = downgradeReasons
+        )
+    }
+
+    private fun applyCaptureProfile(profile: CaptureProfile) {
+        currentResolution = profile.resolution
+        currentFps = profile.fps
+        currentCodec = profile.codec
+        selectedBufferSeconds = profile.bufferSeconds
+        preRollSeconds = profile.bufferSeconds
+        bufferDurationMs = profile.bufferSeconds * 1000L
+        rollingBuffer.updateMaxDuration(profile.bufferSeconds * 1_000_000L)
+        activeCaptureProfile = profile
+        currentRamTier = profile.ramTier
+        currentBufferMode = profile.bufferMode
+
+        val reasons = if (profile.downgradeReasons.isEmpty()) "native" else profile.downgradeReasons.joinToString("; ")
+        Log.i(
+            TAG,
+            "[CaptureProfile] tier=${profile.ramTier}, mode=${profile.bufferMode}, res=${profile.resolution}, fps=${profile.fps}, codec=${profile.codec}, buffer=${profile.bufferSeconds}s, reasons=$reasons"
+        )
+    }
+
+    private fun startBackgroundThread() {
+        backgroundThread = HandlerThread("CameraBackground").also { it.start() }
+        backgroundHandler = Handler(backgroundThread?.looper ?: Looper.getMainLooper())
+    }
+
+    private fun stopBackgroundThread() {
+        backgroundThread?.quitSafely()
+        try {
+            backgroundThread?.join()
+            backgroundThread = null
+            backgroundHandler = null
+        } catch (e: InterruptedException) {
+            Log.e(TAG, "Error stopping background thread", e)
+        }
+    }
+
+    private fun sendEvent(type: String, data: Any?) {
+        Handler(Looper.getMainLooper()).post {
+            try {
+                val event = mutableMapOf<String, Any?>("type" to type)
+                data?.let { 
+                    if (it is Map<*, *>) {
+                        event.putAll(it as Map<String, Any?>)
+                    }
+                }
+                eventSink?.success(event)
+                Log.d(TAG, "Event sent: $type")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to send event: $type", e)
+            }
+        }
+    }
+    
+    private fun updateSubscription(call: MethodCall, result: MethodChannel.Result) {
+        try {
+            val args = call.arguments as? Map<String, Any>
+            val newIsProUser = args?.get("isProUser") as? Boolean ?: false
+            
+            if (newIsProUser != isProUser) {
+                isProUser = newIsProUser
+                val oldBufferDuration = bufferDurationMs
+                // Keep using the current preRollSeconds setting, don't override based on subscription
+                // bufferDurationMs should be controlled by user's selected buffer duration, not subscription tier
+                
+                Log.d(TAG, "Subscription updated: pro=$isProUser, current buffer=${bufferDurationMs}ms (based on preRollSeconds: $preRollSeconds)")
+                
+                sendEvent("subscriptionUpdated", mapOf(
+                    "isProUser" to isProUser,
+                    "bufferDuration" to (bufferDurationMs / 1000).toInt()
+                ))
+            }
+            
+            result.success(null)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to update subscription", e)
+            result.error("SUBSCRIPTION_ERROR", "Failed to update subscription: ${e.message}", null)
+        }
+    }
+
+    private fun dispose() {
+        try {
+            // Clean up continuous buffer and encoders
+            isBufferInitialized = false
+            isAudioCapturing = false
+            bufferLoggingTimer?.cancel()
+            bufferLoggingTimer = null
+            
+            // Stop and release audio recorder
+            try {
+                audioRecord?.stop()
+                audioRecord?.release()
+                audioRecord = null
+            } catch (e: Exception) {
+                Log.e(TAG, "Error stopping audio recorder", e)
+            }
+            
+            // Stop audio thread
+            audioHandler?.removeCallbacksAndMessages(null)
+            audioThread?.quitSafely()
+            audioThread = null
+            audioHandler = null
+            
+            // Stop and release encoders
+            try {
+                videoEncoder?.stop()
+                videoEncoder?.release()
+                videoEncoder = null
+            } catch (e: Exception) {
+                Log.e(TAG, "Error stopping video encoder", e)
+            }
+            
+            try {
+                audioEncoder?.stop()
+                audioEncoder?.release()
+                audioEncoder = null
+            } catch (e: Exception) {
+                Log.e(TAG, "Error stopping audio encoder", e)
+            }
+            
+            videoEncoderSurface?.release()
+            videoEncoderSurface = null
+            
+            // Stop encoder thread
+            encoderHandler?.removeCallbacksAndMessages(null)
+            encoderThread?.quitSafely()
+            encoderThread = null
+            encoderHandler = null
+            
+            // Clear rolling buffer
+            rollingBuffer.clear()
+            
+            // Clean up pending buffer file
+            pendingBufferFile?.delete()
+            pendingBufferFile = null
+            
+            // Clean up pre-roll directory
+            val bufferDir = File(context.filesDir, "preroll_buffer")
+            if (bufferDir.exists()) {
+                bufferDir.listFiles()?.forEach { it.delete() }
+                bufferDir.delete()
+            }
+            
+            stopBuffer(object : MethodChannel.Result {
+                override fun success(result: Any?) {}
+                override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {}
+                override fun notImplemented() {}
+            })
+            
+            bufferUpdateTask?.cancel()
+            bufferTimer.cancel()
+            
+            if (isRecording) {
+                stopRecording(object : MethodChannel.Result {
+                    override fun success(result: Any?) {}
+                    override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {}
+                    override fun notImplemented() {}
+                })
+            }
+            
+            closeCamera()
+            stopBackgroundThread()
+            
+            previewSurface?.release()
+            previewSurface = null
+            textureEntry?.release()
+            textureEntry = null
+            
+            Log.d(TAG, "CameraPlugin disposed")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during dispose", e)
+        }
+    }
+    
+    /**
+     * Get device orientation for recording metadata.
+     * This does NOT rotate the preview - only sets metadata for proper video playback.
+     */
+    private fun getDeviceOrientationForRecording(): Int {
+        val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val display = windowManager.defaultDisplay
+        val rotation = display.rotation
+        
+        // Get camera sensor orientation
+        val cameraId = getCameraId()
+        val characteristics = cameraManager?.getCameraCharacteristics(cameraId)
+        val sensorOrientation = characteristics?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        
+        // Calculate the orientation for the video file based on device rotation
+        // This ensures the video plays correctly in gallery apps
+        val orientation = when (rotation) {
+            Surface.ROTATION_0 -> sensorOrientation        // Portrait
+            Surface.ROTATION_90 -> 0                        // Landscape (left)
+            Surface.ROTATION_180 -> (sensorOrientation + 180) % 360  // Upside down
+            Surface.ROTATION_270 -> 180                     // Landscape (right)
+            else -> sensorOrientation
+        }
+        
+        Log.d(TAG, "[Orientation] Display rotation=$rotation, sensor=$sensorOrientation\u00b0, final=$orientation\u00b0")
+        return orientation
+    }
+}
+
+data class CaptureProfile(
+    val resolution: String,
+    val fps: Int,
+    val codec: String,
+    val bufferSeconds: Int,
+    val bufferMode: String,
+    val ramTier: String,
+    val downgradeReasons: List<String> = emptyList()
+)
+
+data class VideoEncoderSettings(
+    val width: Int,
+    val height: Int,
+    val fps: Int,
+    val bitRate: Int,
+    val codec: String,
+    val mimeType: String,
+    val isFallback: Boolean
+) {
+    val summary: String
+        get() = "${width}x$height@${fps}fps ${codec} ${bitRate / 1_000_000}Mbps (fallback=$isFallback)"
+}
