@@ -2244,12 +2244,19 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
             // ═══════════════════════════════════════════════════════════════════
             // CRITICAL: Expand buffer max duration to hold pre-roll + live recording
             // Without this, the rolling buffer would trim pre-roll samples during recording!
-            // Allow up to 5 minutes of live recording on top of buffer
+            // Max recording time depends on resolution/fps (lower bitrate = longer recording)
             // ═══════════════════════════════════════════════════════════════════
-            val maxLiveRecordingUs = 5L * 60 * 1_000_000L // 5 minutes max
+            val maxLiveRecordingMinutes = when {
+                currentResolution == "4K" && currentFps >= 60 -> 5   // 4K60: ~5.7MB/s → 5 min max
+                currentResolution == "4K" && currentFps <= 30 -> 10  // 4K30: ~2.8MB/s → 10 min max
+                currentResolution == "1080P" && currentFps >= 60 -> 10 // 1080p60: ~1.5MB/s → 10 min max
+                currentResolution == "1080P" && currentFps <= 30 -> 15 // 1080p30: ~0.75MB/s → 15 min max
+                else -> 10 // Default: 10 minutes
+            }
+            val maxLiveRecordingUs = maxLiveRecordingMinutes.toLong() * 60 * 1_000_000L
             val expandedBufferDurationUs = (selectedBufferSeconds * 1_000_000L) + maxLiveRecordingUs
             rollingBuffer.updateMaxDuration(expandedBufferDurationUs)
-            Log.d(TAG, "[Record] Buffer expanded to ${expandedBufferDurationUs / 1_000_000}s to preserve pre-roll during recording")
+            Log.d(TAG, "[Record] Buffer expanded to ${expandedBufferDurationUs / 1_000_000}s (${maxLiveRecordingMinutes}min max for $currentResolution@${currentFps}fps)")
             
             // Set recording flag - buffer will continue writing samples as normal
             isRecording = true
