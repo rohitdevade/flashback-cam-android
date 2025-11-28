@@ -89,6 +89,39 @@ class _CameraScreenState extends State<CameraScreen> {
     );
   }
 
+  /// Check for recording errors and show them to the user
+  void _checkRecordingErrors(AppState appState) {
+    // Use post-frame callback to avoid showing snackbar during build
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final error = appState.consumeRecordingError();
+      if (error != null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Row(
+              children: [
+                const Icon(Icons.error_outline, color: Colors.white, size: 20),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    error,
+                    style: const TextStyle(fontSize: 13),
+                  ),
+                ),
+              ],
+            ),
+            duration: const Duration(seconds: 4),
+            backgroundColor: AppColors.recordRed,
+            behavior: SnackBarBehavior.floating,
+            margin: const EdgeInsets.all(16),
+            shape:
+                RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          ),
+        );
+      }
+    });
+  }
+
   Future<void> _loadCapabilities() async {
     final appState = context.read<AppState>();
     final capabilities =
@@ -170,6 +203,9 @@ class _CameraScreenState extends State<CameraScreen> {
 
     // Check if we should show instructions (after AppState is initialized)
     _checkShowInstructions(appState);
+
+    // Check for and display any recording errors
+    _checkRecordingErrors(appState);
 
     return OrientationBuilder(
       builder: (context, orientation) {
@@ -336,6 +372,7 @@ class _CameraScreenState extends State<CameraScreen> {
       isCameraReady: appState.isCameraReady,
       cameraMode: appState.cameraMode,
       isRecording: appState.isRecording,
+      isPreparingRecording: appState.isPreparingRecording,
       onRecordTap: () => appState.isRecording
           ? appState.stopRecording()
           : appState.startRecording(),
@@ -788,6 +825,7 @@ class FinalizingIndicator extends StatelessWidget {
 class BottomControls extends StatelessWidget {
   final CameraMode cameraMode;
   final bool isRecording;
+  final bool isPreparingRecording;
   final bool isCameraReady;
   final VoidCallback onRecordTap;
   final VoidCallback onBufferToggle;
@@ -805,6 +843,7 @@ class BottomControls extends StatelessWidget {
     super.key,
     required this.cameraMode,
     required this.isRecording,
+    this.isPreparingRecording = false,
     required this.isCameraReady,
     required this.onRecordTap,
     required this.onBufferToggle,
@@ -823,7 +862,9 @@ class BottomControls extends StatelessWidget {
   Widget build(BuildContext context) {
     final isIdle = cameraMode == CameraMode.idle;
     final isBuffering = cameraMode == CameraMode.buffering;
-    final canRecord = isCameraReady && (isBuffering || isRecording);
+    // Disable button while preparing to record (prevents double-taps)
+    final canRecord =
+        isCameraReady && (isBuffering || isRecording) && !isPreparingRecording;
 
     if (isPortrait) {
       return Padding(
@@ -849,6 +890,7 @@ class BottomControls extends StatelessWidget {
                 ),
                 RecordButton(
                   isRecording: isRecording,
+                  isPreparing: isPreparingRecording,
                   onTap: onRecordTap,
                   bufferProgress: bufferProgress,
                   selectedBufferSeconds: selectedBufferSeconds,
@@ -913,6 +955,7 @@ class BottomControls extends StatelessWidget {
           const SizedBox(height: 24),
           RecordButton(
             isRecording: isRecording,
+            isPreparing: isPreparingRecording,
             onTap: onRecordTap,
             bufferProgress: bufferProgress,
             selectedBufferSeconds: selectedBufferSeconds,

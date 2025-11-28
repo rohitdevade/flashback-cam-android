@@ -46,6 +46,12 @@ class AppState extends ChangeNotifier {
   double _zoomLevel = 1.0;
   double _maxZoom = 8.0; // Will be updated from camera capabilities
 
+  // Recording error tracking - cleared after being read
+  String? _lastRecordingError;
+
+  // Flag to indicate recording is being prepared (after button tap, before recording starts)
+  bool _isPreparingRecording = false;
+
   // Dynamic buffer progress tracking
   DateTime? _bufferStartTime;
   Timer? _progressTimer;
@@ -234,6 +240,7 @@ class AppState extends ChangeNotifier {
       switch (eventType) {
         case 'recordingStarted':
           _cameraMode = CameraMode.recording;
+          _isPreparingRecording = false;
           notifyListeners();
           break;
         case 'recordingFinished':
@@ -317,7 +324,10 @@ class AppState extends ChangeNotifier {
           break;
         case 'recordingError':
           final error = event['error'] as String? ?? 'Unknown error';
-          debugPrint('Recording error: $error');
+          final errorCode = event['code'] as String?;
+          debugPrint('Recording error: $error (code: $errorCode)');
+          _lastRecordingError = error;
+          _isPreparingRecording = false;
           _cameraMode = CameraMode.buffering;
           notifyListeners();
           break;
@@ -478,15 +488,49 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> startRecording() async {
-    if (!_isInitialized || _cameraMode != CameraMode.buffering) {
-      debugPrint('Cannot start recording: camera mode is $_cameraMode');
+    if (!_isInitialized) {
+      debugPrint('Cannot start recording: not initialized');
       return;
     }
+
+    // CRITICAL: Recording only works when buffering is active
+    // This is required for DVR-style pre-roll recording
+    if (_cameraMode != CameraMode.buffering) {
+      debugPrint(
+          'Cannot start recording: buffer must be active first (current mode: $_cameraMode)');
+      _lastRecordingError =
+          'Start buffer first to enable recording with pre-roll';
+      notifyListeners();
+      return;
+    }
+
+    // Prevent double-taps while preparing
+    if (_isPreparingRecording) {
+      debugPrint('Already preparing to record, ignoring tap');
+      return;
+    }
+
     try {
+      _isPreparingRecording = true;
+      notifyListeners();
+
       await _cameraService.startRecording();
       // State will be updated by recordingStarted event
     } catch (e) {
       debugPrint('Failed to start recording: $e');
+      _isPreparingRecording = false;
+
+      // Parse error message for user-friendly feedback
+      final errorStr = e.toString();
+      if (errorStr.contains('BUFFER_NOT_ACTIVE')) {
+        _lastRecordingError =
+            'Start buffer first to enable recording with pre-roll';
+      } else if (errorStr.contains('EXPORT_IN_PROGRESS')) {
+        _lastRecordingError = 'Previous recording is still being saved';
+      } else {
+        _lastRecordingError = 'Failed to start recording';
+      }
+      notifyListeners();
     }
   }
 
@@ -653,6 +697,17 @@ class AppState extends ChangeNotifier {
   bool get isProUser => _isProUser;
   int get bufferDuration => _bufferDuration;
   DateTime? get bufferStartTime => _bufferStartTime;
+
+  /// Get and clear the last recording error (returns null if no error)
+  String? consumeRecordingError() {
+    final error = _lastRecordingError;
+    _lastRecordingError = null;
+    return error;
+  }
+
+  /// Returns true if recording is being prepared (after tap, before recording starts)
+  bool get isPreparingRecording => _isPreparingRecording;
+
   double get zoomLevel => _zoomLevel;
   double get maxZoom => _maxZoom;
 

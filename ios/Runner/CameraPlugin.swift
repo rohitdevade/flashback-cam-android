@@ -264,6 +264,12 @@ public class CameraPlugin: NSObject, FlutterPlugin, AVCaptureFileOutputRecording
     }
     
     private func startRecording(result: @escaping FlutterResult) {
+        // CRITICAL: Ensure buffer is running before recording can start (DVR-style recording)
+        guard isBuffering else {
+            result(FlutterError(code: "BUFFER_NOT_ACTIVE", message: "Start buffer first to enable recording with pre-roll", details: nil))
+            return
+        }
+        
         guard let output = movieOutput, !isRecording else {
             result(FlutterError(code: "ERROR", message: "Not ready to record", details: nil))
             return
@@ -282,16 +288,20 @@ public class CameraPlugin: NSObject, FlutterPlugin, AVCaptureFileOutputRecording
             // Current implementation uses AVCaptureMovieFileOutput which doesn't
             // support pre-roll. For now, iOS records without the buffer.
             // 
-            // To implement full buffer recording:
+            // To implement full DVR-style buffer recording:
             // - Replace AVCaptureMovieFileOutput with AVAssetWriter
             // - Add AVCaptureVideoDataOutput and AVCaptureAudioDataOutput
             // - Implement continuous encoding to rollingBuffer
-            // - On record start, write buffer snapshot + continue with live samples
+            // - On record start, mark timestamp (O(1) operation)
+            // - On record stop, export buffer snapshot + live samples in background
             
             if let bufferDuration = self.bufferStartTime {
                 let elapsed = Date().timeIntervalSince(bufferDuration)
-                print("[iOS] Buffer has been running for \(elapsed)s, contains ~\(self.rollingBuffer?.getDurationSeconds() ?? 0)s")
-                print("[iOS] Note: iOS implementation needs AVAssetWriter for full pre-roll support")
+                let actualPreroll = min(Double(self.preRollSeconds), elapsed)
+                print("[iOS] 🎬 RECORDING STARTED (DVR-style)")
+                print("[iOS] - Buffer running for \(String(format: "%.2f", elapsed))s")
+                print("[iOS] - Available pre-roll: \(String(format: "%.2f", actualPreroll))s")
+                print("[iOS] Note: Full pre-roll requires AVAssetWriter implementation")
             }
             
             // Ensure orientation
@@ -305,7 +315,7 @@ public class CameraPlugin: NSObject, FlutterPlugin, AVCaptureFileOutputRecording
             self.isRecording = true
             
             DispatchQueue.main.async {
-                self.sendEvent(event: "recordingStarted", data: [:])
+                self.sendEvent(event: "recordingStarted", data: ["prerollAvailable": 0])
                 result(fileName)
             }
         }

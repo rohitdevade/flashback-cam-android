@@ -4,6 +4,7 @@ import 'package:flashback_cam/theme.dart';
 
 class RecordButton extends StatefulWidget {
   final bool isRecording;
+  final bool isPreparing;
   final VoidCallback onTap;
   final double bufferProgress;
   final int selectedBufferSeconds;
@@ -12,6 +13,7 @@ class RecordButton extends StatefulWidget {
   const RecordButton({
     super.key,
     required this.isRecording,
+    this.isPreparing = false,
     required this.onTap,
     required this.bufferProgress,
     required this.selectedBufferSeconds,
@@ -25,7 +27,6 @@ class RecordButton extends StatefulWidget {
 class _RecordButtonState extends State<RecordButton>
     with TickerProviderStateMixin {
   late AnimationController _breathController;
-  late AnimationController _sweepController;
   late AnimationController _pulseController;
 
   @override
@@ -36,17 +37,10 @@ class _RecordButtonState extends State<RecordButton>
       duration: Duration(seconds: 3),
     );
 
-    _sweepController = AnimationController(
-      vsync: this,
-      duration: Duration(seconds: 2),
-    );
-
     if (widget.isEnabled) {
       _breathController.repeat(reverse: true);
-      _sweepController.repeat();
     } else {
       _breathController.value = 0.0;
-      _sweepController.value = 0.0;
     }
 
     _pulseController = AnimationController(
@@ -66,12 +60,8 @@ class _RecordButtonState extends State<RecordButton>
     if (oldWidget.isEnabled != widget.isEnabled) {
       if (widget.isEnabled) {
         _breathController.repeat(reverse: true);
-        _sweepController.repeat();
       } else {
         _breathController
-          ..stop()
-          ..value = 0.0;
-        _sweepController
           ..stop()
           ..value = 0.0;
       }
@@ -90,7 +80,6 @@ class _RecordButtonState extends State<RecordButton>
   @override
   void dispose() {
     _breathController.dispose();
-    _sweepController.dispose();
     _pulseController.dispose();
     super.dispose();
   }
@@ -99,18 +88,18 @@ class _RecordButtonState extends State<RecordButton>
   Widget build(BuildContext context) => GestureDetector(
         onTap: widget.isEnabled ? widget.onTap : null,
         child: AnimatedBuilder(
-          animation: Listenable.merge(
-              [_breathController, _sweepController, _pulseController]),
+          animation: Listenable.merge([_breathController, _pulseController]),
           builder: (context, child) {
-            final breathScale = widget.isEnabled && !widget.isRecording
-                ? 1.0 + (_breathController.value * 0.03)
-                : 1.0;
+            final breathScale =
+                widget.isEnabled && !widget.isRecording && !widget.isPreparing
+                    ? 1.0 + (_breathController.value * 0.03)
+                    : 1.0;
             final pulseScale = widget.isRecording
                 ? 1.0 + (sin(_pulseController.value * 2 * pi) * 0.08)
                 : 1.0;
 
             return Opacity(
-              opacity: widget.isEnabled ? 1.0 : 0.3,
+              opacity: widget.isEnabled || widget.isPreparing ? 1.0 : 0.3,
               child: Container(
                 width: 80,
                 height: 80,
@@ -122,8 +111,9 @@ class _RecordButtonState extends State<RecordButton>
                       size: Size(80, 80),
                       painter: BufferRingPainter(
                         progress: widget.bufferProgress,
-                        sweepProgress: _sweepController.value,
-                        color: AppColors.electricBlue,
+                        color: widget.isPreparing
+                            ? AppColors.warningOrange
+                            : AppColors.electricBlue,
                         isRecording: widget.isRecording,
                         selectedBufferSeconds: widget.selectedBufferSeconds,
                         isEnabled: widget.isEnabled,
@@ -146,11 +136,17 @@ class _RecordButtonState extends State<RecordButton>
                                       .withValues(alpha: 0.3),
                                   width: 2,
                                 )
-                              : null,
+                              : widget.isPreparing
+                                  ? Border.all(
+                                      color: AppColors.warningOrange
+                                          .withValues(alpha: 0.5),
+                                      width: 2,
+                                    )
+                                  : null,
                         ),
                       ),
                     ),
-                    // Main button (breathing when idle)
+                    // Main button (breathing when idle, spinner when preparing)
                     Transform.scale(
                       scale: breathScale,
                       child: AnimatedContainer(
@@ -161,12 +157,16 @@ class _RecordButtonState extends State<RecordButton>
                           shape: BoxShape.circle,
                           color: widget.isRecording
                               ? AppColors.recordRed
-                              : Colors.white,
+                              : widget.isPreparing
+                                  ? AppColors.warningOrange
+                                  : Colors.white,
                           boxShadow: [
                             BoxShadow(
                               color: (widget.isRecording
                                       ? AppColors.recordRed
-                                      : AppColors.electricBlue)
+                                      : widget.isPreparing
+                                          ? AppColors.warningOrange
+                                          : AppColors.electricBlue)
                                   .withValues(alpha: 0.4),
                               blurRadius: widget.isRecording ? 20 : 16,
                               spreadRadius: widget.isRecording ? 4 : 2,
@@ -184,11 +184,24 @@ class _RecordButtonState extends State<RecordButton>
                                   ),
                                 ),
                               )
-                            : Icon(
-                                Icons.fiber_manual_record,
-                                color: AppColors.electricBlue,
-                                size: 16,
-                              ),
+                            : widget.isPreparing
+                                ? Center(
+                                    child: SizedBox(
+                                      width: 24,
+                                      height: 24,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2.5,
+                                        valueColor:
+                                            AlwaysStoppedAnimation<Color>(
+                                                Colors.white),
+                                      ),
+                                    ),
+                                  )
+                                : Icon(
+                                    Icons.fiber_manual_record,
+                                    color: AppColors.electricBlue,
+                                    size: 16,
+                                  ),
                       ),
                     ),
                   ],
@@ -202,7 +215,6 @@ class _RecordButtonState extends State<RecordButton>
 
 class BufferRingPainter extends CustomPainter {
   final double progress;
-  final double sweepProgress;
   final Color color;
   final bool isRecording;
   final int selectedBufferSeconds;
@@ -212,7 +224,6 @@ class BufferRingPainter extends CustomPainter {
     required this.progress,
     required this.color,
     required this.selectedBufferSeconds,
-    this.sweepProgress = 0.0,
     this.isRecording = false,
     this.isEnabled = true,
   });
@@ -265,7 +276,7 @@ class BufferRingPainter extends CustomPainter {
   void _drawBufferSweep(Canvas canvas, Offset center, double radius) {
     // Draw buffer progress (filled portion)
     final bufferPaint = Paint()
-      ..color = color.withValues(alpha: 0.4)
+      ..color = color.withValues(alpha: 0.6)
       ..style = PaintingStyle.stroke
       ..strokeWidth = 3
       ..strokeCap = StrokeCap.round;
@@ -277,28 +288,11 @@ class BufferRingPainter extends CustomPainter {
       false,
       bufferPaint,
     );
-
-    // Draw sweeping indicator
-    final sweepPaint = Paint()
-      ..color = color.withValues(alpha: 0.8)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 4
-      ..strokeCap = StrokeCap.round;
-
-    final sweepAngle = -pi / 2 + (2 * pi * sweepProgress);
-    canvas.drawArc(
-      Rect.fromCircle(center: center, radius: radius),
-      sweepAngle - pi / 8,
-      pi / 4,
-      false,
-      sweepPaint,
-    );
   }
 
   @override
   bool shouldRepaint(BufferRingPainter oldDelegate) =>
       oldDelegate.progress != progress ||
-      oldDelegate.sweepProgress != sweepProgress ||
       oldDelegate.isRecording != isRecording ||
       oldDelegate.isEnabled != isEnabled;
 }

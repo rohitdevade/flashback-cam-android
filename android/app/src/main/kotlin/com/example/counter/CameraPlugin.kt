@@ -81,59 +81,610 @@ data class EncodedSample(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SIMPLE ROLLING BUFFER - Keeps last N seconds of encoded samples
+// DISK-BASED ROLLING BUFFER - Writes segments to disk to avoid RAM exhaustion
+// At 4K 60fps with 30s buffer, RAM-based storage causes OOM crashes.
+// This implementation writes encoded samples to temporary segment files on disk.
 // ═══════════════════════════════════════════════════════════════════════════════
 class RollingMediaBuffer(private var maxDurationUs: Long) {
-    private val samples = LinkedList<EncodedSample>()
+    private val TAG = "RollingMediaBuffer"
+    
+    // In-memory index of samples (metadata only, data is on disk)
+    private data class SampleIndex(
+        val globalPtsUs: Long,
+        val isVideo: Boolean,
+        val flags: Int,
+        val size: Int,
+        val segmentId: Int,
+        val offsetInSegment: Long
+    )
+    
+    // Segment file management
+    private data class Segment(
+        val id: Int,
+        val file: File,
+        var size: Long = 0,
+        var sampleCount: Int = 0,
+        val startPtsUs: Long
+    )
+    
+    private val sampleIndex = LinkedList<SampleIndex>()
+    private val segments = mutableListOf<Segment>()
+    private var currentSegment: Segment? = null
+    private var currentSegmentStream: java.io.RandomAccessFile? = null
+    private var segmentCounter = 0
+    private var bufferDir: File? = null
+    
+    // Configuration
+    private val MAX_SEGMENT_SIZE = 10 * 1024 * 1024L // 10 MB per segment
+    private val MAX_SEGMENT_DURATION_US = 2_000_000L // 2 seconds per segment
+    private var currentSegmentStartPts = 0L
+    
+    // RAM fallback for very short buffers (< 3 seconds) on high-RAM devices
+    private var useRamBuffer = false
+    private val ramSamples = LinkedList<EncodedSample>()
+    private val RAM_BUFFER_THRESHOLD_SECONDS = 3
+    
+    fun initialize(context: android.content.Context, useRam: Boolean = false) {
+        useRamBuffer = useRam
+        if (!useRamBuffer) {
+            // Clean up any old buffer directories first
+            try {
+                context.cacheDir.listFiles()?.filter { it.name.startsWith("dvr_buffer_") }?.forEach { 
+                    it.deleteRecursively() 
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to clean old buffer dirs", e)
+            }
+            
+            bufferDir = File(context.cacheDir, "dvr_buffer_${System.currentTimeMillis()}")
+            val created = bufferDir?.mkdirs() ?: false
+            Log.d(TAG, "Initialized disk-based buffer at: ${bufferDir?.absolutePath}, created=$created")
+            
+            if (!created && bufferDir?.exists() != true) {
+                Log.e(TAG, "Failed to create buffer directory, falling back to RAM")
+                useRamBuffer = true
+            }
+        } else {
+            Log.d(TAG, "Initialized RAM-based buffer (short duration or high-RAM device)")
+        }
+    }
+    
+    private var isInitialized = false
     
     @Synchronized
     fun addSample(sample: EncodedSample) {
-        samples.offer(sample)
+        if (useRamBuffer) {
+            addSampleToRam(sample)
+            return
+        }
+        
+        // Check if buffer directory exists
+        if (bufferDir == null || bufferDir?.exists() != true) {
+            Log.w(TAG, "Buffer directory not available, using RAM fallback")
+            ramSamples.offer(sample)
+            while (ramSamples.size > 500) ramSamples.poll() // Keep limited fallback
+            return
+        }
+        
+        try {
+            // Create new segment if needed
+            if (shouldCreateNewSegment(sample.globalPtsUs)) {
+                createNewSegment(sample.globalPtsUs)
+            }
+            
+            val segment = currentSegment
+            val stream = currentSegmentStream
+            
+            if (segment == null || stream == null) {
+                Log.w(TAG, "No current segment available, sample dropped")
+                return
+            }
+            
+            // Write sample data to disk
+            val offset = segment.size
+            stream.seek(offset)
+            stream.write(sample.data)
+            
+            // Add to index (metadata only)
+            val indexEntry = SampleIndex(
+                globalPtsUs = sample.globalPtsUs,
+                isVideo = sample.isVideo,
+                flags = sample.info.flags,
+                size = sample.data.size,
+                segmentId = segment.id,
+                offsetInSegment = offset
+            )
+            sampleIndex.offer(indexEntry)
+            
+            // Update segment stats
+            segment.size += sample.data.size
+            segment.sampleCount++
+            
+            // Mark as initialized after first successful write
+            if (!isInitialized) {
+                isInitialized = true
+                Log.d(TAG, "First sample written to disk successfully")
+            }
+            
+            // Trim old samples/segments to maintain time window
+            trimOldData()
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to write sample to disk, falling back to RAM", e)
+            // Fallback: add to RAM buffer
+            ramSamples.offer(sample)
+            while (ramSamples.size > 100) { // Keep limited RAM samples as emergency fallback
+                ramSamples.poll()
+            }
+        }
+    }
+    
+    private fun addSampleToRam(sample: EncodedSample) {
+        ramSamples.offer(sample)
         
         // Trim old samples to maintain time window
-        while (samples.size > 1) {
-            val oldestPts = samples.first.globalPtsUs
-            val newestPts = samples.last.globalPtsUs
+        while (ramSamples.size > 1) {
+            val oldestPts = ramSamples.first.globalPtsUs
+            val newestPts = ramSamples.last.globalPtsUs
             val durationUs = newestPts - oldestPts
             
             if (durationUs > maxDurationUs) {
-                samples.poll() // Remove oldest
+                ramSamples.poll()
             } else {
                 break
             }
         }
     }
     
+    private fun shouldCreateNewSegment(ptsUs: Long): Boolean {
+        val segment = currentSegment ?: return true
+        
+        // Create new segment if current one is too large or too old
+        if (segment.size >= MAX_SEGMENT_SIZE) return true
+        if (ptsUs - currentSegmentStartPts >= MAX_SEGMENT_DURATION_US) return true
+        
+        return false
+    }
+    
+    private fun createNewSegment(startPtsUs: Long) {
+        // Close current segment
+        try {
+            currentSegmentStream?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error closing segment stream", e)
+        }
+        
+        // Create new segment file
+        val segmentId = segmentCounter++
+        val segmentFile = File(bufferDir, "segment_$segmentId.bin")
+        
+        try {
+            currentSegmentStream = java.io.RandomAccessFile(segmentFile, "rw")
+            val newSegment = Segment(
+                id = segmentId,
+                file = segmentFile,
+                startPtsUs = startPtsUs
+            )
+            segments.add(newSegment)
+            currentSegment = newSegment
+            currentSegmentStartPts = startPtsUs
+            
+            Log.d(TAG, "Created new segment $segmentId at ${segmentFile.name}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create segment file", e)
+        }
+    }
+    
+    private fun trimOldData() {
+        if (sampleIndex.size < 2) return
+        
+        val oldestPts = sampleIndex.first.globalPtsUs
+        val newestPts = sampleIndex.last.globalPtsUs
+        val durationUs = newestPts - oldestPts
+        
+        if (durationUs <= maxDurationUs) return
+        
+        // Remove old samples from index
+        val samplesToRemove = mutableListOf<SampleIndex>()
+        val segmentsToRemove = mutableSetOf<Int>()
+        
+        for (sample in sampleIndex) {
+            if (newestPts - sample.globalPtsUs > maxDurationUs) {
+                samplesToRemove.add(sample)
+                segmentsToRemove.add(sample.segmentId)
+            } else {
+                break // Index is sorted by time
+            }
+        }
+        
+        // Remove samples from index
+        sampleIndex.removeAll(samplesToRemove.toSet())
+        
+        // Check which segments are completely empty and can be deleted
+        val usedSegmentIds = sampleIndex.map { it.segmentId }.toSet()
+        val segmentsToDelete = segments.filter { it.id !in usedSegmentIds && it.id != currentSegment?.id }
+        
+        for (segment in segmentsToDelete) {
+            try {
+                segment.file.delete()
+                Log.d(TAG, "Deleted old segment ${segment.id}")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to delete segment ${segment.id}", e)
+            }
+        }
+        segments.removeAll(segmentsToDelete.toSet())
+    }
+    
     @Synchronized
     fun getSnapshot(): List<EncodedSample> {
-        return samples.toList()
+        Log.d(TAG, "getSnapshot called: useRamBuffer=$useRamBuffer, sampleIndex.size=${sampleIndex.size}, ramSamples.size=${ramSamples.size}")
+        
+        if (useRamBuffer) {
+            return ramSamples.toList()
+        }
+        
+        // If disk buffer is empty but we have RAM fallback samples, use those
+        if (sampleIndex.isEmpty() && ramSamples.isNotEmpty()) {
+            Log.d(TAG, "Using RAM fallback samples: ${ramSamples.size}")
+            return ramSamples.toList()
+        }
+        
+        // Flush current segment to ensure all data is written
+        try {
+            currentSegmentStream?.fd?.sync()
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to sync current segment", e)
+        }
+        
+        // Read samples from disk
+        val result = mutableListOf<EncodedSample>()
+        val segmentStreams = mutableMapOf<Int, java.io.RandomAccessFile>()
+        
+        try {
+            // Make a copy of the index to avoid concurrent modification
+            val indexCopy = sampleIndex.toList()
+            Log.d(TAG, "Reading ${indexCopy.size} samples from ${segments.size} segments")
+            
+            for (indexEntry in indexCopy) {
+                try {
+                    // Get or open stream for this segment
+                    val stream = segmentStreams.getOrPut(indexEntry.segmentId) {
+                        val segment = segments.find { it.id == indexEntry.segmentId }
+                        if (segment == null) {
+                            Log.w(TAG, "Segment ${indexEntry.segmentId} not found in segments list")
+                            throw Exception("Segment ${indexEntry.segmentId} not found")
+                        }
+                        if (!segment.file.exists()) {
+                            Log.w(TAG, "Segment file does not exist: ${segment.file.absolutePath}")
+                            throw Exception("Segment file ${indexEntry.segmentId} does not exist")
+                        }
+                        java.io.RandomAccessFile(segment.file, "r")
+                    }
+                    
+                    // Read sample data
+                    stream.seek(indexEntry.offsetInSegment)
+                    val data = ByteArray(indexEntry.size)
+                    stream.readFully(data)
+                    
+                    // Reconstruct BufferInfo
+                    val bufferInfo = MediaCodec.BufferInfo()
+                    bufferInfo.set(0, indexEntry.size, indexEntry.globalPtsUs, indexEntry.flags)
+                    
+                    result.add(EncodedSample(data, bufferInfo, indexEntry.isVideo, indexEntry.globalPtsUs))
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to read sample at offset ${indexEntry.offsetInSegment} from segment ${indexEntry.segmentId}", e)
+                    // Continue with next sample instead of failing completely
+                }
+            }
+            
+            Log.d(TAG, "Successfully read ${result.size} samples from disk")
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error reading snapshot from disk", e)
+        } finally {
+            // Close all opened streams
+            segmentStreams.forEach { (_, stream) ->
+                try { stream.close() } catch (_: Exception) {}
+            }
+        }
+        
+        // If we couldn't read from disk, fall back to RAM samples
+        if (result.isEmpty() && ramSamples.isNotEmpty()) {
+            Log.w(TAG, "Disk read failed, using ${ramSamples.size} RAM fallback samples")
+            return ramSamples.toList()
+        }
+        
+        return result
     }
     
     @Synchronized
     fun clear() {
-        samples.clear()
+        // Clear RAM buffer
+        ramSamples.clear()
+        
+        // Clear index
+        sampleIndex.clear()
+        
+        // Close current stream
+        try {
+            currentSegmentStream?.close()
+        } catch (_: Exception) {}
+        currentSegmentStream = null
+        currentSegment = null
+        
+        // Delete all segment files
+        for (segment in segments) {
+            try {
+                segment.file.delete()
+            } catch (_: Exception) {}
+        }
+        segments.clear()
+        segmentCounter = 0
+        
+        // Delete buffer directory contents but keep the directory
+        try {
+            bufferDir?.listFiles()?.forEach { it.delete() }
+        } catch (_: Exception) {}
+        
+        // Reset initialization flag so next sample creates a new segment
+        isInitialized = false
+        
+        Log.d(TAG, "Buffer cleared, ready for new samples")
     }
     
     @Synchronized
-    fun getSampleCount(): Int = samples.size
+    fun getSampleCount(): Int = if (useRamBuffer) ramSamples.size else sampleIndex.size
     
     @Synchronized
     fun getDurationSeconds(): Double {
-        if (samples.size < 2) return 0.0
-        val oldestPts = samples.first.globalPtsUs
-        val newestPts = samples.last.globalPtsUs
+        if (useRamBuffer) {
+            if (ramSamples.size < 2) return 0.0
+            val oldestPts = ramSamples.first.globalPtsUs
+            val newestPts = ramSamples.last.globalPtsUs
+            return (newestPts - oldestPts) / 1_000_000.0
+        }
+        
+        if (sampleIndex.size < 2) return 0.0
+        val oldestPts = sampleIndex.first.globalPtsUs
+        val newestPts = sampleIndex.last.globalPtsUs
         return (newestPts - oldestPts) / 1_000_000.0
     }
     
+    /**
+     * Get the PTS of the oldest sample in the buffer.
+     * This is the actual start of the buffered content.
+     */
     @Synchronized
-    fun getVideoSampleCount(): Int = samples.count { it.isVideo }
+    fun getOldestSamplePts(): Long {
+        if (useRamBuffer) {
+            return ramSamples.firstOrNull()?.globalPtsUs ?: -1L
+        }
+        return sampleIndex.firstOrNull()?.globalPtsUs ?: -1L
+    }
+    
+    /**
+     * Get the PTS of the newest sample in the buffer.
+     * This is the current end of the buffered content.
+     */
+    @Synchronized
+    fun getNewestSamplePts(): Long {
+        if (useRamBuffer) {
+            return ramSamples.lastOrNull()?.globalPtsUs ?: -1L
+        }
+        return sampleIndex.lastOrNull()?.globalPtsUs ?: -1L
+    }
     
     @Synchronized
-    fun getAudioSampleCount(): Int = samples.count { !it.isVideo }
+    fun getVideoSampleCount(): Int = if (useRamBuffer) ramSamples.count { it.isVideo } else sampleIndex.count { it.isVideo }
+    
+    @Synchronized
+    fun getAudioSampleCount(): Int = if (useRamBuffer) ramSamples.count { !it.isVideo } else sampleIndex.count { !it.isVideo }
     
     @Synchronized
     fun updateMaxDuration(newMaxDurationUs: Long) {
         maxDurationUs = newMaxDurationUs
+        trimOldData()
+    }
+    
+    @Synchronized
+    fun getMemoryUsageBytes(): Long {
+        if (useRamBuffer) {
+            return ramSamples.sumOf { it.data.size.toLong() }
+        }
+        return 0L // Disk buffer doesn't use RAM for sample data
+    }
+    
+    @Synchronized
+    fun getDiskUsageBytes(): Long {
+        if (useRamBuffer) return 0L
+        return segments.sumOf { it.size }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // STREAMING EXPORT API - Process samples without loading all into RAM
+    // This is critical for 4K 60fps where loading 170MB+ into RAM causes OOM
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    /**
+     * Get sample metadata for filtering/planning without loading sample data
+     */
+    data class SampleMetadata(
+        val globalPtsUs: Long,
+        val isVideo: Boolean,
+        val flags: Int,
+        val size: Int,
+        val index: Int // Position in sample list for later retrieval
+    )
+    
+    @Synchronized
+    fun getSampleMetadataInRange(startPtsUs: Long, endPtsUs: Long): List<SampleMetadata> {
+        if (useRamBuffer) {
+            return ramSamples.mapIndexedNotNull { index, sample ->
+                if (sample.globalPtsUs in startPtsUs..endPtsUs) {
+                    SampleMetadata(sample.globalPtsUs, sample.isVideo, sample.info.flags, sample.data.size, index)
+                } else null
+            }
+        }
+        
+        return sampleIndex.mapIndexedNotNull { index, entry ->
+            if (entry.globalPtsUs in startPtsUs..endPtsUs) {
+                SampleMetadata(entry.globalPtsUs, entry.isVideo, entry.flags, entry.size, index)
+            } else null
+        }
+    }
+    
+    /**
+     * Stream samples in batches to a processor function.
+     * This avoids loading all samples into RAM at once.
+     */
+    fun streamSamplesInRange(
+        startPtsUs: Long,
+        endPtsUs: Long,
+        batchSize: Int = 50,
+        processor: (List<EncodedSample>) -> Unit
+    ) {
+        Log.d(TAG, "streamSamplesInRange: start=$startPtsUs, end=$endPtsUs, batchSize=$batchSize")
+        
+        if (useRamBuffer) {
+            // Stream from RAM in batches
+            val relevantSamples = ramSamples.filter { it.globalPtsUs in startPtsUs..endPtsUs }
+            relevantSamples.chunked(batchSize).forEach { batch ->
+                processor(batch)
+            }
+            return
+        }
+        
+        // Stream from disk in batches
+        synchronized(this) {
+            // Flush current segment
+            try {
+                currentSegmentStream?.fd?.sync()
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to sync current segment", e)
+            }
+        }
+        
+        // Get relevant sample indices
+        val relevantIndices = synchronized(this) {
+            sampleIndex.filter { it.globalPtsUs in startPtsUs..endPtsUs }.toList()
+        }
+        
+        Log.d(TAG, "Found ${relevantIndices.size} samples in range, streaming in batches of $batchSize")
+        
+        // Open segment files as needed
+        val segmentStreams = mutableMapOf<Int, java.io.RandomAccessFile>()
+        
+        try {
+            // Process in batches
+            relevantIndices.chunked(batchSize).forEach { batchIndices ->
+                val batch = mutableListOf<EncodedSample>()
+                
+                for (indexEntry in batchIndices) {
+                    try {
+                        val stream = synchronized(this) {
+                            segmentStreams.getOrPut(indexEntry.segmentId) {
+                                val segment = segments.find { it.id == indexEntry.segmentId }
+                                if (segment != null && segment.file.exists()) {
+                                    java.io.RandomAccessFile(segment.file, "r")
+                                } else {
+                                    throw Exception("Segment ${indexEntry.segmentId} not found")
+                                }
+                            }
+                        }
+                        
+                        stream.seek(indexEntry.offsetInSegment)
+                        val data = ByteArray(indexEntry.size)
+                        stream.readFully(data)
+                        
+                        val bufferInfo = MediaCodec.BufferInfo()
+                        bufferInfo.set(0, indexEntry.size, indexEntry.globalPtsUs, indexEntry.flags)
+                        
+                        batch.add(EncodedSample(data, bufferInfo, indexEntry.isVideo, indexEntry.globalPtsUs))
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to read sample", e)
+                    }
+                }
+                
+                if (batch.isNotEmpty()) {
+                    processor(batch)
+                }
+                
+                // Clear batch to allow GC
+                batch.clear()
+            }
+        } finally {
+            // Close all segment streams
+            segmentStreams.values.forEach { stream ->
+                try { stream.close() } catch (_: Exception) {}
+            }
+        }
+        
+        Log.d(TAG, "Streaming complete")
+    }
+    
+    /**
+     * Get total sample count in range (for progress calculation)
+     */
+    @Synchronized
+    fun getSampleCountInRange(startPtsUs: Long, endPtsUs: Long): Int {
+        return if (useRamBuffer) {
+            ramSamples.count { it.globalPtsUs in startPtsUs..endPtsUs }
+        } else {
+            sampleIndex.count { it.globalPtsUs in startPtsUs..endPtsUs }
+        }
+    }
+    
+    /**
+     * Get video sample count in range
+     */
+    @Synchronized
+    fun getVideoSampleCountInRange(startPtsUs: Long, endPtsUs: Long): Int {
+        return if (useRamBuffer) {
+            ramSamples.count { it.isVideo && it.globalPtsUs in startPtsUs..endPtsUs }
+        } else {
+            sampleIndex.count { it.isVideo && it.globalPtsUs in startPtsUs..endPtsUs }
+        }
+    }
+    
+    /**
+     * Get first video sample with SYNC flag (keyframe) for CSD extraction
+     */
+    fun getFirstKeyframeSample(startPtsUs: Long, endPtsUs: Long): EncodedSample? {
+        if (useRamBuffer) {
+            return ramSamples.firstOrNull { 
+                it.isVideo && 
+                it.globalPtsUs in startPtsUs..endPtsUs && 
+                (it.info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0 
+            }
+        }
+        
+        synchronized(this) {
+            val keyframeIndex = sampleIndex.firstOrNull {
+                it.isVideo &&
+                it.globalPtsUs in startPtsUs..endPtsUs &&
+                (it.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+            } ?: return null
+            
+            // Read this single sample from disk
+            val segment = segments.find { it.id == keyframeIndex.segmentId } ?: return null
+            if (!segment.file.exists()) return null
+            
+            return try {
+                java.io.RandomAccessFile(segment.file, "r").use { stream ->
+                    stream.seek(keyframeIndex.offsetInSegment)
+                    val data = ByteArray(keyframeIndex.size)
+                    stream.readFully(data)
+                    
+                    val bufferInfo = MediaCodec.BufferInfo()
+                    bufferInfo.set(0, keyframeIndex.size, keyframeIndex.globalPtsUs, keyframeIndex.flags)
+                    
+                    EncodedSample(data, bufferInfo, true, keyframeIndex.globalPtsUs)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to read keyframe sample", e)
+                null
+            }
+        }
     }
 }
 
@@ -200,18 +751,27 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
     private var videoFormat: MediaFormat? = null
     private var audioFormat: MediaFormat? = null
     
-    // Recording with pre-roll - single muxer approach
+    // DVR-style recording - O(1) record press, background export on stop
+    // Recording only marks timestamps, export happens in background thread after stop
+    private var recordingStartGlobalPtsUs: Long = -1  // Global PTS when record was pressed
+    private var recordingStopGlobalPtsUs: Long = -1   // Global PTS when record was stopped
+    private var recordingMarkTimestamp: Long = 0      // System time when record was pressed
+    private var frozenPreRollStartPts: Long = -1      // Pre-roll start PTS, frozen when Record pressed
+    private var currentOutputFile: File? = null
+    private var exportThread: Thread? = null          // Background thread for export
+    private var isExporting = false                   // Export in progress flag
+    
+    // Legacy fields kept for compatibility during transition
     private var recordingMuxer: MediaMuxer? = null
     private var recordingVideoTrack: Int = -1
     private var recordingAudioTrack: Int = -1
     private var prerollWritten = false
     private var recordingBasePtsUs: Long = -1
-    private var recordingStartTimeUs: Long = -1  // Timestamp when recording was initiated
-    private var lastPrerollVideoPts: Long = -1  // Last video PTS written in pre-roll
-    private var lastPrerollAudioPts: Long = -1  // Last audio PTS written in pre-roll
-    private var currentOutputFile: File? = null
-    private var liveVideoSampleCount: Int = 0  // Counter for live video samples written
-    private var liveAudioSampleCount: Int = 0  // Counter for live audio samples written
+    private var recordingStartTimeUs: Long = -1
+    private var lastPrerollVideoPts: Long = -1
+    private var lastPrerollAudioPts: Long = -1
+    private var liveVideoSampleCount: Int = 0
+    private var liveAudioSampleCount: Int = 0
     
     // CRITICAL: FPS-dependent timing constants
     private var videoDeltaUs: Long = 33333L // Microseconds per frame (default 30fps, updated based on currentFps)
@@ -280,7 +840,11 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
         
         cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         
-        Log.d(TAG, "CameraPlugin attached")
+        // Initialize disk-based rolling buffer with context
+        // This allows the buffer to use the app's cache directory for segment storage
+        rollingBuffer.initialize(context, useRam = false)
+        
+        Log.d(TAG, "CameraPlugin attached, disk buffer initialized")
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
@@ -319,11 +883,68 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
             "updateSubscription" -> updateSubscription(call, result)
             "getDeviceCapabilities" -> getDeviceCapabilities(result)
             "checkDetailedCapabilities" -> checkDetailedCapabilities(result)
+            "getDebugInfo" -> getDebugInfo(result)
             "dispose" -> {
                 dispose()
                 result.success(null)
             }
             else -> result.notImplemented()
+        }
+    }
+    
+    /**
+     * Returns debug information about the DVR-style recording pipeline.
+     * Useful for developers to diagnose issues with buffer and recording.
+     */
+    private fun getDebugInfo(result: MethodChannel.Result) {
+        try {
+            val bufferDuration = rollingBuffer.getDurationSeconds()
+            val bufferSamples = rollingBuffer.getSampleCount()
+            val videoSamples = rollingBuffer.getVideoSampleCount()
+            val audioSamples = rollingBuffer.getAudioSampleCount()
+            
+            val debugInfo = hashMapOf<String, Any>(
+                // Pipeline state
+                "pipelineType" to "DVR-style (O(1) record press, background export)",
+                "isBuffering" to isBuffering,
+                "isBufferInitialized" to isBufferInitialized,
+                "isRecording" to isRecording,
+                "isExporting" to isExporting,
+                
+                // Buffer state
+                "bufferDurationSeconds" to bufferDuration,
+                "bufferSampleCount" to bufferSamples,
+                "bufferVideoSamples" to videoSamples,
+                "bufferAudioSamples" to audioSamples,
+                "selectedBufferSeconds" to selectedBufferSeconds,
+                
+                // Recording state
+                "recordingStartPtsUs" to recordingStartGlobalPtsUs,
+                "recordingStopPtsUs" to recordingStopGlobalPtsUs,
+                "currentRecordingId" to (currentRecordingId ?: "none"),
+                
+                // Encoder state
+                "videoEncoderReady" to (videoEncoder != null),
+                "audioEncoderReady" to (audioEncoder != null),
+                "videoFormatReady" to (videoFormat != null),
+                "audioFormatReady" to (audioFormat != null),
+                
+                // Settings
+                "currentResolution" to currentResolution,
+                "currentFps" to currentFps,
+                "currentCodec" to currentCodec,
+                "videoDeltaUs" to videoDeltaUs,
+                
+                // Device info
+                "ramTier" to currentRamTier,
+                "bufferMode" to currentBufferMode,
+                "maxZoom" to maxZoom
+            )
+            
+            result.success(debugInfo)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get debug info", e)
+            result.success(hashMapOf<String, Any>())
         }
     }
 
@@ -641,16 +1262,31 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
     }
 
     private fun selectPreviewSize(resolution: String): Size {
-        val defaultSize = Size(1920, 1080)
+        val totalRamMb = getTotalRamMb()
+        val isLowRamDevice = totalRamMb < 4096 // Devices with less than 4GB RAM
+        
+        // Use 720p preview for low-RAM devices to reduce GPU/memory pressure
+        val defaultSize = if (isLowRamDevice) Size(1280, 720) else Size(1920, 1080)
+        
         val map = cameraCharacteristics?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             ?: return defaultSize
         val availableSizes = map.getOutputSizes(SurfaceTexture::class.java) ?: return defaultSize
         if (availableSizes.isEmpty()) return defaultSize
         val normalized = resolution.uppercase(Locale.US)
-        val targetSize = when (normalized) {
-            "4K", "UHD" -> Size(3840, 2160)
-            "720P" -> Size(1280, 720)
-            else -> Size(1920, 1080)
+        
+        // For low-RAM devices, cap preview at 720p regardless of recording resolution
+        val targetSize = if (isLowRamDevice) {
+            Size(1280, 720)
+        } else {
+            when (normalized) {
+                "4K", "UHD" -> Size(3840, 2160)
+                "720P" -> Size(1280, 720)
+                else -> Size(1920, 1080)
+            }
+        }
+        
+        if (isLowRamDevice) {
+            Log.d(TAG, "Low-RAM device (${totalRamMb}MB): Using 720p preview for better performance")
         }
         val aspectRatio = targetSize.width.toFloat() / targetSize.height.toFloat()
         val ratioTolerance = 0.02f
@@ -1404,27 +2040,8 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                             val sample = EncodedSample(data, adjustedBufferInfo, isVideo = true, globalPtsUs = globalPtsUs)
                             rollingBuffer.addSample(sample)
 
-                            // SIMPLIFIED: Write live samples with continuous counter
-                            if (isRecording && recordingMuxer != null && prerollWritten && recordingVideoTrack >= 0) {
-                                try {
-                                    // Use next sequential PTS based on current FPS
-                                    val nextPts = lastPrerollVideoPts + (videoDeltaUs * (liveVideoSampleCount + 1))
-                                    
-                                    val bufferInfo = MediaCodec.BufferInfo().apply {
-                                        set(0, sample.data.size, nextPts, sample.info.flags)
-                                    }
-                                    
-                                    val buffer = ByteBuffer.wrap(sample.data)
-                                    recordingMuxer?.writeSampleData(recordingVideoTrack, buffer, bufferInfo)
-                                    liveVideoSampleCount++
-                                    
-                                    if (liveVideoSampleCount <= 5 || liveVideoSampleCount % 30 == 0) {
-                                        Log.d(TAG, "[Live] VIDEO #$liveVideoSampleCount: PTS=${nextPts}µs (delta=${videoDeltaUs}µs)")
-                                    }
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "[Live] Failed to write video sample #$liveVideoSampleCount", e)
-                                }
-                            }
+                            // DVR-style: All samples go to rolling buffer only
+                            // No live writing to muxer - export happens in background after record stop
                         }
 
                         encoder.releaseOutputBuffer(outputBufferId, false)
@@ -1485,27 +2102,8 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                             val sample = EncodedSample(data, adjustedBufferInfo, isVideo = false, globalPtsUs = globalPtsUs)
                             rollingBuffer.addSample(sample)
 
-                            // SIMPLIFIED: Write live samples with continuous counter
-                            if (isRecording && recordingMuxer != null && prerollWritten && recordingAudioTrack >= 0) {
-                                try {
-                                    // Use next sequential PTS
-                                    val nextPts = lastPrerollAudioPts + (23220L * (liveAudioSampleCount + 1))
-                                    
-                                    val bufferInfo = MediaCodec.BufferInfo().apply {
-                                        set(0, sample.data.size, nextPts, sample.info.flags)
-                                    }
-                                    
-                                    val buffer = ByteBuffer.wrap(sample.data)
-                                    recordingMuxer?.writeSampleData(recordingAudioTrack, buffer, bufferInfo)
-                                    liveAudioSampleCount++
-                                    
-                                    if (liveAudioSampleCount <= 5 || liveAudioSampleCount % 50 == 0) {
-                                        Log.d(TAG, "[Live] AUDIO #$liveAudioSampleCount: PTS=${nextPts}µs")
-                                    }
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "[Live] Failed to write audio sample #$liveAudioSampleCount", e)
-                                }
-                            }
+                            // DVR-style: All samples go to rolling buffer only
+                            // No live writing to muxer - export happens in background after record stop
                         }
 
                         encoder.releaseOutputBuffer(outputBufferId, false)
@@ -1535,10 +2133,14 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                     val sampleCount = rollingBuffer.getSampleCount()
                     val videoCount = rollingBuffer.getVideoSampleCount()
                     val audioCount = rollingBuffer.getAudioSampleCount()
+                    val memoryUsageMB = rollingBuffer.getMemoryUsageBytes() / (1024.0 * 1024.0)
+                    val diskUsageMB = rollingBuffer.getDiskUsageBytes() / (1024.0 * 1024.0)
                     
-                    Log.d(TAG, "Buffer state: selectedBufferSeconds=${selectedBufferSeconds}s, " +
-                            "currentBuffered=${String.format("%.2f", duration)}s, " +
-                            "samples=${sampleCount} (video=$videoCount, audio=$audioCount)")
+                    Log.d(TAG, "Buffer state: target=${selectedBufferSeconds}s, " +
+                            "buffered=${String.format("%.2f", duration)}s, " +
+                            "samples=${sampleCount} (V=$videoCount, A=$audioCount), " +
+                            "disk=${String.format("%.1f", diskUsageMB)}MB, " +
+                            "ram=${String.format("%.1f", memoryUsageMB)}MB")
                 }
             }
         }, 1000, 1000) // Log every second
@@ -1582,8 +2184,10 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
     }
 
     // ═══════════════════════════════════════════════════════════════════════════════
-    // FRESH PRE-ROLL RECORDING IMPLEMENTATION
-    // Write buffer samples FIRST, then live samples - all into single MediaMuxer
+    // DVR-STYLE RECORDING: O(1) Record Press, Background Export on Stop
+    // - Record press: Just mark timestamp (instant, no pipeline interruption)
+    // - Recording: Continue writing to rolling buffer as normal
+    // - Record stop: Export pre-roll + live samples in background thread
     // ═══════════════════════════════════════════════════════════════════════════════
     
     private fun startRecording(result: MethodChannel.Result) {
@@ -1593,298 +2197,117 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                 return
             }
             
-            // Capture current device orientation for video metadata
-            recordingOrientation = getDeviceOrientationForRecording()
-            Log.d(TAG, "[Record] Device orientation captured: $recordingOrientation°")
+            // CRITICAL: Ensure buffer is running before recording can start
+            if (!isBuffering || !isBufferInitialized) {
+                Log.e(TAG, "[Record] ❌ Cannot start recording: Buffer not active (isBuffering=$isBuffering, isBufferInitialized=$isBufferInitialized)")
+                result.error("BUFFER_NOT_ACTIVE", "Start buffer first to enable recording with pre-roll", null)
+                return
+            }
             
-            // Generate fresh recording ID and timestamp for THIS recording
+            // Check if previous export is still running
+            if (isExporting) {
+                Log.w(TAG, "[Record] ⚠️ Previous export still running, waiting...")
+                result.error("EXPORT_IN_PROGRESS", "Previous recording is still being saved", null)
+                return
+            }
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // O(1) RECORD START - Just mark timestamp, NO heavy work!
+            // ═══════════════════════════════════════════════════════════════════
+            
+            // Generate fresh recording ID
             currentRecordingId = UUID.randomUUID().toString()
             recordingStartTime = System.currentTimeMillis()
             
-            Log.d(TAG, "═══════════════════════════════════════════════════════════")
-            Log.d(TAG, "[Record] NEW RECORDING STARTED")
-            Log.d(TAG, "[Record] - ID: $currentRecordingId")
-            Log.d(TAG, "[Record] - Start time: $recordingStartTime")
+            // Mark the global PTS when recording started - this is the key for DVR-style recording
+            recordingStartGlobalPtsUs = nowUs()
+            recordingMarkTimestamp = System.currentTimeMillis()
             
-            // [Buffer] Log buffer state
+            // ═══════════════════════════════════════════════════════════════════
+            // CRITICAL: Get the ACTUAL oldest sample PTS from the buffer
+            // This is the real start of the pre-roll content, not a calculated value!
+            // ═══════════════════════════════════════════════════════════════════
+            val bufferOldestPts = rollingBuffer.getOldestSamplePts()
+            val bufferNewestPts = rollingBuffer.getNewestSamplePts()
             val bufferDuration = rollingBuffer.getDurationSeconds()
+            
+            // Use the actual oldest sample in the buffer as the pre-roll start
+            // This ensures we capture ALL buffered content, regardless of how long buffer ran
+            frozenPreRollStartPts = if (bufferOldestPts > 0) bufferOldestPts else recordingStartGlobalPtsUs
+            
+            val actualPrerollSec = if (bufferOldestPts > 0 && bufferNewestPts > 0) {
+                (bufferNewestPts - bufferOldestPts) / 1_000_000.0
+            } else {
+                0.0
+            }
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // CRITICAL: Expand buffer max duration to hold pre-roll + live recording
+            // Without this, the rolling buffer would trim pre-roll samples during recording!
+            // Allow up to 5 minutes of live recording on top of buffer
+            // ═══════════════════════════════════════════════════════════════════
+            val maxLiveRecordingUs = 5L * 60 * 1_000_000L // 5 minutes max
+            val expandedBufferDurationUs = (selectedBufferSeconds * 1_000_000L) + maxLiveRecordingUs
+            rollingBuffer.updateMaxDuration(expandedBufferDurationUs)
+            Log.d(TAG, "[Record] Buffer expanded to ${expandedBufferDurationUs / 1_000_000}s to preserve pre-roll during recording")
+            
+            // Set recording flag - buffer will continue writing samples as normal
+            isRecording = true
+            
+            // Capture device orientation for video metadata
+            recordingOrientation = getDeviceOrientationForRecording()
+            
+            // Log buffer state for debugging
             val bufferSamples = rollingBuffer.getSampleCount()
             val videoCount = rollingBuffer.getVideoSampleCount()
             val audioCount = rollingBuffer.getAudioSampleCount()
-            Log.d(TAG, "[Buffer] State: ${String.format("%.2f", bufferDuration)}s, samples=$bufferSamples (video=$videoCount, audio=$audioCount)")
+            
+            Log.d(TAG, "═══════════════════════════════════════════════════════════")
+            Log.d(TAG, "[Record] 🎬 RECORDING STARTED (O(1) - instant)")
+            Log.d(TAG, "[Record] - ID: $currentRecordingId")
+            Log.d(TAG, "[Record] - Record start PTS: ${recordingStartGlobalPtsUs}µs")
+            Log.d(TAG, "[Record] - Buffer oldest PTS: ${bufferOldestPts}µs")
+            Log.d(TAG, "[Record] - Buffer newest PTS: ${bufferNewestPts}µs")
+            Log.d(TAG, "[Record] - Frozen pre-roll start: ${frozenPreRollStartPts}µs")
+            Log.d(TAG, "[Record] - Buffer duration: ${String.format("%.2f", bufferDuration)}s")
+            Log.d(TAG, "[Record] - Actual pre-roll available: ${String.format("%.2f", actualPrerollSec)}s")
+            Log.d(TAG, "[Record] - Buffer samples: $bufferSamples (video=$videoCount, audio=$audioCount)")
+            Log.d(TAG, "[Record] - Selected buffer setting: ${selectedBufferSeconds}s")
+            Log.d(TAG, "[Record] - Orientation: $recordingOrientation°")
             Log.d(TAG, "═══════════════════════════════════════════════════════════")
             
-            // Instant response
+            // Instant response - recording has started
             result.success(currentRecordingId)
             
-            // Start recording in background
-            startRecordingWithPreroll()
+            // Notify Flutter that recording started
+            sendEvent("recordingStarted", mapOf(
+                "id" to currentRecordingId,
+                "prerollAvailable" to actualPrerollSec
+            ))
             
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start recording", e)
+            isRecording = false
             result.error("RECORDING_ERROR", "Failed to start recording: ${e.message}", null)
         }
     }
     
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // LEGACY METHODS - Kept for reference but no longer used in DVR-style recording
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    // DEPRECATED: Old sync pre-roll approach - replaced by DVR-style background export
+    @Deprecated("Use startBackgroundExport instead")
     private fun startRecordingWithPreroll() {
-        encoderHandler?.post { startRecordingWithPrerollInternal(0) }
+        Log.w(TAG, "startRecordingWithPreroll is DEPRECATED - using DVR-style recording now")
+        // No longer used - recording now uses DVR-style export
     }
 
+    // DEPRECATED: Old sync pre-roll approach - replaced by DVR-style background export  
+    @Deprecated("Use performBackgroundExport instead")
     private fun startRecordingWithPrerollInternal(attempt: Int) {
-        val maxAttempts = 200
-        val retryDelayMs = 15L
-
-        // Step 1: Validate encoder formats are ready
-        if (!areEncoderFormatsReady()) {
-            captureEncoderFormatsIfAvailable()
-
-            if (!areEncoderFormatsReady()) {
-                if (attempt >= maxAttempts) {
-                    Log.e(TAG, "[Record] ❌ Encoder formats unavailable after ${attempt + 1} attempts")
-                    Log.e(TAG, "[Record] Video format: ${videoFormat}")
-                    Log.e(TAG, "[Record] Audio format: ${audioFormat}")
-                    sendEvent("recordingError", mapOf("error" to "Encoder formats not ready"))
-                    return
-                }
-
-                if (attempt == 0 || (attempt + 1) % 20 == 0) {
-                    Log.d(TAG, "[Record] ⏳ Waiting for encoder formats (attempt ${attempt + 1}/$maxAttempts)")
-                }
-
-                encoderHandler?.postDelayed({
-                    startRecordingWithPrerollInternal(attempt + 1)
-                }, retryDelayMs)
-                return
-            }
-        }
-
-        // Step 2: Get buffer snapshot and validate
-        val bufferedSamples = rollingBuffer.getSnapshot()
-        val sortedSamples = bufferedSamples.sortedBy { it.globalPtsUs }
-        val videoSamples = sortedSamples.filter { it.isVideo }
-        val audioSamples = sortedSamples.filter { !it.isVideo }
-        
-        Log.d(TAG, "[Record] 📋 Buffer snapshot: total=${sortedSamples.size}, video=${videoSamples.size}, audio=${audioSamples.size}")
-        
-        if (sortedSamples.isNotEmpty()) {
-            val firstPts = sortedSamples.first().globalPtsUs
-            val lastPts = sortedSamples.last().globalPtsUs
-            val durationUs = lastPts - firstPts
-            Log.d(TAG, "[Record] Buffer PTS range: ${firstPts}µs to ${lastPts}µs (duration: ${durationUs / 1_000_000.0}s)")
-            
-            // Check for timestamp gaps
-            var maxGap = 0L
-            sortedSamples.zipWithNext().forEach { (sample1, sample2) ->
-                val gap = sample2.globalPtsUs - sample1.globalPtsUs
-                if (gap > maxGap) maxGap = gap
-            }
-            Log.d(TAG, "[Record] Maximum timestamp gap in buffer: ${maxGap}µs (${maxGap / 1000.0}ms)")
-        }
-        
-        if (videoSamples.isEmpty()) {
-            Log.e(TAG, "[Record] ❌ Cannot start recording: No video samples in buffer")
-            sendEvent("recordingError", mapOf("error" to "No video data"))
-            return
-        }
-        
-        if (audioSamples.isEmpty()) {
-            Log.w(TAG, "[Record] ⚠️ Warning: No audio samples in buffer, video-only recording")
-        }
-        
-        try {
-            // Step 3: Calculate base timestamp from first sample
-            val basePtsUs = sortedSamples.firstOrNull()?.globalPtsUs ?: 0L
-            val endPrerollPtsUs = sortedSamples.lastOrNull()?.globalPtsUs ?: basePtsUs
-            val prerollDurationUs = endPrerollPtsUs - basePtsUs
-            
-            Log.d(TAG, "[Record] 🎬 Starting recording ID: $currentRecordingId")
-            Log.d(TAG, "[Record] Base PTS: ${basePtsUs}µs")
-            Log.d(TAG, "[Record] Pre-roll duration: ${prerollDurationUs}µs (${prerollDurationUs / 1_000_000.0}s)")
-            
-            // Step 4: Create output file and muxer
-            val outputFile = getOutputFile()
-            currentOutputFile = outputFile
-            Log.d(TAG, "[Record] Output: ${outputFile.absolutePath}")
-            
-            val muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-            
-            // Step 5: Ensure video format has CSD (extract from CODEC_CONFIG frame if needed)
-            val videoFormatWithCsd = ensureVideoFormatHasCsd(videoFormat, videoSamples)
-            if (videoFormatWithCsd == null) {
-                Log.e(TAG, "[Record] ❌ Failed to get valid video format with CSD")
-                muxer.release()
-                outputFile.delete()
-                sendEvent("recordingError", mapOf("error" to "Invalid video format"))
-                return
-            }
-            
-            // Step 6: Add tracks to muxer
-            val videoTrackIndex = try {
-                val trackIndex = muxer.addTrack(videoFormatWithCsd)
-                Log.d(TAG, "[Record] ✅ Video track added: index=$trackIndex")
-                trackIndex
-            } catch (e: Exception) {
-                Log.e(TAG, "[Record] ❌ Failed to add video track", e)
-                muxer.release()
-                outputFile.delete()
-                sendEvent("recordingError", mapOf("error" to "Failed to add video track"))
-                return
-            }
-            
-            val audioTrackIndex = if (audioSamples.isNotEmpty() && audioFormat != null) {
-                try {
-                    val trackIndex = muxer.addTrack(audioFormat!!)
-                    Log.d(TAG, "[Record] ✅ Audio track added: index=$trackIndex")
-                    trackIndex
-                } catch (e: Exception) {
-                    Log.w(TAG, "[Record] ⚠️ Failed to add audio track, continuing video-only", e)
-                    -1
-                }
-            } else {
-                -1
-            }
-            
-            // Step 6: Set orientation and start muxer
-            muxer.setOrientationHint(recordingOrientation)
-            
-            try {
-                muxer.start()
-                Log.d(TAG, "[Record] ✅ Muxer started")
-            } catch (e: Exception) {
-                Log.e(TAG, "[Record] ❌ Failed to start muxer", e)
-                muxer.release()
-                outputFile.delete()
-                sendEvent("recordingError", mapOf("error" to "Muxer start failed: ${e.message}"))
-                return
-            }
-            
-            // Step 7: SIMPLIFIED - Write pre-roll with continuous counter per track
-            var prerollVideoCount = 0
-            var prerollAudioCount = 0
-            var nextVideoPts = 0L
-            var nextAudioPts = 0L
-            // Use the class member videoDeltaUs which is updated based on currentFps
-            Log.d(TAG, "[Record] Using videoDeltaUs=${videoDeltaUs}µs (${currentFps} fps), audioDeltaUs=${audioDeltaUs}µs")
-            
-            // Separate samples by type
-            val prerollVideoSamples = sortedSamples.filter { it.isVideo }
-            val prerollAudioSamples = sortedSamples.filter { !it.isVideo }
-            
-            Log.d(TAG, "[Record] Writing ${prerollVideoSamples.size} video + ${prerollAudioSamples.size} audio samples to pre-roll")
-            
-            // Find first keyframe in buffer
-            val firstKeyframeIndex = prerollVideoSamples.indexOfFirst { 
-                (it.info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0 
-            }
-            
-            if (firstKeyframeIndex < 0) {
-                Log.e(TAG, "[Record] ❌ No keyframe found in buffer! Recording will fail.")
-                muxer.stop()
-                muxer.release()
-                outputFile.delete()
-                sendEvent("recordingError", mapOf("error" to "No keyframe in buffer"))
-                return
-            }
-            
-            // Get the timestamp of the first keyframe
-            val firstKeyframeTimestamp = prerollVideoSamples[firstKeyframeIndex].globalPtsUs
-            
-            if (firstKeyframeIndex > 0) {
-                Log.w(TAG, "[Record] ⚠️ First keyframe at index $firstKeyframeIndex (timestamp ${firstKeyframeTimestamp}µs), skipping ${firstKeyframeIndex} video frames")
-            }
-            
-            // Write video samples starting from first keyframe
-            for (i in firstKeyframeIndex until prerollVideoSamples.size) {
-                val sample = prerollVideoSamples[i]
-                val isKeyframe = (sample.info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
-                
-                val bufferInfo = MediaCodec.BufferInfo()
-                bufferInfo.set(0, sample.data.size, nextVideoPts, sample.info.flags)
-                
-                val byteBuffer = ByteBuffer.wrap(sample.data)
-                muxer.writeSampleData(videoTrackIndex, byteBuffer, bufferInfo)
-                
-                if (prerollVideoCount < 5 || isKeyframe) {
-                    Log.d(TAG, "[Record] Video #${prerollVideoCount}: keyframe=$isKeyframe, pts=${nextVideoPts}µs, size=${sample.data.size}b")
-                }
-                
-                prerollVideoCount++
-                nextVideoPts += videoDeltaUs
-            }
-            
-            if (prerollVideoCount == 0) {
-                Log.e(TAG, "[Record] ❌ No video frames written to pre-roll")
-                muxer.stop()
-                muxer.release()
-                outputFile.delete()
-                sendEvent("recordingError", mapOf("error" to "No video frames"))
-                return
-            }
-            
-            // CRITICAL FIX: Write audio samples starting from same timestamp as first keyframe
-            // This ensures audio/video sync even when video starts from middle of buffer
-            if (audioTrackIndex >= 0) {
-                val syncedAudioSamples = prerollAudioSamples.filter { it.globalPtsUs >= firstKeyframeTimestamp }
-                val skippedAudioCount = prerollAudioSamples.size - syncedAudioSamples.size
-                
-                if (skippedAudioCount > 0) {
-                    Log.d(TAG, "[Record] Skipping $skippedAudioCount audio samples to sync with video (audio starts at ${firstKeyframeTimestamp}µs)")
-                }
-                
-                syncedAudioSamples.forEach { sample ->
-                    val bufferInfo = MediaCodec.BufferInfo()
-                    bufferInfo.set(0, sample.data.size, nextAudioPts, sample.info.flags)
-                    
-                    val byteBuffer = ByteBuffer.wrap(sample.data)
-                    muxer.writeSampleData(audioTrackIndex, byteBuffer, bufferInfo)
-                    
-                    if (prerollAudioCount < 5) {
-                        Log.d(TAG, "[Record] Audio #${prerollAudioCount}: pts=${nextAudioPts}µs, size=${sample.data.size}b")
-                    }
-                    
-                    prerollAudioCount++
-                    nextAudioPts += audioDeltaUs
-                }
-                
-                Log.d(TAG, "[Record] Written ${prerollAudioCount} audio samples (skipped $skippedAudioCount for sync)")
-            }
-            
-            val prerollDurationSec = nextVideoPts / 1_000_000.0
-            Log.d(TAG, "[Record] ✅ Pre-roll written: ${prerollVideoCount}v + ${prerollAudioCount}a frames (${String.format("%.2f", prerollDurationSec)}s)")
-            
-            if (prerollVideoCount < 3) {
-                Log.w(TAG, "[Record] ⚠️ WARNING: Only $prerollVideoCount video samples in pre-roll (very short!)")
-            }
-            
-            // Step 8: Set up for live recording with continuous counters
-            val recordingStartTime = nowUs()
-            
-            recordingMuxer = muxer
-            recordingVideoTrack = videoTrackIndex
-            recordingAudioTrack = audioTrackIndex
-            recordingBasePtsUs = basePtsUs
-            recordingStartTimeUs = recordingStartTime
-            lastPrerollVideoPts = nextVideoPts - videoDeltaUs // Last written PTS
-            lastPrerollAudioPts = nextAudioPts - audioDeltaUs // Last written PTS
-            prerollWritten = true
-            isRecording = true
-            liveVideoSampleCount = 0
-            liveAudioSampleCount = 0
-            
-            Log.d(TAG, "[Record] ✅ Ready for live samples")
-            Log.d(TAG, "[Record] Recording started at: ${recordingStartTime}µs")
-            Log.d(TAG, "[Record] Next video PTS: ${nextVideoPts}µs")
-            Log.d(TAG, "[Record] Next audio PTS: ${nextAudioPts}µs")
-            
-            // Notify Flutter that recording started
-            sendEvent("recordingStarted", mapOf("id" to currentRecordingId))
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "[Record] ❌ Fatal error during recording start", e)
-            currentOutputFile?.delete()
-            currentOutputFile = null
-            sendEvent("recordingError", mapOf("error" to "Recording failed: ${e.message}"))
-        }
+        Log.w(TAG, "startRecordingWithPrerollInternal is DEPRECATED - using DVR-style recording now")
+        // No longer used - recording now uses DVR-style export
     }
 
     private fun areEncoderFormatsReady(): Boolean {
@@ -2060,118 +2483,360 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                 return
             }
             
-            Log.i(TAG, "[Record] stopRecording called")
-            // Instant response
-            sendEvent("recordingStopped", null)
+            // ═══════════════════════════════════════════════════════════════════
+            // DVR-STYLE RECORD STOP - Mark timestamp, then export in background
+            // ═══════════════════════════════════════════════════════════════════
+            
+            // Mark the global PTS when recording stopped
+            recordingStopGlobalPtsUs = nowUs()
+            val recordingDurationUs = recordingStopGlobalPtsUs - recordingStartGlobalPtsUs
+            
+            Log.d(TAG, "═══════════════════════════════════════════════════════════")
+            Log.d(TAG, "[Record] 🛑 RECORDING STOPPED")
+            Log.d(TAG, "[Record] - Stop PTS: ${recordingStopGlobalPtsUs}µs")
+            Log.d(TAG, "[Record] - Recording duration: ${recordingDurationUs / 1_000_000.0}s")
+            Log.d(TAG, "═══════════════════════════════════════════════════════════")
+            
+            // Clear recording flag immediately
+            isRecording = false
+            
+            // Send immediate response to Flutter
+            sendEvent("recordingStopped", mapOf("id" to currentRecordingId))
             result.success(null)
             
-            // Stop recording in background
-            stopRecordingAndFinalize()
+            // Start background export
+            startBackgroundExport()
             
         } catch (e: Exception) {
             Log.e(TAG, "Failed to stop recording", e)
+            isRecording = false
             result.error("RECORDING_ERROR", "Failed to stop recording: ${e.message}", null)
         }
     }
     
-    private fun stopRecordingAndFinalize() {
-        encoderHandler?.post {
+    /**
+     * DVR-style background export - extracts pre-roll + live samples and muxes them
+     * This runs completely in the background, never blocking the camera pipeline
+     */
+    private fun startBackgroundExport() {
+        if (isExporting) {
+            Log.w(TAG, "[Export] ⚠️ Export already in progress")
+            return
+        }
+        
+        isExporting = true
+        
+        // Capture all needed state before starting the background thread
+        val recordingId = currentRecordingId ?: return
+        val startPts = recordingStartGlobalPtsUs
+        val stopPts = recordingStopGlobalPtsUs
+        val orientation = recordingOrientation
+        val startTime = recordingStartTime
+        val fps = currentFps
+        val resolution = currentResolution
+        val codec = currentCodec
+        val preRollSec = preRollSeconds
+        
+        // ═══════════════════════════════════════════════════════════════════
+        // USE FROZEN PRE-ROLL START PTS - This was captured when Record started
+        // This ensures we get the exact pre-roll content that existed at that moment
+        // ═══════════════════════════════════════════════════════════════════
+        val preRollStartPts = frozenPreRollStartPts
+        
+        // Calculate actual durations
+        val preRollDurationSec = (startPts - preRollStartPts) / 1_000_000.0
+        val liveDurationSec = (stopPts - startPts) / 1_000_000.0
+        val totalDurationSec = (stopPts - preRollStartPts) / 1_000_000.0
+        
+        Log.d(TAG, "[Export] 📦 Starting background export...")
+        Log.d(TAG, "[Export] - Recording ID: $recordingId")
+        Log.d(TAG, "[Export] - Frozen pre-roll start PTS: ${preRollStartPts}µs")
+        Log.d(TAG, "[Export] - Record start PTS: ${startPts}µs")
+        Log.d(TAG, "[Export] - Record stop PTS: ${stopPts}µs")
+        Log.d(TAG, "[Export] - Pre-roll duration: ${String.format("%.2f", preRollDurationSec)}s")
+        Log.d(TAG, "[Export] - Live duration: ${String.format("%.2f", liveDurationSec)}s")
+        Log.d(TAG, "[Export] - Total timeline: ${String.format("%.2f", totalDurationSec)}s")
+        
+        // NOTE: Do NOT restore buffer duration here!
+        // We must keep the expanded buffer until export has finished reading samples.
+        // Buffer will be restored inside the export thread after streaming is complete.
+        
+        exportThread = Thread {
             try {
-                Log.d(TAG, "[Record] stopRecording called")
-                
-                // Stop and finalize muxer
-                val muxer = recordingMuxer
-                val outputFile = currentOutputFile
-                
-                // Reset state FIRST to stop new samples from being written
-                recordingMuxer = null
-                recordingVideoTrack = -1
-                recordingAudioTrack = -1
-                recordingBasePtsUs = -1
-                recordingStartTimeUs = -1
-                lastPrerollVideoPts = -1
-                lastPrerollAudioPts = -1
-                prerollWritten = false
-                isRecording = false
-                
-                val finalVideoCount = liveVideoSampleCount
-                val finalAudioCount = liveAudioSampleCount
-                liveVideoSampleCount = 0
-                liveAudioSampleCount = 0
-                
-                // Log final statistics
-                Log.d(TAG, "[Record] Final statistics:")
-                Log.d(TAG, "[Record] - Live VIDEO samples written: $finalVideoCount")
-                Log.d(TAG, "[Record] - Live AUDIO samples written: $finalAudioCount")
-                
-                if (muxer != null) {
-                    // Validate that we have written some samples
-                    if (finalVideoCount == 0 && finalAudioCount == 0) {
-                        Log.w(TAG, "[Record] ⚠️ WARNING: No live samples were written to muxer!")
-                    }
-                    
-                    Log.d(
-                        TAG,
-                        "[Record] Finalizing muxer with ${finalVideoCount} live video samples and ${finalAudioCount} live audio samples"
-                    )
-                    try {
-                        Log.d(TAG, "[Record] Stopping muxer...")
-                        muxer.stop()
-                        Log.d(TAG, "[Record] ✅ Muxer stop complete")
-                    } catch (e: Exception) {
-                        Log.e(TAG, "[Record] ❌ ERROR while stopping muxer - file may be corrupted", e)
-                        Log.e(TAG, "[Record] Error details: ${e::class.simpleName}: ${e.message}")
-                        // Try to delete potentially corrupted file
-                        outputFile?.let { file ->
-                            if (file.exists()) {
-                                file.delete()
-                                Log.d(TAG, "[Record] Deleted corrupted file: ${file.absolutePath}")
-                            }
-                        }
-                        sendEvent("recordingError", mapOf("error" to "Failed to finalize recording: ${e.message}"))
-                        return@post
-                    } finally {
-                        try {
-                            Log.d(TAG, "[Record] Releasing muxer")
-                            muxer.release()
-                            Log.d(TAG, "[Record] Muxer released")
-                        } catch (e: Exception) {
-                            Log.e(TAG, "[Record] finalize ERROR while releasing muxer", e)
-                        }
-                    }
-                }
-                
-                // Calculate approximate duration
-                if (outputFile != null && outputFile.exists()) {
-                    val fileSizeBytes = outputFile.length()
-                    val fileSizeKB = fileSizeBytes / 1024.0
-                    val fileSizeMB = fileSizeKB / 1024.0
-                    Log.d(TAG, "[Record] Output file size: ${String.format("%.2f", fileSizeMB)} MB")
-                    
-                    // Estimate duration based on sample count (at 30fps)
-                    val estimatedVideoSeconds = finalVideoCount / 30.0
-                    Log.d(TAG, "[Record] Estimated live duration from video samples: ${String.format("%.2f", estimatedVideoSeconds)}s")
-                    
-                    // Validate minimum file size
-                    if (fileSizeBytes < minValidFileBytes) {
-                        Log.e(TAG, "[Record] ❌ File too small: ${fileSizeBytes} bytes (min: ${minValidFileBytes})")
-                        outputFile.delete()
-                        sendEvent("recordingError", mapOf("error" to "Recording file too small"))
-                        return@post
-                    }
-                }
-                
-                // Buffer keeps running - ready for next recording
-                Log.d(TAG, "[Record] Recording finalized, buffer continues running")
-                
-                // Notify completion
-                finalizeRecording(outputFile)
-                
+                performBackgroundExport(
+                    recordingId = recordingId,
+                    preRollStartPts = preRollStartPts,
+                    recordStartPts = startPts,
+                    recordStopPts = stopPts,
+                    orientation = orientation,
+                    startTime = startTime,
+                    fps = fps,
+                    resolution = resolution,
+                    codec = codec,
+                    preRollSec = preRollSec
+                )
             } catch (e: Exception) {
-                Log.e(TAG, "[Record] Error stopping recording", e)
-                sendEvent("recordingError", mapOf("error" to e.message))
+                Log.e(TAG, "[Export] ❌ Background export failed", e)
+                sendEvent("recordingError", mapOf("error" to "Export failed: ${e.message}"))
+            } finally {
+                isExporting = false
+                
+                // Reset recording state
+                recordingStartGlobalPtsUs = -1
+                recordingStopGlobalPtsUs = -1
+                recordingMarkTimestamp = 0
+                frozenPreRollStartPts = -1
             }
         }
+        exportThread?.name = "DVR-Export-Thread"
+        exportThread?.start()
+    }
+    
+    /**
+     * Performs the actual export work in background thread.
+     * Uses STREAMING approach - reads samples from disk in batches to avoid OOM at 4K 60fps.
+     * This is critical for 30s buffer at 4K 60fps which contains ~170MB of encoded data.
+     */
+    private fun performBackgroundExport(
+        recordingId: String,
+        preRollStartPts: Long,
+        recordStartPts: Long,
+        recordStopPts: Long,
+        orientation: Int,
+        startTime: Long,
+        fps: Int,
+        resolution: String,
+        codec: String,
+        preRollSec: Int
+    ) {
+        Log.d(TAG, "[Export] 🔄 Background STREAMING export started on ${Thread.currentThread().name}")
+        
+        // Send initial progress
+        sendEvent("finalizeProgress", mapOf("progress" to 0.1))
+        
+        // Step 1: Get sample counts and metadata without loading data into RAM
+        val totalSamples = rollingBuffer.getSampleCountInRange(preRollStartPts, recordStopPts)
+        val videoSampleCount = rollingBuffer.getVideoSampleCountInRange(preRollStartPts, recordStopPts)
+        
+        Log.d(TAG, "[Export] Total samples in range: $totalSamples (video: $videoSampleCount)")
+        
+        if (videoSampleCount == 0) {
+            Log.e(TAG, "[Export] ❌ No video samples found in recording timeline")
+            sendEvent("recordingError", mapOf("error" to "No video data captured"))
+            return
+        }
+        
+        sendEvent("finalizeProgress", mapOf("progress" to 0.15))
+        
+        // Step 2: Validate encoder formats
+        if (!areEncoderFormatsReady()) {
+            Log.e(TAG, "[Export] ❌ Encoder formats not ready")
+            sendEvent("recordingError", mapOf("error" to "Encoder formats not ready"))
+            return
+        }
+        
+        // Step 3: Get first keyframe for CSD without loading all samples
+        val firstKeyframeSample = rollingBuffer.getFirstKeyframeSample(preRollStartPts, recordStopPts)
+        if (firstKeyframeSample == null) {
+            Log.e(TAG, "[Export] ❌ No keyframe found in recording range")
+            sendEvent("recordingError", mapOf("error" to "No keyframe found"))
+            return
+        }
+        
+        val firstKeyframePts = firstKeyframeSample.globalPtsUs
+        Log.d(TAG, "[Export] First keyframe at PTS: $firstKeyframePts")
+        
+        sendEvent("finalizeProgress", mapOf("progress" to 0.2))
+        
+        // Step 4: Create output file
+        val outputFile = getOutputFile()
+        currentOutputFile = outputFile
+        Log.d(TAG, "[Export] Output file: ${outputFile.absolutePath}")
+        
+        try {
+            // Step 5: Ensure video format has CSD from keyframe
+            val videoFormatWithCsd = ensureVideoFormatHasCsd(videoFormat, listOf(firstKeyframeSample))
+            if (videoFormatWithCsd == null) {
+                Log.e(TAG, "[Export] ❌ Failed to get valid video format with CSD")
+                outputFile.delete()
+                sendEvent("recordingError", mapOf("error" to "Invalid video format"))
+                return
+            }
+            
+            // Step 6: Create muxer and add tracks
+            val muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            
+            val videoTrackIndex = muxer.addTrack(videoFormatWithCsd)
+            Log.d(TAG, "[Export] ✅ Video track added: index=$videoTrackIndex")
+            
+            val audioTrackIndex = if (audioFormat != null) {
+                try {
+                    muxer.addTrack(audioFormat!!)
+                } catch (e: Exception) {
+                    Log.w(TAG, "[Export] ⚠️ Failed to add audio track", e)
+                    -1
+                }
+            } else {
+                -1
+            }
+            
+            muxer.setOrientationHint(orientation)
+            muxer.start()
+            Log.d(TAG, "[Export] ✅ Muxer started")
+            
+            sendEvent("finalizeProgress", mapOf("progress" to 0.3))
+            
+            // Step 7: Stream samples from disk and write to muxer
+            // This avoids loading all samples into RAM at once
+            val localVideoDeltaUs = 1_000_000L / fps.toLong()
+            val localAudioDeltaUs = 23220L // AAC @ 44.1kHz
+            
+            var nextVideoPts = 0L
+            var nextAudioPts = 0L
+            var videoWriteCount = 0
+            var audioWriteCount = 0
+            var samplesProcessed = 0
+            var foundFirstKeyframe = false
+            
+            // Use streaming to process samples in batches of 30
+            // This keeps memory usage bounded regardless of buffer size
+            rollingBuffer.streamSamplesInRange(
+                startPtsUs = preRollStartPts,
+                endPtsUs = recordStopPts,
+                batchSize = 30
+            ) { batch ->
+                for (sample in batch) {
+                    // Skip samples until we reach the first keyframe
+                    if (!foundFirstKeyframe) {
+                        if (sample.isVideo && (sample.info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0) {
+                            foundFirstKeyframe = true
+                            Log.d(TAG, "[Export] Found first keyframe at sample $samplesProcessed")
+                        } else if (sample.isVideo) {
+                            // Skip non-keyframe video samples before first keyframe
+                            samplesProcessed++
+                            continue
+                        }
+                    }
+                    
+                    if (sample.isVideo) {
+                        // Write video sample
+                        val bufferInfo = MediaCodec.BufferInfo()
+                        bufferInfo.set(0, sample.data.size, nextVideoPts, sample.info.flags)
+                        
+                        val byteBuffer = ByteBuffer.wrap(sample.data)
+                        muxer.writeSampleData(videoTrackIndex, byteBuffer, bufferInfo)
+                        
+                        videoWriteCount++
+                        nextVideoPts += localVideoDeltaUs
+                    } else if (audioTrackIndex >= 0 && foundFirstKeyframe) {
+                        // Write audio sample (only after first keyframe)
+                        val bufferInfo = MediaCodec.BufferInfo()
+                        bufferInfo.set(0, sample.data.size, nextAudioPts, sample.info.flags)
+                        
+                        val byteBuffer = ByteBuffer.wrap(sample.data)
+                        muxer.writeSampleData(audioTrackIndex, byteBuffer, bufferInfo)
+                        
+                        audioWriteCount++
+                        nextAudioPts += localAudioDeltaUs
+                    }
+                    
+                    samplesProcessed++
+                }
+                
+                // Update progress based on samples processed
+                val progress = 0.3 + (0.5 * samplesProcessed / totalSamples.coerceAtLeast(1))
+                sendEvent("finalizeProgress", mapOf("progress" to progress.coerceAtMost(0.8)))
+            }
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // CRITICAL: Now that streaming is complete, restore buffer to normal duration
+            // This was expanded when Record started to preserve pre-roll during recording
+            // ═══════════════════════════════════════════════════════════════════
+            val normalBufferDurationUs = selectedBufferSeconds * 1_000_000L
+            rollingBuffer.updateMaxDuration(normalBufferDurationUs)
+            Log.d(TAG, "[Export] Buffer restored to normal ${selectedBufferSeconds}s duration after streaming complete")
+            
+            val totalDurationSec = nextVideoPts / 1_000_000.0
+            Log.d(TAG, "[Export] ✅ Streamed: $videoWriteCount video + $audioWriteCount audio samples (${String.format("%.2f", totalDurationSec)}s)")
+            
+            if (videoWriteCount == 0) {
+                Log.e(TAG, "[Export] ❌ No video samples were written")
+                muxer.stop()
+                muxer.release()
+                outputFile.delete()
+                sendEvent("recordingError", mapOf("error" to "No video data written"))
+                return
+            }
+            
+            sendEvent("finalizeProgress", mapOf("progress" to 0.85))
+            
+            // Step 8: Finalize muxer
+            try {
+                muxer.stop()
+                muxer.release()
+                Log.d(TAG, "[Export] ✅ Muxer finalized")
+            } catch (e: Exception) {
+                Log.e(TAG, "[Export] ❌ Error finalizing muxer", e)
+                outputFile.delete()
+                sendEvent("recordingError", mapOf("error" to "Failed to finalize: ${e.message}"))
+                return
+            }
+            
+            sendEvent("finalizeProgress", mapOf("progress" to 0.9))
+            
+            // Step 9: Validate output file
+            if (!outputFile.exists() || outputFile.length() < minValidFileBytes) {
+                Log.e(TAG, "[Export] ❌ Output file invalid: exists=${outputFile.exists()}, size=${outputFile.length()}")
+                outputFile.delete()
+                sendEvent("recordingError", mapOf("error" to "Recording file too small"))
+                return
+            }
+            
+            // Step 10: Generate thumbnail
+            val thumbnailPath = generateVideoThumbnail(outputFile)
+            
+            // Step 11: Refresh MediaStore
+            refreshMediaStore(outputFile)
+            
+            sendEvent("finalizeProgress", mapOf("progress" to 1.0))
+            
+            // Step 12: Send completion event
+            val videoData = mapOf(
+                "id" to recordingId,
+                "filePath" to outputFile.absolutePath,
+                "thumbnailPath" to thumbnailPath,
+                "duration" to (totalDurationSec * 1000).toLong(),
+                "resolution" to resolution,
+                "fps" to fps,
+                "codec" to codec,
+                "preRollSeconds" to preRollSec,
+                "size" to outputFile.length(),
+                "timestamp" to outputFile.lastModified()
+            )
+            
+            Log.d(TAG, "[Export] ═══════════════════════════════════════════════════════")
+            Log.d(TAG, "[Export] ✅ STREAMING EXPORT COMPLETE")
+            Log.d(TAG, "[Export] - File: ${outputFile.absolutePath}")
+            Log.d(TAG, "[Export] - Size: ${outputFile.length() / 1024.0 / 1024.0} MB")
+            Log.d(TAG, "[Export] - Duration: ${String.format("%.2f", totalDurationSec)}s")
+            Log.d(TAG, "[Export] - Video samples: $videoWriteCount")
+            Log.d(TAG, "[Export] - Audio samples: $audioWriteCount")
+            Log.d(TAG, "[Export] ═══════════════════════════════════════════════════════")
+            
+            sendEvent("finalizeCompleted", mapOf("video" to videoData))
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "[Export] ❌ Export error", e)
+            outputFile.delete()
+            sendEvent("recordingError", mapOf("error" to "Export failed: ${e.message}"))
+        }
+    }
+    
+    // DEPRECATED: Old sync finalize approach - replaced by DVR-style background export
+    @Deprecated("Use startBackgroundExport instead")
+    private fun stopRecordingAndFinalize() {
+        Log.w(TAG, "stopRecordingAndFinalize is DEPRECATED - using DVR-style export now")
+        // No longer used - recording now uses DVR-style export via startBackgroundExport
     }
 
     private fun finalizeRecordingWithPreroll(liveRecordingFile: File, bufferFile: File?) {
