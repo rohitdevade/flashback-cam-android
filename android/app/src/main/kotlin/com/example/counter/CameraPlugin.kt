@@ -760,6 +760,8 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
     private var currentOutputFile: File? = null
     private var exportThread: Thread? = null          // Background thread for export
     private var isExporting = false                   // Export in progress flag
+    private var maxRecordingDurationMs: Long = 0      // Max recording duration, auto-stops when reached
+    private var recordingAutoStopTimer: Timer? = null // Timer for auto-stop
     
     // Legacy fields kept for compatibility during transition
     private var recordingMuxer: MediaMuxer? = null
@@ -2281,7 +2283,39 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
             Log.d(TAG, "[Record] - Buffer samples: $bufferSamples (video=$videoCount, audio=$audioCount)")
             Log.d(TAG, "[Record] - Selected buffer setting: ${selectedBufferSeconds}s")
             Log.d(TAG, "[Record] - Orientation: $recordingOrientation°")
+            Log.d(TAG, "[Record] - Max recording duration: ${maxLiveRecordingMinutes} minutes")
             Log.d(TAG, "═══════════════════════════════════════════════════════════")
+            
+            // Setup auto-stop timer for max recording duration
+            maxRecordingDurationMs = maxLiveRecordingMinutes.toLong() * 60 * 1000
+            recordingAutoStopTimer?.cancel()
+            recordingAutoStopTimer = Timer()
+            recordingAutoStopTimer?.schedule(object : TimerTask() {
+                override fun run() {
+                    if (isRecording) {
+                        Log.d(TAG, "⏱️ Max recording duration reached (${maxLiveRecordingMinutes}min) - auto-stopping")
+                        // Send event to Flutter to notify user and trigger stop
+                        sendEvent("maxDurationReached", mapOf(
+                            "maxMinutes" to maxLiveRecordingMinutes,
+                            "resolution" to currentResolution,
+                            "fps" to currentFps
+                        ))
+                        // Auto-stop recording on main handler
+                        backgroundHandler?.post {
+                            stopRecording(object : MethodChannel.Result {
+                                override fun success(result: Any?) {
+                                    Log.d(TAG, "Auto-stop recording completed successfully")
+                                }
+                                override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {
+                                    Log.e(TAG, "Auto-stop recording failed: $errorMessage")
+                                }
+                                override fun notImplemented() {}
+                            })
+                        }
+                    }
+                }
+            }, maxRecordingDurationMs)
+            Log.d(TAG, "[Record] Auto-stop timer set for ${maxLiveRecordingMinutes} minutes")
             
             // Instant response - recording has started
             result.success(currentRecordingId)
@@ -2489,6 +2523,10 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                 result.success(null)
                 return
             }
+            
+            // Cancel auto-stop timer if running
+            recordingAutoStopTimer?.cancel()
+            recordingAutoStopTimer = null
             
             // ═══════════════════════════════════════════════════════════════════
             // DVR-STYLE RECORD STOP - Mark timestamp, then export in background

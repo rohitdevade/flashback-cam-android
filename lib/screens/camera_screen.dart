@@ -119,6 +119,33 @@ class _CameraScreenState extends State<CameraScreen> {
           ),
         );
       }
+
+      // Check for max duration reached message
+      final maxDurationMessage = appState.consumeMaxDurationMessage();
+      if (maxDurationMessage != null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Row(
+              children: [
+                const Icon(Icons.timer_off, color: Colors.white, size: 20),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    maxDurationMessage,
+                    style: const TextStyle(fontSize: 13),
+                  ),
+                ),
+              ],
+            ),
+            duration: const Duration(seconds: 5),
+            backgroundColor: AppColors.warningOrange,
+            behavior: SnackBarBehavior.floating,
+            margin: const EdgeInsets.all(16),
+            shape:
+                RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          ),
+        );
+      }
     });
   }
 

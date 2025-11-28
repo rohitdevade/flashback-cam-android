@@ -49,6 +49,9 @@ class AppState extends ChangeNotifier {
   // Recording error tracking - cleared after being read
   String? _lastRecordingError;
 
+  // Max duration reached message - cleared after being read
+  String? _maxDurationReachedMessage;
+
   // Flag to indicate recording is being prepared (after button tap, before recording starts)
   bool _isPreparingRecording = false;
 
@@ -279,6 +282,16 @@ class AppState extends ChangeNotifier {
           _cameraMode = CameraMode.processing;
           notifyListeners();
           _showAdIfNeeded();
+          break;
+        case 'maxDurationReached':
+          final maxMinutes = event['maxMinutes'] as int? ?? 0;
+          final resolution = event['resolution'] as String? ?? '';
+          final fps = event['fps'] as int? ?? 0;
+          debugPrint(
+              'Max recording duration reached: ${maxMinutes}min at $resolution@${fps}fps');
+          _maxDurationReachedMessage =
+              'Recording auto-stopped after $maxMinutes minutes (max for $resolution@${fps}fps)';
+          notifyListeners();
           break;
         case 'finalizeProgress':
           _finalizeProgress = (event['progress'] as num?)?.toDouble() ?? 0.0;
@@ -703,6 +716,13 @@ class AppState extends ChangeNotifier {
     final error = _lastRecordingError;
     _lastRecordingError = null;
     return error;
+  }
+
+  /// Get and clear the max duration reached message (returns null if no message)
+  String? consumeMaxDurationMessage() {
+    final message = _maxDurationReachedMessage;
+    _maxDurationReachedMessage = null;
+    return message;
   }
 
   /// Returns true if recording is being prepared (after tap, before recording starts)
