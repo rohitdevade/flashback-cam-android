@@ -819,6 +819,9 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
     private var flashMode = "off"
     private var cameraFacing = CameraCharacteristics.LENS_FACING_BACK
     
+    // Helper to check if front camera is active
+    private fun isFrontCamera(): Boolean = cameraFacing == CameraCharacteristics.LENS_FACING_FRONT
+    
     // Zoom
     private var currentZoomLevel = 1.0f
     private var maxZoom = 1.0f
@@ -1276,6 +1279,25 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
         if (availableSizes.isEmpty()) return defaultSize
         val normalized = resolution.uppercase(Locale.US)
         
+        // FRONT CAMERA: Always use 720p for preview (front cameras have lower quality sensors)
+        if (isFrontCamera()) {
+            Log.d(TAG, "📷 Front camera detected: forcing 720p preview")
+            val targetSize = Size(1280, 720)
+            val aspectRatio = targetSize.width.toFloat() / targetSize.height.toFloat()
+            val ratioTolerance = 0.02f
+            val ratioMatches = availableSizes.filter { size ->
+                val ratio = size.width.toFloat() / size.height.toFloat()
+                abs(ratio - aspectRatio) <= ratioTolerance
+            }
+            val filtered = if (ratioMatches.isNotEmpty()) ratioMatches else availableSizes.toList()
+            val notBigger = filtered.filter { it.width <= targetSize.width && it.height <= targetSize.height }
+            return when {
+                notBigger.isNotEmpty() -> notBigger.maxByOrNull { it.width * it.height } ?: Size(1280, 720)
+                else -> filtered.minByOrNull { abs((it.width * it.height) - (targetSize.width * targetSize.height)) }
+                    ?: Size(1280, 720)
+            }
+        }
+        
         // For low-RAM devices, cap preview at 720p regardless of recording resolution
         val targetSize = if (isLowRamDevice) {
             Size(1280, 720)
@@ -1716,14 +1738,28 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
         val candidates = mutableListOf<VideoEncoderSettings>()
         val totalRamMb = getTotalRamMb()
         
-        // Always try the user's requested settings first
-        // Only use fallback if the primary fails
-        Log.d(TAG, "[VideoEncoder] Building candidates for: ${currentResolution}@${currentFps}fps, RAM: ${totalRamMb}MB")
+        // FRONT CAMERA: Always use 720p recording (front cameras have limited capabilities)
+        val effectiveResolution = if (isFrontCamera()) {
+            Log.d(TAG, "📷 Front camera: forcing 720p recording (was: $currentResolution)")
+            "720P"
+        } else {
+            currentResolution
+        }
         
-        // Primary: User's selected settings
+        // Front camera: also cap FPS at 30 for stability
+        val effectiveFps = if (isFrontCamera() && currentFps > 30) {
+            Log.d(TAG, "📷 Front camera: capping FPS at 30 (was: $currentFps)")
+            30
+        } else {
+            currentFps
+        }
+        
+        Log.d(TAG, "[VideoEncoder] Building candidates for: ${effectiveResolution}@${effectiveFps}fps, RAM: ${totalRamMb}MB")
+        
+        // Primary: User's selected settings (or forced 720p for front camera)
         createVideoEncoderSettings(
-            resolutionLabel = currentResolution,
-            fps = currentFps,
+            resolutionLabel = effectiveResolution,
+            fps = effectiveFps,
             codec = currentCodec,
             isFallback = false
         )?.let { 
@@ -1766,6 +1802,13 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
     }
 
     private fun buildSafeFallbackVideoSettings(): VideoEncoderSettings {
+        // FRONT CAMERA: Always fallback to 720p@30fps
+        if (isFrontCamera()) {
+            Log.d(TAG, "[VideoEncoder] Front camera fallback: 720P@30fps")
+            return createVideoEncoderSettings("720P", 30, "H.264", true)
+                ?: VideoEncoderSettings(1280, 720, 30, 6_000_000, "H.264", MediaFormat.MIMETYPE_VIDEO_AVC, true)
+        }
+        
         val supportedResolutions = ensureCameraCharacteristics()?.let { collectSupportedResolutions(it) } ?: emptyList()
         val fallbackRes = when {
             supportedResolutions.contains("1080P") -> "1080P"
@@ -3475,14 +3518,131 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
 
     private fun switchCamera(result: MethodChannel.Result) {
         try {
+            Log.d(TAG, "🔄 switchCamera called: isBuffering=$isBuffering, isBufferInitialized=$isBufferInitialized")
+            Log.d(TAG, "🔄 Current settings: resolution=$currentResolution, fps=$currentFps")
+            
+            val wasBuffering = isBuffering
+            val wasBufferInitialized = isBufferInitialized
+            val oldCameraFacing = cameraFacing
+            
             cameraFacing = if (cameraFacing == CameraCharacteristics.LENS_FACING_BACK) {
                 CameraCharacteristics.LENS_FACING_FRONT
             } else {
                 CameraCharacteristics.LENS_FACING_BACK
             }
             
+            val isSwitchingToFront = isFrontCamera()
+            Log.d(TAG, "🔄 New camera facing: ${if (isSwitchingToFront) "FRONT" else "BACK"}")
+            
+            // Log resolution change for front camera
+            if (isSwitchingToFront) {
+                Log.d(TAG, "🔄 FRONT CAMERA: Will use 720p@30fps (overriding user setting: ${currentResolution}@${currentFps}fps)")
+            } else {
+                Log.d(TAG, "🔄 BACK CAMERA: Will use user settings ${currentResolution}@${currentFps}fps")
+            }
+            
+            // CRITICAL: If buffer was active, we need to stop encoders before switching cameras
+            // The encoder surfaces are tied to the old camera session and can't be reused
+            if (wasBuffering && wasBufferInitialized) {
+                Log.d(TAG, "🔄 Buffer active - stopping encoders before camera switch")
+                
+                // Stop audio capture first
+                isAudioCapturing = false
+                
+                // Stop and release video encoder
+                try {
+                    videoEncoder?.stop()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error stopping video encoder: ${e.message}")
+                }
+                try {
+                    videoEncoder?.release()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error releasing video encoder: ${e.message}")
+                }
+                videoEncoder = null
+                
+                // Release video encoder surface
+                try {
+                    videoEncoderSurface?.release()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error releasing video encoder surface: ${e.message}")
+                }
+                videoEncoderSurface = null
+                
+                // Stop and release audio encoder
+                try {
+                    audioRecord?.stop()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error stopping audio record: ${e.message}")
+                }
+                try {
+                    audioRecord?.release()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error releasing audio record: ${e.message}")
+                }
+                audioRecord = null
+                
+                try {
+                    audioEncoder?.stop()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error stopping audio encoder: ${e.message}")
+                }
+                try {
+                    audioEncoder?.release()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error releasing audio encoder: ${e.message}")
+                }
+                audioEncoder = null
+                
+                // Quit encoder threads
+                try {
+                    encoderThread?.quitSafely()
+                    encoderThread?.join(300)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error stopping encoder thread: ${e.message}")
+                }
+                encoderThread = null
+                encoderHandler = null
+                
+                try {
+                    audioThread?.quitSafely()
+                    audioThread?.join(300)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error stopping audio thread: ${e.message}")
+                }
+                audioThread = null
+                audioHandler = null
+                
+                // Clear buffer and reset initialization flag
+                rollingBuffer.clear()
+                isBufferInitialized = false
+                
+                Log.d(TAG, "🔄 Encoders and threads stopped and released")
+            }
+            
             closeCamera()
+            
+            // Update camera characteristics for the new camera
+            cameraCharacteristics = null
+            
             openCamera()
+            
+            // If buffer was active, reinitialize it after camera switch
+            if (wasBuffering) {
+                Log.d(TAG, "🔄 Reinitializing buffer for new camera")
+                // Post to background handler to allow camera to open first
+                backgroundHandler?.postDelayed({
+                    try {
+                        // Reinitialize the buffer with new encoders for the new camera
+                        initializeContinuousBuffer()
+                        Log.d(TAG, "🔄 Buffer reinitialized successfully for new camera")
+                    } catch (e: Exception) {
+                        Log.e(TAG, "🔄 Failed to reinitialize buffer: ${e.message}")
+                    }
+                }, 500) // Give camera time to open and create session
+            }
+            
             result.success(null)
             
         } catch (e: Exception) {

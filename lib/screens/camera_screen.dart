@@ -276,10 +276,6 @@ class _CameraScreenState extends State<CameraScreen> {
                   onScaleEnd: (details) {
                     print('🔍 Scale gesture ended');
                   },
-                  onDoubleTap: () {
-                    print('🔍 Double tap detected - switching camera');
-                    appState.switchCamera();
-                  },
                   child: Container(color: Colors.transparent),
                 ),
               ),
@@ -412,7 +408,6 @@ class _CameraScreenState extends State<CameraScreen> {
       onGalleryTap: () => _openGallery(appState),
       flashMode: appState.flashMode,
       onFlashTap: () => appState.toggleFlash(),
-      onSwitchCamera: () => appState.switchCamera(),
     );
   }
 
@@ -863,7 +858,6 @@ class BottomControls extends StatelessWidget {
   final VoidCallback onGalleryTap;
   final String flashMode;
   final VoidCallback onFlashTap;
-  final VoidCallback onSwitchCamera;
   final bool isPortrait;
 
   const BottomControls({
@@ -881,7 +875,6 @@ class BottomControls extends StatelessWidget {
     required this.onGalleryTap,
     required this.flashMode,
     required this.onFlashTap,
-    required this.onSwitchCamera,
     this.isPortrait = true,
   });
 
@@ -923,40 +916,19 @@ class BottomControls extends StatelessWidget {
                   selectedBufferSeconds: selectedBufferSeconds,
                   isEnabled: canRecord,
                 ),
-                Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    GestureDetector(
-                      onTap: isIdle ? null : onFlashTap,
-                      child: Opacity(
-                        opacity: (isIdle || !isCameraReady) ? 0.3 : 1.0,
-                        child: GlassContainer(
-                          padding: const EdgeInsets.all(12),
-                          child: Icon(
-                            flashMode == 'on'
-                                ? Icons.flash_on
-                                : Icons.flash_off,
-                            color: Colors.white,
-                            size: 24,
-                          ),
-                        ),
+                GestureDetector(
+                  onTap: isIdle ? null : onFlashTap,
+                  child: Opacity(
+                    opacity: (isIdle || !isCameraReady) ? 0.3 : 1.0,
+                    child: GlassContainer(
+                      padding: const EdgeInsets.all(12),
+                      child: Icon(
+                        flashMode == 'on' ? Icons.flash_on : Icons.flash_off,
+                        color: Colors.white,
+                        size: 24,
                       ),
                     ),
-                    const SizedBox(height: 12),
-                    GestureDetector(
-                      onTap: (isIdle || isRecording) ? null : onSwitchCamera,
-                      child: Opacity(
-                        opacity: (isIdle || !isCameraReady || isRecording)
-                            ? 0.3
-                            : 1.0,
-                        child: GlassContainer(
-                          padding: const EdgeInsets.all(12),
-                          child: const Icon(Icons.cameraswitch,
-                              color: Colors.white, size: 24),
-                        ),
-                      ),
-                    ),
-                  ],
+                  ),
                 ),
               ],
             ),
@@ -997,23 +969,6 @@ class BottomControls extends StatelessWidget {
                 padding: const EdgeInsets.all(12),
                 child: Icon(
                   flashMode == 'on' ? Icons.flash_on : Icons.flash_off,
-                  color: Colors.white,
-                  size: 24,
-                ),
-              ),
-            ),
-          ),
-          const SizedBox(height: 16),
-          GestureDetector(
-            onTap: (!isCameraReady || isIdle || isRecording)
-                ? null
-                : onSwitchCamera,
-            child: Opacity(
-              opacity: (isIdle || !isCameraReady || isRecording) ? 0.3 : 1.0,
-              child: GlassContainer(
-                padding: const EdgeInsets.all(12),
-                child: const Icon(
-                  Icons.cameraswitch,
                   color: Colors.white,
                   size: 24,
                 ),
