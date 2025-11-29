@@ -608,6 +608,26 @@ class AppState extends ChangeNotifier {
   bool get hasSeenCameraInstructions =>
       _settingsService.settings.hasSeenCameraInstructions;
 
+  /// Mark trial popup as seen (for current session only - not persisted)
+  /// This is no longer used since we show the popup every app launch
+  Future<void> markTrialPopupSeen() async {
+    // No longer persist - popup shows every app launch for free users
+  }
+
+  /// Check if user has seen trial popup (not used anymore)
+  bool get hasSeenTrialPopup => false;
+
+  /// Check if we should show trial popup
+  /// Shows every app launch for users who don't have Pro access (paid or trial)
+  bool get shouldShowTrialPopup {
+    // Don't show if user already has Pro (paid subscription)
+    if (isPro) return false;
+    // Don't show if user is in active trial
+    if (isTrialActive) return false;
+    // Show for all other users (free users who can start trial)
+    return true;
+  }
+
   Future<void> updateSettings(AppSettings settings) async {
     final normalizedSettings = settings.copyWith(
       resolution: settings.resolution.toUpperCase(),
@@ -668,6 +688,15 @@ class AppState extends ChangeNotifier {
     return success;
   }
 
+  /// Start a 7-day free trial
+  Future<bool> startFreeTrial() async {
+    final success = await _subscriptionService.startFreeTrial();
+    if (success) {
+      notifyListeners();
+    }
+    return success;
+  }
+
   Future<void> deleteVideo(String id) async {
     await _storageService.deleteVideo(id);
     notifyListeners();
@@ -700,7 +729,9 @@ class AppState extends ChangeNotifier {
   String get flashMode => _flashMode;
   double get finalizeProgress => _finalizeProgress;
   int? get previewTextureId => _previewTextureId;
-  bool get isPro => _subscriptionService.isPro;
+
+  /// Returns true if user has Pro access (paid subscription OR active trial)
+  bool get isPro => _subscriptionService.hasProAccess;
   SubscriptionService get subscriptionService => _subscriptionService;
   AppSettings get settings => _settingsService.settings;
   DeviceCapabilities? get deviceCapabilities => _deviceService.capabilities;
@@ -710,6 +741,13 @@ class AppState extends ChangeNotifier {
   bool get isProUser => _isProUser;
   int get bufferDuration => _bufferDuration;
   DateTime? get bufferStartTime => _bufferStartTime;
+
+  // Trial-related getters
+  bool get hasProAccess => _subscriptionService.hasProAccess;
+  bool get isTrialActive => _subscriptionService.isTrialActive;
+  bool get trialUsed => _subscriptionService.trialUsed;
+  int get trialDaysRemaining => _subscriptionService.trialDaysRemaining;
+  bool get canStartTrial => _subscriptionService.canStartTrial;
 
   /// Get and clear the last recording error (returns null if no error)
   String? consumeRecordingError() {

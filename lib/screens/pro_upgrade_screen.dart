@@ -479,13 +479,41 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
   }
 
   Widget _buildDisclaimer() {
-    return Text(
-      'Subscriptions auto-renew unless canceled 24 hours before the current period ends. Manage subscriptions in App Store settings.',
-      style: Theme.of(context).textTheme.bodySmall?.copyWith(
-            color: AppColors.textTertiary,
-            height: 1.4,
-          ),
-      textAlign: TextAlign.center,
+    return Builder(
+      builder: (context) {
+        final appState = context.watch<AppState>();
+        final subscriptionService = appState.subscriptionService;
+
+        // Get the price for the selected tier
+        final selectedProduct =
+            subscriptionService.getProductDetails(_selectedTier);
+        final selectedPrice =
+            selectedProduct?.price ?? 'the selected plan\'s price';
+
+        // Determine the billing period text
+        String billingPeriod;
+        if (_selectedTier == 'monthly') {
+          billingPeriod = '/month';
+        } else if (_selectedTier == 'yearly') {
+          billingPeriod = '/year';
+        } else {
+          billingPeriod = ''; // Lifetime has no renewal
+        }
+
+        // Show appropriate disclaimer based on plan type
+        final disclaimerText = _selectedTier == 'lifetime'
+            ? 'One-time purchase. No subscription or recurring charges. All purchases are processed securely by Google Play.'
+            : 'Your subscription auto-renews at $selectedPrice$billingPeriod until canceled. Cancel anytime in Google Play. Manage subscriptions in Google Play settings.';
+
+        return Text(
+          disclaimerText,
+          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: AppColors.textTertiary,
+                height: 1.4,
+              ),
+          textAlign: TextAlign.center,
+        );
+      },
     );
   }
 

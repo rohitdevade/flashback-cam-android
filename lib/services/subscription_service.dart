@@ -139,6 +139,8 @@ class SubscriptionService {
       final isPro = prefs.getBool('isPro') ?? false;
       final proTier = prefs.getString('proTier');
       final proExpiresAtStr = prefs.getString('proExpiresAt');
+      final trialStartedAtStr = prefs.getString('trialStartedAt');
+      final trialUsed = prefs.getBool('trialUsed') ?? false;
 
       _currentUser = User(
         id: 'default_user',
@@ -148,6 +150,10 @@ class SubscriptionService {
             proExpiresAtStr != null ? DateTime.parse(proExpiresAtStr) : null,
         createdAt: DateTime.now(),
         updatedAt: DateTime.now(),
+        trialStartedAt: trialStartedAtStr != null
+            ? DateTime.parse(trialStartedAtStr)
+            : null,
+        trialUsed: trialUsed,
       );
     } catch (e) {
       debugPrint('Failed to load user: $e');
@@ -175,6 +181,14 @@ class SubscriptionService {
       } else {
         await prefs.remove('proExpiresAt');
       }
+      // Save trial fields
+      if (user.trialStartedAt != null) {
+        await prefs.setString(
+            'trialStartedAt', user.trialStartedAt!.toIso8601String());
+      } else {
+        await prefs.remove('trialStartedAt');
+      }
+      await prefs.setBool('trialUsed', user.trialUsed);
       _currentUser = user;
     } catch (e) {
       debugPrint('Failed to save user: $e');
@@ -303,4 +317,59 @@ class SubscriptionService {
           updatedAt: DateTime.now());
 
   bool get isPro => _currentUser?.isPro ?? false;
+
+  /// Check if user has Pro access (paid or trial)
+  bool get hasProAccess => _currentUser?.hasProAccess ?? false;
+
+  /// Check if user is in an active trial
+  bool get isTrialActive => _currentUser?.isTrialActive ?? false;
+
+  /// Check if user has already used their trial
+  bool get trialUsed => _currentUser?.trialUsed ?? false;
+
+  /// Get remaining trial days
+  int get trialDaysRemaining => _currentUser?.trialDaysRemaining ?? 0;
+
+  /// Start a 7-day free trial for the user
+  /// Returns true if trial was started successfully
+  Future<bool> startFreeTrial() async {
+    if (_currentUser == null) {
+      debugPrint('Cannot start trial: no user loaded');
+      return false;
+    }
+
+    // Check if user already has Pro or has used trial
+    if (_currentUser!.isPro) {
+      debugPrint('Cannot start trial: user already has Pro');
+      return false;
+    }
+
+    if (_currentUser!.trialUsed) {
+      debugPrint('Cannot start trial: trial already used');
+      return false;
+    }
+
+    try {
+      final updatedUser = _currentUser!.copyWith(
+        trialStartedAt: DateTime.now(),
+        trialUsed: true,
+        updatedAt: DateTime.now(),
+      );
+
+      await _saveUser(updatedUser);
+      debugPrint('✅ Free trial started successfully');
+      return true;
+    } catch (e) {
+      debugPrint('Failed to start trial: $e');
+      return false;
+    }
+  }
+
+  /// Check if user can start a free trial
+  bool get canStartTrial {
+    if (_currentUser == null) return false;
+    if (_currentUser!.isPro) return false;
+    if (_currentUser!.trialUsed) return false;
+    return true;
+  }
 }

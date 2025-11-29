@@ -259,25 +259,47 @@ class _SettingsScreenState extends State<SettingsScreen>
 
   Widget _buildProSection(BuildContext context, AppState appState, bool isPro) {
     final proTier = appState.subscriptionService.currentUser.proTier;
-    String planName = 'Free Plan';
-    bool canUpgradeToLifetime = false;
+    final isTrialActive = appState.isTrialActive;
+    final trialDaysRemaining = appState.trialDaysRemaining;
+    final isPaidPro =
+        appState.subscriptionService.isPro; // Paid Pro only (not trial)
+    final monthlyPrice =
+        appState.subscriptionService.getProductDetails('monthly')?.price ??
+            '\$9.99';
 
-    if (isPro && proTier != null) {
+    String planName = 'Free Plan';
+    String planSubtitle = 'Limited to 1080p 30fps • 10s buffer • Ads';
+    bool canUpgradeToLifetime = false;
+    bool showUpgradeButton = true;
+    bool isProOrTrial = isPro || isTrialActive;
+
+    if (isTrialActive) {
+      planName = 'Trial Plan';
+      planSubtitle = trialDaysRemaining == 1
+          ? '1 day left • Then $monthlyPrice/month'
+          : '$trialDaysRemaining days left • Then $monthlyPrice/month';
+      showUpgradeButton = true; // Show upgrade button during trial
+    } else if (isPaidPro && proTier != null) {
+      showUpgradeButton = false;
       final tierLower = proTier.toLowerCase();
       switch (tierLower) {
         case 'monthly':
           planName = 'Monthly Plan';
+          planSubtitle = 'All features unlocked • No ads';
           canUpgradeToLifetime = true;
           break;
         case 'yearly':
           planName = 'Yearly Plan';
+          planSubtitle = 'All features unlocked • No ads';
           canUpgradeToLifetime = true;
           break;
         case 'lifetime':
           planName = 'Lifetime Plan';
+          planSubtitle = 'All features unlocked • No ads';
           break;
         default:
           planName = 'Pro Active';
+          planSubtitle = 'All features unlocked • No ads';
       }
     }
 
@@ -296,25 +318,31 @@ class _SettingsScreenState extends State<SettingsScreen>
                   height: 60,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    gradient: isPro
-                        ? const LinearGradient(
-                            colors: [
-                              AppColors.electricBlue,
-                              AppColors.neonCyan
-                            ],
+                    gradient: isProOrTrial
+                        ? LinearGradient(
+                            colors: isTrialActive
+                                ? [AppColors.neonGreen, AppColors.electricBlue]
+                                : [AppColors.electricBlue, AppColors.neonCyan],
                             begin: Alignment.topLeft,
                             end: Alignment.bottomRight,
                           )
                         : null,
-                    color: isPro ? null : AppColors.glassLight,
+                    color: isProOrTrial ? null : AppColors.glassLight,
                     border: Border.all(
-                      color: isPro ? AppColors.proGold : AppColors.glassBorder,
+                      color: isTrialActive
+                          ? AppColors.neonGreen
+                          : (isPro ? AppColors.proGold : AppColors.glassBorder),
                       width: 2,
                     ),
                   ),
                   child: Icon(
-                    isPro ? Icons.workspace_premium : Icons.lock_outline,
-                    color: isPro ? Colors.white : AppColors.textSecondary,
+                    isTrialActive
+                        ? Icons.timer
+                        : (isPro
+                            ? Icons.workspace_premium
+                            : Icons.lock_outline),
+                    color:
+                        isProOrTrial ? Colors.white : AppColors.textSecondary,
                     size: 28,
                   ),
                 ),
@@ -323,21 +351,50 @@ class _SettingsScreenState extends State<SettingsScreen>
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
-                        planName,
-                        style:
-                            Theme.of(context).textTheme.headlineSmall?.copyWith(
+                      Row(
+                        children: [
+                          Text(
+                            planName,
+                            style: Theme.of(context)
+                                .textTheme
+                                .headlineSmall
+                                ?.copyWith(
                                   color: AppColors.textPrimary,
                                   fontWeight: FontWeight.w700,
                                 ),
+                          ),
+                          if (isTrialActive) ...[
+                            const SizedBox(width: 8),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 8, vertical: 2),
+                              decoration: BoxDecoration(
+                                color:
+                                    AppColors.neonGreen.withValues(alpha: 0.2),
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                              child: Text(
+                                'ACTIVE',
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .labelSmall
+                                    ?.copyWith(
+                                      color: AppColors.neonGreen,
+                                      fontWeight: FontWeight.w800,
+                                      fontSize: 10,
+                                    ),
+                              ),
+                            ),
+                          ],
+                        ],
                       ),
                       const SizedBox(height: 4),
                       Text(
-                        isPro
-                            ? 'All features unlocked • No ads'
-                            : 'Limited to 1080p 30fps • 10s buffer • Ads',
+                        planSubtitle,
                         style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                              color: AppColors.textSecondary,
+                              color: isTrialActive
+                                  ? AppColors.neonGreen
+                                  : AppColors.textSecondary,
                             ),
                       ),
                     ],
@@ -345,7 +402,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                 ),
               ],
             ),
-            if (!isPro) ...[
+            if (showUpgradeButton && !isPaidPro) ...[
               const SizedBox(height: 24),
               Container(
                 width: double.infinity,
@@ -368,7 +425,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                       const Icon(Icons.flash_on, size: 20),
                       const SizedBox(width: 8),
                       Text(
-                        'Upgrade to Pro',
+                        isTrialActive ? 'Keep Pro Forever' : 'Upgrade to Pro',
                         style: Theme.of(context).textTheme.labelLarge?.copyWith(
                               color: AppColors.deepCharcoal,
                               fontWeight: FontWeight.w700,
@@ -378,7 +435,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                   ),
                 ),
               ),
-            ] else ...[
+            ] else if (isPaidPro) ...[
               const SizedBox(height: 16),
               Row(
                 mainAxisAlignment: MainAxisAlignment.center,
@@ -1126,66 +1183,161 @@ class _SettingsScreenState extends State<SettingsScreen>
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    _buildPolicyHeader('PRIVACY POLICY — Flashback Cam'),
-                    const SizedBox(height: 8),
-                    _buildPolicyText('Last Updated: 2025/28/11'),
+                    _buildPolicyHeader('Rochenterprises.in'),
+                    const SizedBox(height: 4),
+                    _buildPolicyHeader('Privacy Policy'),
+                    const SizedBox(height: 16),
+                    _buildPolicyText('Effective Date: 2025/29/11'),
                     _buildPolicyText('Developer: Roch Enterprises'),
+                    _buildPolicyText('Email: support@rochenterprises.in'),
                     _buildPolicyText('App Name: Flashback Cam'),
+                    const SizedBox(height: 20),
                     _buildPolicyText(
-                        'Contact Email: contact@rochenterprises.in'),
+                        'Roch Enterprises ("we", "our", "us") respects your privacy. This Privacy Policy explains how Flashback Cam collects, uses, and protects information across all countries, including compliance with GDPR, CCPA/CPRA, COPPA, and Google Play policies.'),
+                    const SizedBox(height: 12),
+                    _buildPolicyText(
+                        'Flashback Cam is a camera app that allows users to record video and save past moments using a buffer system. All media processing happens on your device only.'),
                     const SizedBox(height: 24),
-                    _buildPolicySection('1. Introduction'),
+
+                    // Section 1
+                    _buildPolicySection('1. WHAT INFORMATION WE COLLECT'),
                     _buildPolicyText(
-                        'Flashback Cam ("we", "our", "us") is a video recording application developed by Roch Enterprises. This Privacy Policy explains what information we collect, how we use it, how it is protected, and your rights as a user.\n\nBy using Flashback Cam, you agree to the practices described in this Privacy Policy.'),
-                    const SizedBox(height: 20),
-                    _buildPolicySection('2. Information We Collect'),
-                    _buildPolicySubsection('2.1 Camera & Microphone'),
-                    _buildPolicyText(
-                        'The app requires access to:\n• Your device camera to capture video\n• Your microphone to record audio\n\nWe do not collect, store, or upload any photos or videos to our servers. All recordings stay on your device only.'),
+                        'Flashback Cam collects the minimum data required to operate.'),
                     const SizedBox(height: 12),
-                    _buildPolicySubsection('2.2 Device Information'),
+                    _buildPolicySubsection('A. Information You Provide'),
                     _buildPolicyText(
-                        'We may collect non-personal, technical information such as:\n• Device model\n• Operating system version\n• App version\n• Crash logs\n• Performance analytics\n\nThis data is used solely to improve app stability and performance.'),
+                        'We do not collect personal data such as:\n• Photos\n• Videos\n• Audio\n• Contacts\n• Messages\n• Files\n\nAll captured media remains on your device, never uploaded to our servers.'),
                     const SizedBox(height: 12),
-                    _buildPolicySubsection('2.3 Usage Data'),
+                    _buildPolicySubsection(
+                        'B. Information Collected Automatically'),
                     _buildPolicyText(
-                        'We may collect anonymous usage data, including:\n• Feature usage (buffer time, recording duration, etc.)\n• App interactions\n• Subscription activity (Pro/Free status)\n\nThis data is anonymous and cannot identify you.'),
+                        'Through third-party SDKs (AdMob, Google Play Services, Billing):\n• Device model & OS version\n• App usage statistics\n• Crash logs & diagnostics\n• Approximate region (not precise location)\n• Advertising ID (resettable)\n• Purchase tokens (for verifying subscriptions)'),
                     const SizedBox(height: 12),
-                    _buildPolicySubsection('2.4 Ads Data (AdMob)'),
+                    _buildPolicySubsection('C. We DO NOT collect:'),
                     _buildPolicyText(
-                        'Flashback Cam uses Google AdMob, which may collect:\n• Advertising ID\n• Approximate location\n• Device information\n• App interactions\n• Analytics for ad performance\n\nAdMob operates under Google\'s Privacy Policy:\nhttps://policies.google.com/privacy'),
+                        '• Facial recognition data\n• Biometric data\n• Precise GPS location\n• Health information\n• Payment card numbers\n• User-generated media content'),
                     const SizedBox(height: 20),
-                    _buildPolicySection('3. How We Use Your Information'),
+
+                    // Section 2
+                    _buildPolicySection('2. CAMERA & MICROPHONE TRANSPARENCY'),
                     _buildPolicyText(
-                        'We use collected data to:\n• Provide camera and recording functionality\n• Process videos locally on your device\n• Improve app performance\n• Fix crashes and bugs\n• Show personalized or non-personalized ads (AdMob)\n• Manage subscription status\n\nWe do not sell or trade your personal data.'),
+                        'Flashback Cam requires:\n\n📷 Camera Permission – To show live preview and record video.\n\n🎤 Microphone Permission – To record audio along with video.\n\n💾 Storage Access – To save videos on your device.'),
+                    const SizedBox(height: 12),
+                    _buildPolicyText(
+                        'Flashback Cam does NOT:\n• Record automatically\n• Record in background\n• Record when screen is off\n• Upload camera feed to servers\n• Transmit any media or audio off-device'),
                     const SizedBox(height: 20),
-                    _buildPolicySection('4. Data Storage & Security'),
+
+                    // Section 3
+                    _buildPolicySection('3. BUFFER RECORDING TRANSPARENCY'),
                     _buildPolicyText(
-                        '• We do not upload your photos or videos to any server.\n• All recordings remain locally stored on your device.\n• Analytics and crash data are securely processed through Google services.'),
+                        'Flashback Cam includes a rolling video buffer feature.\n\n• The buffer activates only when you tap "Start Buffer."\n• It temporarily stores the last N seconds of video so you can save recent moments.'),
+                    const SizedBox(height: 12),
+                    _buildPolicyText(
+                        'Flashback Cam does NOT:\n• Start buffer automatically\n• Save buffer without user action\n• Store buffer on remote servers\n• Record anything without visible UI\n• Record secretly or silently'),
+                    const SizedBox(height: 12),
+                    _buildPolicyText(
+                        'All buffer data:\n• Is stored temporarily\n• Exists inside your device memory or local storage\n• Is deleted automatically when overwritten\n• Never leaves your device'),
                     const SizedBox(height: 20),
-                    _buildPolicySection('5. Data Sharing'),
+
+                    // Section 4
+                    _buildPolicySection('4. HOW WE USE YOUR INFORMATION'),
                     _buildPolicyText(
-                        'We do not share your data with third parties, except:\n• Google AdMob (for ads)\n• Google Play Billing (for purchases)\n• Firebase/Google (for crash logs & analytics, if enabled)\n\nWe never sell your information.'),
+                        'We use collected data for:\n• App functionality\n• Subscription validation\n• Crash and performance analytics\n• Showing ads (if user consents)\n• Security and fraud prevention\n• Improving app performance\n\nWe do not sell or rent personal data.'),
                     const SizedBox(height: 20),
-                    _buildPolicySection('6. Children\'s Privacy'),
+
+                    // Section 5
+                    _buildPolicySection(
+                        '5. DATA SHARING & THIRD-PARTY SERVICES'),
                     _buildPolicyText(
-                        'Flashback Cam is not intended for children under 13. We do not knowingly collect personal data from minors.'),
+                        'Flashback Cam uses the following services:'),
+                    const SizedBox(height: 12),
+                    _buildPolicySubsection('Google AdMob'),
+                    _buildPolicyText(
+                        'Used for displaying ads. May collect:\n• Advertising ID\n• Device identifiers\n• Ad interaction data'),
+                    const SizedBox(height: 12),
+                    _buildPolicySubsection('Google Play Billing'),
+                    _buildPolicyText('Used for subscriptions and purchases.'),
+                    const SizedBox(height: 12),
+                    _buildPolicySubsection('Google Play Services / Firebase'),
+                    _buildPolicyText(
+                        'Used for:\n• Crash logs\n• Analytics\n• Diagnostics\n\nThese providers process data according to their own privacy policies.'),
+                    const SizedBox(height: 12),
+                    _buildPolicyText(
+                        'We never share:\n• Photos\n• Videos\n• Audio\n• Buffer recordings\n• Personal files'),
                     const SizedBox(height: 20),
-                    _buildPolicySection('7. Permissions Explained'),
+
+                    // Section 6
+                    _buildPolicySection('6. INTERNATIONAL DATA COMPLIANCE'),
                     _buildPolicyText(
-                        'Flashback Cam requests the following permissions:\n\n📷 Camera\nTo show camera preview and record videos.\n\n🎤 Microphone\nTo record audio for your videos.\n\n💾 Storage / Media Access\nTo save videos and show them in the gallery.\n\n🌐 Internet\nUsed only for:\n• Loading ads\n• Verifying subscriptions\n• Crash analytics\n\nFlashback Cam never records secretly and stops recording when the device is locked.'),
+                        'Flashback Cam complies with data regulations in:'),
+                    const SizedBox(height: 12),
+                    _buildPolicySubsection('GDPR (EU)'),
+                    _buildPolicyText(
+                        'EU users have:\n• Right to access\n• Right to deletion\n• Right to restrict processing\n• Right to withdraw consent\n• Right to data portability\n\nTo exercise rights, contact: support@rochenterprises.in'),
+                    const SizedBox(height: 12),
+                    _buildPolicySubsection('CCPA / CPRA (California)'),
+                    _buildPolicyText(
+                        'California users have:\n• Right to know what data is collected\n• Right to deletion of data collected\n• Right to opt-out of data selling (we do not sell data)\n• Right to non-discrimination\n\nTo exercise rights, contact: support@rochenterprises.in'),
+                    const SizedBox(height: 12),
+                    _buildPolicySubsection('COPPA'),
+                    _buildPolicyText(
+                        'Flashback Cam is not directed to children under 13 and does not knowingly collect personal data from children.'),
                     const SizedBox(height: 20),
-                    _buildPolicySection('8. Subscription & Purchases'),
+
+                    // Section 7
+                    _buildPolicySection('7. CONSENT MANAGEMENT (EU UMP)'),
                     _buildPolicyText(
-                        'Flashback Cam offers optional Pro subscriptions. All payments are processed securely by Google Play Billing.\n\nWe do not store your payment details.'),
+                        'Flashback Cam may use Google\'s UMP (User Messaging Platform) for consent in applicable regions.\n\nEU/EEA users may see a consent dialog asking:\n• To allow personalized ads\n• To allow non-personalized ads\n• Or to manage preferences later\n\nAds will not load where required until consent is obtained or a legitimate basis is established.'),
                     const SizedBox(height: 20),
-                    _buildPolicySection('9. Changes to This Policy'),
+
+                    // Section 8
+                    _buildPolicySection('8. DATA SECURITY'),
                     _buildPolicyText(
-                        'We may update this Privacy Policy occasionally. If changes are significant, we will notify you within the app.'),
+                        'We protect data through:\n• Device-level OS encryption\n• No media uploads to our servers\n• Secure communication channels (HTTPS) with Google services\n• Relying on trusted billing and ad providers (Google)\n\nHowever, no system is 100% secure. By using the app, you accept the inherent risks of online services and mobile platforms.'),
                     const SizedBox(height: 20),
-                    _buildPolicySection('10. Contact Us'),
+
+                    // Section 9
+                    _buildPolicySection('9. DATA RETENTION'),
                     _buildPolicyText(
-                        'For questions or concerns:\n\n📧 Email: contact@rochenterprises.in\n🏢 Developer: Roch Enterprises'),
+                        '• Video recordings: Stored only on your device, until you delete them.\n• Buffer files: Temporary and auto-deleted when overwritten or when you stop buffering.\n• Crash/analytics data: Retained per Google\'s retention policies.\n• Subscription data: Retained by Google Play for billing and legal compliance.\n\nWe do not store media content on our own servers.'),
+                    const SizedBox(height: 20),
+
+                    // Section 10
+                    _buildPolicySection(
+                        '10. NO DARK PATTERNS (EU DSA COMPLIANT)'),
+                    _buildPolicyText(
+                        'Flashback Cam complies with the EU Digital Services Act principles regarding fair design.\n\nWe do not:\n• Hide cancel buttons\n• Force you into subscriptions\n• Use fake countdown timers\n• Use misleading labels on buttons\n• Make it difficult to cancel or refuse paid features\n\nSubscription prices, terms, and renewal conditions are always clearly displayed.'),
+                    const SizedBox(height: 20),
+
+                    // Section 11
+                    _buildPolicySection(
+                        '11. SUBSCRIPTIONS & BILLING DISCLOSURE'),
+                    _buildPolicyText(
+                        '• Subscriptions renew automatically unless cancelled in time.\n• Free trials, if available, convert automatically to paid subscriptions at the end of the trial period unless cancelled.\n• Cancellation is managed via Google Play → Payments & Subscriptions → Subscriptions.\n• We do not process or store payment card details; all payments are handled by Google Play.'),
+                    const SizedBox(height: 20),
+
+                    // Section 12
+                    _buildPolicySection('12. USER CONTROLS & YOUR RIGHTS'),
+                    _buildPolicyText(
+                        'You can:\n• Withdraw ad consent (where applicable) via consent dialog or device settings.\n• Reset your Advertising ID via system settings.\n• Delete videos and recordings directly from your device.\n• Uninstall the app to stop data collection and use.\n• Request information about or deletion of non-media data (such as logs) that might be associated with your usage, subject to technical feasibility and legal requirements.\n\nTo submit a request or question, contact: support@rochenterprises.in'),
+                    const SizedBox(height: 20),
+
+                    // Section 13
+                    _buildPolicySection('13. CHILDREN\'S PRIVACY'),
+                    _buildPolicyText(
+                        'Flashback Cam is not designed for children under the age of 13.\n\nWe do not knowingly collect personal data from children. If you believe a child has provided us with information, please contact us at support@rochenterprises.in and we will take appropriate action.'),
+                    const SizedBox(height: 20),
+
+                    // Section 14
+                    _buildPolicySection('14. CONTACT INFORMATION'),
+                    _buildPolicyText(
+                        'For privacy questions, legal requests, or support:\n\nRoch Enterprises\n📧 Email: support@rochenterprises.in'),
+                    const SizedBox(height: 20),
+
+                    // Section 15
+                    _buildPolicySection('15. CHANGES TO THIS PRIVACY POLICY'),
+                    _buildPolicyText(
+                        'We may update this Privacy Policy from time to time.\n\nAny changes will be posted at:\nhttps://sites.google.com/rochenterprises.in/privacy-policy\n\nThe "Effective Date" at the top will be updated.\n\nContinued use of Flashback Cam after changes are posted means you accept the updated policy.'),
                     const SizedBox(height: 40),
                   ],
                 ),
@@ -1257,52 +1409,77 @@ class _SettingsScreenState extends State<SettingsScreen>
                   children: [
                     _buildPolicyHeader('TERMS OF SERVICE — Flashback Cam'),
                     const SizedBox(height: 8),
-                    _buildPolicyText('Last Updated: 2025/28/11'),
-                    _buildPolicyText('Developer: Roch Enterprises'),
+                    _buildPolicyText('Effective Date: 2025/28/11'),
+                    _buildPolicyText('Company: Roch Enterprises'),
+                    _buildPolicyText('Email: support@rochenterprises.in'),
                     const SizedBox(height: 24),
-                    _buildPolicySection('1. Acceptance of Terms'),
+                    _buildPolicySection('1. ABOUT THE APP'),
                     _buildPolicyText(
-                        'By downloading or using Flashback Cam, you agree to these Terms of Service.\nIf you do not agree, please uninstall the app immediately.'),
+                        'Flashback Cam ("App") is a video recording application that allows users to:\n\n• Record videos\n• Use buffer recording to save past moments\n• Save media locally\n• Access advanced features via subscription\n\nFlashback Cam does not upload media to servers.'),
                     const SizedBox(height: 20),
-                    _buildPolicySection('2. Use of the App'),
+                    _buildPolicySection('2. ELIGIBILITY (UPDATED TO 18+)'),
                     _buildPolicyText(
-                        'You agree to:\n• Use the app only for lawful purposes\n• Not attempt to reverse engineer or modify the app\n• Not record individuals without consent (where required by law)\n• Not exploit any loopholes or misuse app features'),
+                        'You must be:\n\n✔ 18 years of age or older\n\nto download or use Flashback Cam.\n\nBy installing the App, you confirm that:\n• You are at least 18 years old\n• You have the legal capacity to enter agreements\n• You agree to follow all local laws related to recording\n\nFlashback Cam is not intended for minors under any circumstances.'),
                     const SizedBox(height: 20),
-                    _buildPolicySection('3. User Content'),
+                    _buildPolicySection('3. LICENSE TO USE THE APP'),
                     _buildPolicyText(
-                        'All videos you record using Flashback Cam:\n• Remain your property\n• Are stored only on your device\n• Are not uploaded or transmitted by us\n\nWe are not responsible for loss of user data.'),
+                        'We grant you a limited, non-exclusive license to use the App for personal use.\n\nYou may not:\n• Reverse engineer the app\n• Use it for unlawful surveillance\n• Modify the App or its code\n• Bypass subscription features'),
                     const SizedBox(height: 20),
-                    _buildPolicySection('4. Pro Subscription'),
+                    _buildPolicySection('4. USER-GENERATED CONTENT'),
                     _buildPolicyText(
-                        'Flashback Cam offers optional Pro features:\n• Higher resolutions (up to device capability)\n• No ads\n• Extended buffer\n• Faster processing\n• Lifetime unlock'),
-                    const SizedBox(height: 12),
-                    _buildPolicySubsection('Billing & Refunds'),
-                    _buildPolicyText(
-                        '• Payments are processed by Google Play\n• We do not manage refunds directly\n• Users may request refunds through Google Play support\n• Subscription auto-renews unless canceled'),
+                        'All videos you create:\n• Belong to you\n• Remain only on your device\n• Are not collected by us\n\nYou are responsible for complying with local recording laws.'),
                     const SizedBox(height: 20),
-                    _buildPolicySection('5. App Updates'),
+                    _buildPolicySection('5. BUFFER RECORDING DISCLOSURE'),
                     _buildPolicyText(
-                        'We may update or modify features at any time.\nUpdates may:\n• Add features\n• Improve performance\n• Fix issues\n• Remove deprecated or unsafe functions\n\nYou agree to use the most current version of the app.'),
+                        'Flashback Cam\'s buffer system:\n• Activates only when you tap "Start Buffer"\n• Stores temporary video locally\n• Never records secretly or in background\n• Is automatically overwritten\n\nWe never access buffer content.'),
                     const SizedBox(height: 20),
-                    _buildPolicySection('6. Device Compatibility'),
+                    _buildPolicySection('6. SUBSCRIPTIONS & BILLING'),
                     _buildPolicyText(
-                        'Flashback Cam supports devices based on:\n• Hardware capability\n• Camera support\n• Operating system version\n• Google Play policies\n\nSome features (like 1080p/4K/60fps) depend on device hardware.'),
+                        'Covers:\n• Monthly / Yearly / Lifetime plans\n• Free trials (e.g., 7 days)\n• Auto-renewal\n• Cancellation through Google Play\n• Refunds handled by Google Play'),
                     const SizedBox(height: 20),
-                    _buildPolicySection('7. Limitation of Liability'),
+                    _buildPolicySection('7. ADVERTISEMENTS'),
                     _buildPolicyText(
-                        'Roch Enterprises is not liable for:\n• Data loss\n• Device issues caused by hardware limitations\n• Improper usage\n• Recording done without consent\n• Any damage resulting from misuse\n\nUse the app at your own risk.'),
+                        '• Free version displays ads\n• Ads delivered via Google AdMob\n• EU users receive GDPR consent dialog\n• Ads removed with Pro subscription'),
                     const SizedBox(height: 20),
-                    _buildPolicySection('8. Prohibited Activities'),
+                    _buildPolicySection('8. PERMISSIONS'),
                     _buildPolicyText(
-                        'You must not:\n• Use the app for unlawful surveillance\n• Circumvent subscription or licensing checks\n• Modify or redistribute the app illegally\n• Misuse buffer or background behavior to violate others\' privacy\n\nDoing so may result in termination of your rights to use the app.'),
+                        'App needs:\n• Camera\n• Microphone\n• Storage access\n\nNothing is recorded automatically or uploaded.'),
                     const SizedBox(height: 20),
-                    _buildPolicySection('9. Termination'),
+                    _buildPolicySection('9. PROHIBITED USES'),
                     _buildPolicyText(
-                        'We may suspend access if you:\n• Abuse the app\n• Attempt fraud\n• Tamper with subscriptions\n• Violate laws'),
+                        'You agree not to:\n• Record illegally or without consent\n• Violate privacy laws\n• Disassemble or hack the App\n• Remove copyright notices\n• Misuse Pro features'),
                     const SizedBox(height: 20),
-                    _buildPolicySection('10. Contact Information'),
+                    _buildPolicySection('10. DISCLAIMERS'),
                     _buildPolicyText(
-                        'For legal or support queries:\n\n📧 Email: contact@rochenterprises.in\n🏢 Developer: Roch Enterprises'),
+                        'The App is provided "AS IS."\n\nWe do not guarantee:\n• Error-free operation\n• Compatibility with all devices\n• Continuous buffer reliability\n• Zero data loss'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('11. LIMITATION OF LIABILITY'),
+                    _buildPolicyText(
+                        'Roch Enterprises is not liable for:\n• Lost videos\n• Illegal use of the app\n• Device or data damage\n• Indirect damages\n\nYour sole remedy is uninstalling the App.'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('12. INTELLECTUAL PROPERTY'),
+                    _buildPolicyText(
+                        'All app content and design belong to Roch Enterprises.'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('13. TERMINATION'),
+                    _buildPolicyText(
+                        'We may suspend or terminate usage for violation of these Terms.\n\nYou may stop using the App at any time by uninstalling it.'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('14. PRIVACY POLICY'),
+                    _buildPolicyText(
+                        'The Privacy Policy governs how data is handled:\n\n👉 https://rochenterprises.in/flashbackcam/privacy'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('15. GOVERNING LAW'),
+                    _buildPolicyText(
+                        'These Terms are governed by:\n• Your country\'s consumer protection laws\n• Indian law (company jurisdiction)\n\nEU users maintain their EU consumer rights.'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('16. CHANGES TO TERMS'),
+                    _buildPolicyText(
+                        'We may update these Terms; continued use signifies acceptance.'),
+                    const SizedBox(height: 20),
+                    _buildPolicySection('17. CONTACT US'),
+                    _buildPolicyText(
+                        'Roch Enterprises\n📧 support@rochenterprises.in'),
                     const SizedBox(height: 40),
                   ],
                 ),

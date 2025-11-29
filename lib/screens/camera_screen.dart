@@ -10,6 +10,7 @@ import 'package:flashback_cam/widgets/record_button.dart';
 import 'package:flashback_cam/widgets/video_thumbnail.dart';
 import 'package:flashback_cam/widgets/debug_info_panel.dart';
 import 'package:flashback_cam/widgets/camera_instructions_overlay.dart';
+import 'package:flashback_cam/widgets/free_trial_dialog.dart';
 import 'package:flashback_cam/screens/gallery_screen.dart';
 import 'package:flashback_cam/screens/settings_screen.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -26,7 +27,9 @@ class _CameraScreenState extends State<CameraScreen> {
   Map<String, bool> _capabilities = {};
   bool _capabilitiesLoaded = false;
   bool _showInstructions = false;
+  bool _showTrialPopup = false;
   bool _instructionsChecked = false;
+  bool _trialPopupChecked = false;
   bool _lowMemoryWarningShown = false;
 
   @override
@@ -47,6 +50,23 @@ class _CameraScreenState extends State<CameraScreen> {
 
     // Check for low memory warning (less than 4GB = 4096MB)
     _checkLowMemoryWarning(appState);
+  }
+
+  /// Check if we should show trial popup (after instructions are dismissed)
+  void _checkShowTrialPopup(AppState appState) {
+    if (_trialPopupChecked) return;
+    if (!appState.isInitialized) return;
+    if (_showInstructions) return; // Wait for instructions to be dismissed
+
+    _trialPopupChecked = true;
+    if (appState.shouldShowTrialPopup) {
+      // Show trial popup after a short delay
+      Future.delayed(const Duration(milliseconds: 800), () {
+        if (mounted && !_showInstructions) {
+          setState(() => _showTrialPopup = true);
+        }
+      });
+    }
   }
 
   void _checkLowMemoryWarning(AppState appState) {
@@ -231,6 +251,11 @@ class _CameraScreenState extends State<CameraScreen> {
     // Check if we should show instructions (after AppState is initialized)
     _checkShowInstructions(appState);
 
+    // Check for trial popup if instructions were already seen
+    if (!_showInstructions && appState.hasSeenCameraInstructions) {
+      _checkShowTrialPopup(appState);
+    }
+
     // Check for and display any recording errors
     _checkRecordingErrors(appState);
 
@@ -301,6 +326,20 @@ class _CameraScreenState extends State<CameraScreen> {
                   onDismiss: () {
                     setState(() => _showInstructions = false);
                     appState.markCameraInstructionsSeen();
+                    // Check for trial popup after instructions are dismissed
+                    _checkShowTrialPopup(appState);
+                  },
+                ),
+              // Free trial popup (shown on every app launch for free users)
+              if (_showTrialPopup)
+                FreeTrialDialog(
+                  onDismiss: () {
+                    setState(() => _showTrialPopup = false);
+                    // Don't persist - will show again on next app launch
+                  },
+                  onTrialStarted: () {
+                    // Trial started - popup won't show anymore (user has trial)
+                    setState(() => _showTrialPopup = false);
                   },
                 ),
             ],

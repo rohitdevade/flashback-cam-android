@@ -7,6 +7,7 @@ class AppSettings {
   final bool stabilization;
   final bool showGrid;
   final bool hasSeenCameraInstructions;
+  final bool hasSeenTrialPopup;
   final DateTime updatedAt;
 
   AppSettings({
@@ -18,6 +19,7 @@ class AppSettings {
     required this.stabilization,
     required this.showGrid,
     required this.hasSeenCameraInstructions,
+    required this.hasSeenTrialPopup,
     required this.updatedAt,
   });
 
@@ -29,6 +31,7 @@ class AppSettings {
         stabilization: true,
         showGrid: false,
         hasSeenCameraInstructions: false,
+        hasSeenTrialPopup: false,
         updatedAt: DateTime.now(),
       );
 
@@ -41,6 +44,7 @@ class AppSettings {
         showGrid: json['showGrid'] as bool? ?? false,
         hasSeenCameraInstructions:
             json['hasSeenCameraInstructions'] as bool? ?? false,
+        hasSeenTrialPopup: json['hasSeenTrialPopup'] as bool? ?? false,
         updatedAt: json['updatedAt'] != null
             ? DateTime.parse(json['updatedAt'] as String)
             : DateTime.now(),
@@ -54,6 +58,7 @@ class AppSettings {
         'stabilization': stabilization,
         'showGrid': showGrid,
         'hasSeenCameraInstructions': hasSeenCameraInstructions,
+        'hasSeenTrialPopup': hasSeenTrialPopup,
         'updatedAt': updatedAt.toIso8601String(),
       };
 
@@ -65,6 +70,7 @@ class AppSettings {
     bool? stabilization,
     bool? showGrid,
     bool? hasSeenCameraInstructions,
+    bool? hasSeenTrialPopup,
     DateTime? updatedAt,
   }) =>
       AppSettings(
@@ -76,6 +82,7 @@ class AppSettings {
         showGrid: showGrid ?? this.showGrid,
         hasSeenCameraInstructions:
             hasSeenCameraInstructions ?? this.hasSeenCameraInstructions,
+        hasSeenTrialPopup: hasSeenTrialPopup ?? this.hasSeenTrialPopup,
         updatedAt: updatedAt ?? this.updatedAt,
       );
 }
