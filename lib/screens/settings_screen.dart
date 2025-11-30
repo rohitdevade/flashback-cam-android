@@ -942,17 +942,15 @@ class _SettingsScreenState extends State<SettingsScreen>
       return;
     }
 
-    // Build available resolutions based on capabilities
-    final options = <String>['1080P'];
-    if (_capabilities['supports4K'] == true) {
-      options.add('4K');
-    }
+    // Show all resolutions, mark unsupported ones
+    final options = <String>['1080P', '4K'];
+    final supports4K = _capabilities['supports4K'] == true;
 
     final normalized = settings.resolution.toUpperCase();
     final currentIndex = options.indexOf(normalized);
     final initialIndex = currentIndex >= 0 ? currentIndex : 0;
 
-    _showPicker(
+    _showPickerWithSupport(
       context,
       'Resolution',
       options,
@@ -965,6 +963,9 @@ class _SettingsScreenState extends State<SettingsScreen>
         }
         appState.updateSettings(settings.copyWith(resolution: resolution));
       },
+      supportedIndices: supports4K ? [0, 1] : [0],
+      unsupportedMessage:
+          '4K recording is not supported by your device camera.',
     );
   }
 
@@ -977,7 +978,7 @@ class _SettingsScreenState extends State<SettingsScreen>
       return;
     }
 
-    // Determine available FPS based on resolution and capabilities
+    // Show all FPS options, mark unsupported ones
     final currentResolution = settings.resolution.toUpperCase();
     bool supports60fps = false;
 
@@ -987,26 +988,27 @@ class _SettingsScreenState extends State<SettingsScreen>
       supports60fps = _capabilities['supports4K60fps'] == true;
     }
 
-    final options = <int>[30];
-    if (supports60fps) {
-      options.add(60);
-    }
+    final options = <String>['30 fps', '60 fps'];
+    final fpsValues = <int>[30, 60];
 
-    final currentIndex = options.indexOf(settings.fps);
+    final currentIndex = fpsValues.indexOf(settings.fps);
 
-    _showPicker(
+    _showPickerWithSupport(
       context,
       'Frame Rate',
-      options.map((e) => '$e fps').toList(),
+      options,
       currentIndex,
       (index) {
-        final fps = options[index];
+        final fps = fpsValues[index];
         if (!isPro && fps == 60) {
           _showProUpgrade(context);
           return;
         }
         appState.updateSettings(settings.copyWith(fps: fps));
       },
+      supportedIndices: supports60fps ? [0, 1] : [0],
+      unsupportedMessage:
+          '60fps recording at $currentResolution is not supported by your device camera.',
     );
   }
 
@@ -1100,6 +1102,144 @@ class _SettingsScreenState extends State<SettingsScreen>
             const SizedBox(height: 20),
           ],
         ),
+      ),
+    );
+  }
+
+  void _showPickerWithSupport(
+    BuildContext context,
+    String title,
+    List<String> options,
+    int currentIndex,
+    Function(int) onSelect, {
+    required List<int> supportedIndices,
+    String? unsupportedMessage,
+  }) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (context) => Container(
+        decoration: const BoxDecoration(
+          color: AppColors.charcoal,
+          borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // Drag handle
+            Container(
+              margin: const EdgeInsets.only(top: 12),
+              width: 40,
+              height: 4,
+              decoration: BoxDecoration(
+                color: AppColors.textSecondary.withValues(alpha: 0.3),
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+
+            // Header
+            Padding(
+              padding: const EdgeInsets.all(20),
+              child: Text(
+                title,
+                style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                      color: AppColors.textPrimary,
+                      fontWeight: FontWeight.w600,
+                    ),
+              ),
+            ),
+
+            // Options
+            ...options.asMap().entries.map((entry) {
+              final index = entry.key;
+              final option = entry.value;
+              final isSelected = index == currentIndex;
+              final isSupported = supportedIndices.contains(index);
+
+              return Opacity(
+                opacity: isSupported ? 1.0 : 0.4,
+                child: ListTile(
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 20),
+                  leading: !isSupported
+                      ? const Icon(Icons.block,
+                          color: AppColors.textSecondary, size: 20)
+                      : null,
+                  title: Text(
+                    option,
+                    style: TextStyle(
+                      color: isSelected && isSupported
+                          ? AppColors.electricBlue
+                          : (isSupported
+                              ? AppColors.textPrimary
+                              : AppColors.textSecondary),
+                      fontWeight: isSelected && isSupported
+                          ? FontWeight.w600
+                          : FontWeight.w400,
+                    ),
+                  ),
+                  trailing: isSelected && isSupported
+                      ? const Icon(Icons.check, color: AppColors.electricBlue)
+                      : null,
+                  onTap: () {
+                    if (!isSupported) {
+                      Navigator.pop(context);
+                      _showUnsupportedDialog(
+                          context, option, unsupportedMessage);
+                      return;
+                    }
+                    Navigator.pop(context);
+                    onSelect(index);
+                  },
+                ),
+              );
+            }).toList(),
+
+            const SizedBox(height: 20),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showUnsupportedDialog(
+      BuildContext context, String option, String? message) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: AppColors.charcoal,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Row(
+          children: [
+            Icon(Icons.info_outline, color: AppColors.warningOrange, size: 24),
+            const SizedBox(width: 12),
+            Text(
+              'Not Supported',
+              style: TextStyle(
+                color: AppColors.textPrimary,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+        content: Text(
+          message ?? '$option is not supported by your device.',
+          style: TextStyle(
+            color: AppColors.textSecondary,
+            fontSize: 14,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: Text(
+              'OK',
+              style: TextStyle(
+                color: AppColors.electricBlue,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

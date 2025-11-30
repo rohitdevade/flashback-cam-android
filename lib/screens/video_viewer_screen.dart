@@ -101,9 +101,9 @@ class _VideoViewerScreenState extends State<VideoViewerScreen> {
 
       // Step 4: Initialize with timeout
       await controller.initialize().timeout(
-        const Duration(seconds: 10),
+        const Duration(seconds: 30),
         onTimeout: () {
-          throw Exception('Video initialization timed out after 10 seconds');
+          throw Exception('Video initialization timed out after 30 seconds');
         },
       );
 

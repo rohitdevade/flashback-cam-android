@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flashback_cam/models/app_settings.dart';
 import 'package:flashback_cam/models/debug_info.dart';
 import 'package:flashback_cam/models/device_capabilities.dart';
@@ -59,6 +60,70 @@ class AppState extends ChangeNotifier {
   DateTime? _bufferStartTime;
   Timer? _progressTimer;
   int _bufferRemainingSeconds = 0;
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // STORAGE STATE - Track storage mode and errors for UI
+  // ═══════════════════════════════════════════════════════════════════════════════
+  StorageMode _storageMode = StorageMode.normal;
+  String? _storageErrorMessage;
+  bool _isStorageLow = false;
+
+  /// Current storage mode (normal or low)
+  StorageMode get storageMode => _storageMode;
+
+  /// True if storage is low and features are limited
+  bool get isStorageLow => _isStorageLow;
+
+  /// Storage error message, if any (cleared after being read)
+  String? get storageErrorMessage {
+    final msg = _storageErrorMessage;
+    _storageErrorMessage = null;
+    return msg;
+  }
+
+  /// Refresh storage status from native code
+  Future<void> refreshStorageStatus() async {
+    try {
+      final status = await _cameraService.getStorageStatus();
+      final availableMB = status['availableMB'] as int? ?? 0;
+      final lowStorageThresholdMB =
+          status['lowStorageThresholdMB'] as int? ?? 1024;
+      final modeStr = status['mode'] as String? ?? 'NORMAL';
+
+      _storageMode = modeStr == 'LOW' ? StorageMode.low : StorageMode.normal;
+      _isStorageLow = availableMB < lowStorageThresholdMB;
+
+      debugPrint(
+          '📊 Storage status: ${availableMB}MB available, mode: $modeStr, isLow: $_isStorageLow');
+      notifyListeners();
+    } catch (e) {
+      debugPrint('❌ Failed to refresh storage status: $e');
+    }
+  }
+
+  /// Clear storage error state (call after user acknowledges error)
+  void clearStorageError() {
+    _storageErrorMessage = null;
+    notifyListeners();
+  }
+
+  /// Get adjusted settings for current storage conditions
+  Future<Map<String, dynamic>?> getAdjustedSettingsForStorage({
+    required String resolution,
+    required int fps,
+    required int bufferSeconds,
+  }) async {
+    try {
+      return await _cameraService.getAdjustedSettingsForStorage(
+        resolution: resolution,
+        fps: fps,
+        bufferSeconds: bufferSeconds,
+      );
+    } catch (e) {
+      debugPrint('❌ Failed to get adjusted settings: $e');
+      return null;
+    }
+  }
 
   int get selectedBufferSeconds => _settingsService.settings.preRollSeconds;
 
@@ -348,7 +413,27 @@ class AppState extends ChangeNotifier {
           debugPrint('Thermal warning: ${event['message']}');
           break;
         case 'lowStorage':
-          debugPrint('Low storage warning');
+          final availableMB = event['availableMB'] as int? ?? 0;
+          final thresholdMB = event['thresholdMB'] as int? ?? 0;
+          debugPrint(
+              '⚠️ Low storage warning: ${availableMB}MB available (threshold: ${thresholdMB}MB)');
+          _isStorageLow = true;
+          _storageMode = StorageMode.low;
+          _storageErrorMessage = 'Low storage: ${availableMB}MB available';
+          notifyListeners();
+          break;
+        case 'storageFull':
+          final savedPath = event['savedPath'] as String?;
+          final error = event['error'] as String? ?? 'Storage full';
+          debugPrint('🛑 Storage full during recording: $error');
+          if (savedPath != null) {
+            debugPrint('  Recording saved to: $savedPath');
+          }
+          _isStorageLow = true;
+          _storageErrorMessage = error;
+          _cameraMode = CameraMode.buffering;
+          _isPreparingRecording = false;
+          notifyListeners();
           break;
         case 'recovered':
           debugPrint('Recovered video: ${event['video']}');
@@ -429,13 +514,30 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// Check and update storage mode before starting buffer
+  Future<void> _updateStorageMode() async {
+    try {
+      final status = await _cameraService.getStorageStatus();
+      _storageMode =
+          status['storageMode'] == 'low' ? StorageMode.low : StorageMode.normal;
+      _isStorageLow = status['isLowStorage'] as bool? ?? false;
+      debugPrint('Storage status: mode=$_storageMode, isLow=$_isStorageLow');
+    } catch (e) {
+      debugPrint('Failed to update storage mode: $e');
+    }
+  }
+
   Future<void> startBuffer() async {
     if (!_isInitialized || _cameraMode != CameraMode.idle) return;
 
     try {
-      debugPrint('Starting buffer: starting encoders...');
+      debugPrint('Starting buffer: checking storage and starting encoders...');
+
+      // Update storage mode before starting
+      await _updateStorageMode();
 
       // Start buffer (preview already running)
+      // This will throw if there's insufficient storage
       await _cameraService.startBuffer();
 
       // Mark buffer start time
@@ -460,6 +562,21 @@ class AppState extends ChangeNotifier {
       notifyListeners();
 
       debugPrint('✅ Buffer started - encoders active, ready to record');
+    } on PlatformException catch (e) {
+      debugPrint('Failed to start buffer: ${e.code} - ${e.message}');
+
+      // Handle storage-specific errors
+      if (e.code == 'INSUFFICIENT_STORAGE') {
+        _storageErrorMessage = e.message ??
+            'Not enough storage for buffer. Please free up space or reduce quality.';
+        _isStorageLow = true;
+        _storageMode = StorageMode.low;
+      } else {
+        _storageErrorMessage = 'Failed to start buffer: ${e.message}';
+      }
+
+      _cameraMode = CameraMode.idle;
+      notifyListeners();
     } catch (e, stackTrace) {
       debugPrint('Failed to start buffer: $e');
       debugPrint('Stack trace: $stackTrace');
@@ -529,6 +646,26 @@ class AppState extends ChangeNotifier {
 
       await _cameraService.startRecording();
       // State will be updated by recordingStarted event
+    } on PlatformException catch (e) {
+      debugPrint('Failed to start recording: ${e.code} - ${e.message}');
+      _isPreparingRecording = false;
+
+      // Handle storage-specific errors
+      if (e.code == 'INSUFFICIENT_STORAGE') {
+        _lastRecordingError = e.message ??
+            'Not enough storage to safely record. Try reducing resolution, frame rate, or buffer duration.';
+        _storageErrorMessage = _lastRecordingError;
+        _isStorageLow = true;
+        _storageMode = StorageMode.low;
+      } else if (e.code == 'BUFFER_NOT_ACTIVE') {
+        _lastRecordingError =
+            'Start buffer first to enable recording with pre-roll';
+      } else if (e.code == 'EXPORT_IN_PROGRESS') {
+        _lastRecordingError = 'Previous recording is still being saved';
+      } else {
+        _lastRecordingError = e.message ?? 'Failed to start recording';
+      }
+      notifyListeners();
     } catch (e) {
       debugPrint('Failed to start recording: $e');
       _isPreparingRecording = false;
@@ -540,6 +677,11 @@ class AppState extends ChangeNotifier {
             'Start buffer first to enable recording with pre-roll';
       } else if (errorStr.contains('EXPORT_IN_PROGRESS')) {
         _lastRecordingError = 'Previous recording is still being saved';
+      } else if (errorStr.contains('INSUFFICIENT_STORAGE')) {
+        _lastRecordingError =
+            'Not enough storage to safely record. Try reducing resolution, frame rate, or buffer duration.';
+        _storageErrorMessage = _lastRecordingError;
+        _isStorageLow = true;
       } else {
         _lastRecordingError = 'Failed to start recording';
       }

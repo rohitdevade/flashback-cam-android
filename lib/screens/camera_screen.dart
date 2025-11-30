@@ -646,84 +646,94 @@ class TopControls extends StatelessWidget {
   });
 
   @override
-  Widget build(BuildContext context) => Row(
-        children: [
-          GestureDetector(
-            onTap: () => Navigator.push(
-                context, MaterialPageRoute(builder: (_) => SettingsScreen())),
-            onLongPress: onDebugLongPress,
-            child: GlassContainer(
-              padding: EdgeInsets.all(12),
-              child: Icon(Icons.settings, color: Colors.white, size: 24),
+  Widget build(BuildContext context) {
+    // Determine capability states
+    final supports4K = capabilitiesLoaded && capabilities['supports4K'] == true;
+    final supports1080p60fps =
+        capabilitiesLoaded && capabilities['supports1080p60fps'] == true;
+    final supports4K60fps =
+        capabilitiesLoaded && capabilities['supports4K60fps'] == true;
+
+    // Determine if 60fps is supported for current resolution
+    final supports60fps =
+        selectedResolution == '1080P' ? supports1080p60fps : supports4K60fps;
+
+    return Row(
+      children: [
+        GestureDetector(
+          onTap: () => Navigator.push(
+              context, MaterialPageRoute(builder: (_) => SettingsScreen())),
+          onLongPress: onDebugLongPress,
+          child: GlassContainer(
+            padding: EdgeInsets.all(12),
+            child: Icon(Icons.settings, color: Colors.white, size: 24),
+          ),
+        ),
+        SizedBox(width: 12),
+        // Make the chips horizontally scrollable to avoid overflow on small screens
+        Expanded(
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            physics: BouncingScrollPhysics(),
+            child: Row(
+              children: [
+                GlassContainer(
+                  padding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      ModeChip(
+                        label: '1080P',
+                        isSelected: selectedResolution == '1080P',
+                        onTap: () => onResolutionChanged('1080P'),
+                      ),
+                      SizedBox(width: 8),
+                      ModeChip(
+                        label: '4K',
+                        isSelected: selectedResolution == '4K',
+                        onTap: () => onResolutionChanged('4K'),
+                        isLocked: !isPro && supports4K,
+                        isUnsupported: !supports4K,
+                        unsupportedMessage:
+                            '4K recording is not supported by your device camera.',
+                      ),
+                    ],
+                  ),
+                ),
+                SizedBox(width: 12),
+                GlassContainer(
+                  padding:
+                      EdgeInsets.only(left: 12, top: 8, right: 12, bottom: 10),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      ModeChip(
+                        label: '30',
+                        suffix: 'fps',
+                        isSelected: selectedFps == 30,
+                        onTap: () => onFpsChanged(30),
+                      ),
+                      SizedBox(width: 8),
+                      ModeChip(
+                        label: '60',
+                        suffix: 'fps',
+                        isSelected: selectedFps == 60,
+                        onTap: () => onFpsChanged(60),
+                        isLocked: !isPro && supports60fps,
+                        isUnsupported: !supports60fps,
+                        unsupportedMessage:
+                            '60fps recording at ${selectedResolution} is not supported by your device camera.',
+                      ),
+                    ],
+                  ),
+                ),
+              ],
             ),
           ),
-          SizedBox(width: 12),
-          // Make the chips horizontally scrollable to avoid overflow on small screens
-          Expanded(
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              physics: BouncingScrollPhysics(),
-              child: Row(
-                children: [
-                  GlassContainer(
-                    padding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        ModeChip(
-                          label: '1080P',
-                          isSelected: selectedResolution == '1080P',
-                          onTap: () => onResolutionChanged('1080P'),
-                        ),
-                        if (capabilitiesLoaded &&
-                            capabilities['supports4K'] == true) ...[
-                          SizedBox(width: 8),
-                          ModeChip(
-                            label: '4K',
-                            isSelected: selectedResolution == '4K',
-                            onTap: () => onResolutionChanged('4K'),
-                            isLocked: !isPro,
-                          ),
-                        ],
-                      ],
-                    ),
-                  ),
-                  SizedBox(width: 12),
-                  GlassContainer(
-                    padding: EdgeInsets.only(
-                        left: 12, top: 8, right: 12, bottom: 10),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        ModeChip(
-                          label: '30',
-                          isSelected: selectedFps == 30,
-                          onTap: () => onFpsChanged(30),
-                        ),
-                        if (capabilitiesLoaded &&
-                            ((selectedResolution == '1080P' &&
-                                    capabilities['supports1080p60fps'] ==
-                                        true) ||
-                                (selectedResolution == '4K' &&
-                                    capabilities['supports4K60fps'] ==
-                                        true))) ...[
-                          SizedBox(width: 8),
-                          ModeChip(
-                            label: '60',
-                            isSelected: selectedFps == 60,
-                            onTap: () => onFpsChanged(60),
-                            isLocked: !isPro,
-                          ),
-                        ],
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ],
-      );
+        ),
+      ],
+    );
+  }
 }
 
 class BufferIndicator extends StatefulWidget {

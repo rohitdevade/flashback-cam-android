@@ -51,6 +51,350 @@ import java.util.concurrent.TimeUnit
 import kotlin.collections.HashMap
 import kotlin.math.abs
 import kotlin.math.max
+import android.os.StatFs
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STORAGE MANAGEMENT - Low storage handling to prevent crashes and corruption
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Storage mode indicating current storage conditions.
+ * Exposed to Flutter for UI adaptation.
+ */
+enum class StorageMode {
+    NORMAL,     // Sufficient storage - all features available
+    LOW         // Low storage - 4K disabled, buffer duration limited
+}
+
+/**
+ * Result of storage check operations
+ */
+data class StorageCheckResult(
+    val hasEnoughSpace: Boolean,
+    val availableBytes: Long,
+    val requiredBytes: Long,
+    val storageMode: StorageMode,
+    val message: String? = null
+)
+
+/**
+ * Manages storage checks and cleanup for the disk-based buffer system.
+ * Provides configurable thresholds based on resolution and fps.
+ */
+class StorageManager(private val context: Context) {
+    private val TAG = "StorageManager"
+    
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // CONFIGURABLE THRESHOLDS
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    companion object {
+        // Minimum free space required to START buffering (configurable by quality)
+        // These values account for buffer size + overhead
+        private const val MIN_FREE_SPACE_4K_60FPS = 800L * 1024 * 1024      // 800 MB for 4K 60fps
+        private const val MIN_FREE_SPACE_4K_30FPS = 500L * 1024 * 1024      // 500 MB for 4K 30fps
+        private const val MIN_FREE_SPACE_1080P_60FPS = 400L * 1024 * 1024   // 400 MB for 1080p 60fps
+        private const val MIN_FREE_SPACE_1080P_30FPS = 300L * 1024 * 1024   // 300 MB for 1080p 30fps
+        private const val MIN_FREE_SPACE_720P = 200L * 1024 * 1024          // 200 MB for 720p
+        private const val MIN_FREE_SPACE_DEFAULT = 500L * 1024 * 1024       // 500 MB default
+        
+        // Safety margin for recording (added to estimated recording size)
+        private const val RECORDING_SAFETY_MARGIN = 200L * 1024 * 1024      // 200 MB
+        
+        // Low storage threshold - triggers smart mode
+        private const val LOW_STORAGE_THRESHOLD = 1024L * 1024 * 1024       // 1 GB
+        
+        // Maximum buffer duration in low storage mode
+        const val LOW_STORAGE_MAX_BUFFER_SECONDS = 10
+        
+        // Approximate bitrates for space estimation (bytes per second)
+        // These are conservative estimates to ensure we don't run out of space
+        private const val BITRATE_4K_60FPS = 6_000_000L       // ~48 Mbps / 8 = 6 MB/s
+        private const val BITRATE_4K_30FPS = 3_500_000L       // ~28 Mbps / 8 = 3.5 MB/s
+        private const val BITRATE_1080P_60FPS = 2_000_000L    // ~16 Mbps / 8 = 2 MB/s
+        private const val BITRATE_1080P_30FPS = 1_000_000L    // ~8 Mbps / 8 = 1 MB/s
+        private const val BITRATE_720P = 500_000L             // ~4 Mbps / 8 = 0.5 MB/s
+    }
+    
+    private var bufferDirectory: File? = null
+    
+    /**
+     * Get the app-specific buffer directory.
+     * Uses getExternalFilesDir for better performance, falls back to cacheDir.
+     */
+    fun getBufferDirectory(): File {
+        if (bufferDirectory == null) {
+            // Try external files dir first (better I/O performance)
+            bufferDirectory = context.getExternalFilesDir("flashback_buffer")
+                ?: File(context.cacheDir, "flashback_buffer")
+            
+            // Ensure directory exists
+            bufferDirectory?.mkdirs()
+        }
+        return bufferDirectory!!
+    }
+    
+    /**
+     * Get available free space in bytes at the buffer storage location.
+     */
+    fun getAvailableFreeSpace(): Long {
+        return try {
+            val dir = getBufferDirectory()
+            val statFs = StatFs(dir.absolutePath)
+            statFs.availableBytes
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get free space", e)
+            0L
+        }
+    }
+    
+    /**
+     * Get total storage space in bytes.
+     */
+    fun getTotalStorageSpace(): Long {
+        return try {
+            val dir = getBufferDirectory()
+            val statFs = StatFs(dir.absolutePath)
+            statFs.totalBytes
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get total space", e)
+            0L
+        }
+    }
+    
+    /**
+     * Determine current storage mode based on available space.
+     */
+    fun getCurrentStorageMode(): StorageMode {
+        val availableSpace = getAvailableFreeSpace()
+        return if (availableSpace < LOW_STORAGE_THRESHOLD) {
+            StorageMode.LOW
+        } else {
+            StorageMode.NORMAL
+        }
+    }
+    
+    /**
+     * Get minimum free space required to start buffering for given settings.
+     */
+    fun getMinBufferFreeSpace(resolution: String, fps: Int): Long {
+        return when {
+            resolution == "4K" && fps >= 60 -> MIN_FREE_SPACE_4K_60FPS
+            resolution == "4K" && fps < 60 -> MIN_FREE_SPACE_4K_30FPS
+            resolution == "1080P" && fps >= 60 -> MIN_FREE_SPACE_1080P_60FPS
+            resolution == "1080P" && fps < 60 -> MIN_FREE_SPACE_1080P_30FPS
+            resolution == "720P" -> MIN_FREE_SPACE_720P
+            else -> MIN_FREE_SPACE_DEFAULT
+        }
+    }
+    
+    /**
+     * Get approximate bitrate for given settings (bytes per second).
+     */
+    fun getApproximateBitrate(resolution: String, fps: Int): Long {
+        return when {
+            resolution == "4K" && fps >= 60 -> BITRATE_4K_60FPS
+            resolution == "4K" && fps < 60 -> BITRATE_4K_30FPS
+            resolution == "1080P" && fps >= 60 -> BITRATE_1080P_60FPS
+            resolution == "1080P" && fps < 60 -> BITRATE_1080P_30FPS
+            resolution == "720P" -> BITRATE_720P
+            else -> BITRATE_1080P_30FPS
+        }
+    }
+    
+    /**
+     * Check if there's enough space to start buffering.
+     */
+    fun checkBufferStartSpace(resolution: String, fps: Int): StorageCheckResult {
+        val availableSpace = getAvailableFreeSpace()
+        val requiredSpace = getMinBufferFreeSpace(resolution, fps)
+        val storageMode = getCurrentStorageMode()
+        
+        Log.d(TAG, "Buffer space check: available=${availableSpace / 1024 / 1024}MB, " +
+                "required=${requiredSpace / 1024 / 1024}MB, mode=$storageMode")
+        
+        return if (availableSpace >= requiredSpace) {
+            StorageCheckResult(
+                hasEnoughSpace = true,
+                availableBytes = availableSpace,
+                requiredBytes = requiredSpace,
+                storageMode = storageMode
+            )
+        } else {
+            StorageCheckResult(
+                hasEnoughSpace = false,
+                availableBytes = availableSpace,
+                requiredBytes = requiredSpace,
+                storageMode = storageMode,
+                message = "Not enough storage for buffer. Please free up space or reduce quality."
+            )
+        }
+    }
+    
+    /**
+     * Check if there's enough space to start recording.
+     * Estimates space needed for: current buffer + expected recording duration + safety margin.
+     */
+    fun checkRecordingStartSpace(
+        resolution: String,
+        fps: Int,
+        bufferDurationSeconds: Int,
+        expectedRecordingSeconds: Int
+    ): StorageCheckResult {
+        val availableSpace = getAvailableFreeSpace()
+        val bitrate = getApproximateBitrate(resolution, fps)
+        val storageMode = getCurrentStorageMode()
+        
+        // Calculate required space:
+        // - Buffer content (already partially on disk, but may need to be kept)
+        // - Expected recording duration
+        // - Safety margin
+        val bufferSize = bitrate * bufferDurationSeconds
+        val recordingSize = bitrate * expectedRecordingSeconds
+        val requiredSpace = bufferSize + recordingSize + RECORDING_SAFETY_MARGIN
+        
+        Log.d(TAG, "Recording space check: available=${availableSpace / 1024 / 1024}MB, " +
+                "required=${requiredSpace / 1024 / 1024}MB (buffer=${bufferSize / 1024 / 1024}MB, " +
+                "recording=${recordingSize / 1024 / 1024}MB, safety=${RECORDING_SAFETY_MARGIN / 1024 / 1024}MB)")
+        
+        return if (availableSpace >= requiredSpace) {
+            StorageCheckResult(
+                hasEnoughSpace = true,
+                availableBytes = availableSpace,
+                requiredBytes = requiredSpace,
+                storageMode = storageMode
+            )
+        } else {
+            StorageCheckResult(
+                hasEnoughSpace = false,
+                availableBytes = availableSpace,
+                requiredBytes = requiredSpace,
+                storageMode = storageMode,
+                message = "Not enough storage to safely record. Try reducing resolution, frame rate, or buffer duration."
+            )
+        }
+    }
+    
+    /**
+     * Get adjusted settings for low storage mode.
+     * Returns map with adjusted resolution, fps, and maxBufferSeconds.
+     */
+    fun getAdjustedSettingsForLowStorage(
+        requestedResolution: String,
+        requestedFps: Int,
+        requestedBufferSeconds: Int
+    ): Map<String, Any> {
+        val storageMode = getCurrentStorageMode()
+        
+        return if (storageMode == StorageMode.LOW) {
+            mapOf(
+                "resolution" to if (requestedResolution == "4K") "1080P" else requestedResolution,
+                "fps" to if (requestedResolution == "4K" || requestedFps > 30) 30 else requestedFps,
+                "maxBufferSeconds" to minOf(requestedBufferSeconds, LOW_STORAGE_MAX_BUFFER_SECONDS),
+                "storageMode" to "low",
+                "adjusted" to true
+            )
+        } else {
+            mapOf(
+                "resolution" to requestedResolution,
+                "fps" to requestedFps,
+                "maxBufferSeconds" to requestedBufferSeconds,
+                "storageMode" to "normal",
+                "adjusted" to false
+            )
+        }
+    }
+    
+    /**
+     * Clean up all buffer files in the buffer directory.
+     * Called when buffer stops, app closes, or buffer reinitializes.
+     */
+    fun cleanupBufferFiles() {
+        try {
+            val dir = getBufferDirectory()
+            if (dir.exists()) {
+                var deletedCount = 0
+                var deletedSize = 0L
+                
+                dir.listFiles()?.forEach { file ->
+                    if (file.isFile && (file.name.startsWith("segment_") || 
+                        file.name.startsWith("dvr_buffer_") ||
+                        file.name.endsWith(".bin"))) {
+                        deletedSize += file.length()
+                        if (file.delete()) {
+                            deletedCount++
+                        }
+                    } else if (file.isDirectory && file.name.startsWith("dvr_buffer_")) {
+                        deletedSize += file.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+                        if (file.deleteRecursively()) {
+                            deletedCount++
+                        }
+                    }
+                }
+                
+                Log.d(TAG, "Cleaned up $deletedCount buffer files (${deletedSize / 1024 / 1024}MB)")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to cleanup buffer files", e)
+        }
+    }
+    
+    /**
+     * Clean up old buffer directories (from previous sessions).
+     */
+    fun cleanupOldBufferDirectories() {
+        try {
+            // Clean from cache dir
+            context.cacheDir.listFiles()?.filter { 
+                it.name.startsWith("dvr_buffer_") && it.isDirectory 
+            }?.forEach { dir ->
+                try {
+                    val deletedSize = dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+                    dir.deleteRecursively()
+                    Log.d(TAG, "Cleaned old buffer dir: ${dir.name} (${deletedSize / 1024 / 1024}MB)")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to delete old buffer dir: ${dir.name}", e)
+                }
+            }
+            
+            // Clean from external files dir
+            context.getExternalFilesDir("flashback_buffer")?.listFiles()?.filter {
+                it.name.startsWith("dvr_buffer_") || it.name.startsWith("segment_")
+            }?.forEach { file ->
+                try {
+                    if (file.isDirectory) {
+                        file.deleteRecursively()
+                    } else {
+                        file.delete()
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to delete old buffer file: ${file.name}", e)
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to cleanup old buffer directories", e)
+        }
+    }
+    
+    /**
+     * Get storage status info for Flutter UI.
+     */
+    fun getStorageStatus(): Map<String, Any> {
+        val availableSpace = getAvailableFreeSpace()
+        val totalSpace = getTotalStorageSpace()
+        val storageMode = getCurrentStorageMode()
+        
+        return mapOf(
+            "availableBytes" to availableSpace,
+            "totalBytes" to totalSpace,
+            "availableMB" to (availableSpace / 1024 / 1024),
+            "totalMB" to (totalSpace / 1024 / 1024),
+            "storageMode" to storageMode.name.lowercase(),
+            "isLowStorage" to (storageMode == StorageMode.LOW),
+            "lowStorageThresholdMB" to (LOW_STORAGE_THRESHOLD / 1024 / 1024)
+        )
+    }
+}
 
 // Data class to hold encoded samples in the buffer
 data class EncodedSample(
@@ -124,19 +468,52 @@ class RollingMediaBuffer(private var maxDurationUs: Long) {
     private val ramSamples = LinkedList<EncodedSample>()
     private val RAM_BUFFER_THRESHOLD_SECONDS = 3
     
-    fun initialize(context: android.content.Context, useRam: Boolean = false) {
+    // Storage failure callback
+    private var storageFullCallback: (() -> Unit)? = null
+    private var lastStorageError: String? = null
+    private var storageManager: StorageManager? = null
+    
+    /**
+     * Set callback for storage full errors during buffer writes.
+     */
+    fun setStorageFullCallback(callback: (() -> Unit)?) {
+        storageFullCallback = callback
+    }
+    
+    /**
+     * Get last storage error message, if any.
+     */
+    fun getLastStorageError(): String? = lastStorageError
+    
+    /**
+     * Clear the last storage error.
+     */
+    fun clearStorageError() {
+        lastStorageError = null
+    }
+    
+    fun initialize(context: android.content.Context, useRam: Boolean = false, manager: StorageManager? = null) {
+        storageManager = manager
         useRamBuffer = useRam
+        lastStorageError = null
+        
         if (!useRamBuffer) {
-            // Clean up any old buffer directories first
-            try {
-                context.cacheDir.listFiles()?.filter { it.name.startsWith("dvr_buffer_") }?.forEach { 
-                    it.deleteRecursively() 
+            // Clean up any old buffer directories first using StorageManager if available
+            if (manager != null) {
+                manager.cleanupOldBufferDirectories()
+                bufferDir = File(manager.getBufferDirectory(), "dvr_buffer_${System.currentTimeMillis()}")
+            } else {
+                // Fallback: clean up manually
+                try {
+                    context.cacheDir.listFiles()?.filter { it.name.startsWith("dvr_buffer_") }?.forEach { 
+                        it.deleteRecursively() 
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to clean old buffer dirs", e)
                 }
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to clean old buffer dirs", e)
+                bufferDir = File(context.cacheDir, "dvr_buffer_${System.currentTimeMillis()}")
             }
             
-            bufferDir = File(context.cacheDir, "dvr_buffer_${System.currentTimeMillis()}")
             val created = bufferDir?.mkdirs() ?: false
             Log.d(TAG, "Initialized disk-based buffer at: ${bufferDir?.absolutePath}, created=$created")
             
@@ -151,11 +528,15 @@ class RollingMediaBuffer(private var maxDurationUs: Long) {
     
     private var isInitialized = false
     
+    // Track consecutive storage failures for detecting storage full condition
+    private var consecutiveWriteFailures = 0
+    private val MAX_CONSECUTIVE_FAILURES = 5
+    
     @Synchronized
-    fun addSample(sample: EncodedSample) {
+    fun addSample(sample: EncodedSample): Boolean {
         if (useRamBuffer) {
             addSampleToRam(sample)
-            return
+            return true
         }
         
         // Check if buffer directory exists
@@ -163,7 +544,7 @@ class RollingMediaBuffer(private var maxDurationUs: Long) {
             Log.w(TAG, "Buffer directory not available, using RAM fallback")
             ramSamples.offer(sample)
             while (ramSamples.size > 500) ramSamples.poll() // Keep limited fallback
-            return
+            return true
         }
         
         try {
@@ -177,7 +558,7 @@ class RollingMediaBuffer(private var maxDurationUs: Long) {
             
             if (segment == null || stream == null) {
                 Log.w(TAG, "No current segment available, sample dropped")
-                return
+                return false
             }
             
             // Write sample data to disk
@@ -206,16 +587,47 @@ class RollingMediaBuffer(private var maxDurationUs: Long) {
                 Log.d(TAG, "First sample written to disk successfully")
             }
             
+            // Reset failure counter on success
+            consecutiveWriteFailures = 0
+            
             // Trim old samples/segments to maintain time window
             trimOldData()
             
+            return true
+            
+        } catch (e: IOException) {
+            consecutiveWriteFailures++
+            Log.e(TAG, "Failed to write sample to disk (failure $consecutiveWriteFailures/$MAX_CONSECUTIVE_FAILURES)", e)
+            
+            // Check if this is a storage full condition
+            val isStorageFull = e.message?.contains("No space left", ignoreCase = true) == true ||
+                    e.message?.contains("ENOSPC", ignoreCase = true) == true ||
+                    consecutiveWriteFailures >= MAX_CONSECUTIVE_FAILURES
+            
+            if (isStorageFull) {
+                lastStorageError = "Storage is full. Recording stopped to prevent data corruption."
+                Log.e(TAG, "Storage full detected! Triggering callback.")
+                storageFullCallback?.invoke()
+                return false
+            }
+            
+            // Non-fatal failure: fall back to RAM buffer temporarily
+            ramSamples.offer(sample)
+            while (ramSamples.size > 100) {
+                ramSamples.poll()
+            }
+            return true
+            
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to write sample to disk, falling back to RAM", e)
+            consecutiveWriteFailures++
+            Log.e(TAG, "Failed to write sample to disk (failure $consecutiveWriteFailures)", e)
+            
             // Fallback: add to RAM buffer
             ramSamples.offer(sample)
             while (ramSamples.size > 100) { // Keep limited RAM samples as emergency fallback
                 ramSamples.poll()
             }
+            return true
         }
     }
     
@@ -421,15 +833,80 @@ class RollingMediaBuffer(private var maxDurationUs: Long) {
         segments.clear()
         segmentCounter = 0
         
-        // Delete buffer directory contents but keep the directory
+        // Delete buffer directory and all contents
         try {
-            bufferDir?.listFiles()?.forEach { it.delete() }
+            bufferDir?.let { dir ->
+                if (dir.exists()) {
+                    dir.listFiles()?.forEach { file ->
+                        try {
+                            if (file.isDirectory) {
+                                file.deleteRecursively()
+                            } else {
+                                file.delete()
+                            }
+                        } catch (_: Exception) {}
+                    }
+                    // Also delete the buffer directory itself
+                    dir.delete()
+                }
+            }
         } catch (_: Exception) {}
+        bufferDir = null
         
-        // Reset initialization flag so next sample creates a new segment
+        // Reset state
         isInitialized = false
+        consecutiveWriteFailures = 0
+        lastStorageError = null
         
-        Log.d(TAG, "Buffer cleared, ready for new samples")
+        Log.d(TAG, "Buffer cleared and directory removed, ready for reinitialization")
+    }
+    
+    /**
+     * Cleanup buffer files without clearing in-memory state.
+     * Used when stopping buffer or app closes.
+     */
+    @Synchronized
+    fun cleanup() {
+        Log.d(TAG, "Cleanup called - deleting all buffer files")
+        
+        // Close current stream
+        try {
+            currentSegmentStream?.close()
+        } catch (_: Exception) {}
+        currentSegmentStream = null
+        
+        // Delete all segment files and buffer directory
+        try {
+            bufferDir?.let { dir ->
+                if (dir.exists()) {
+                    var deletedSize = 0L
+                    dir.listFiles()?.forEach { file ->
+                        deletedSize += file.length()
+                        try {
+                            if (file.isDirectory) {
+                                file.deleteRecursively()
+                            } else {
+                                file.delete()
+                            }
+                        } catch (_: Exception) {}
+                    }
+                    dir.delete()
+                    Log.d(TAG, "Deleted buffer directory (${deletedSize / 1024}KB freed)")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error during cleanup", e)
+        }
+        
+        // Clear in-memory state
+        ramSamples.clear()
+        sampleIndex.clear()
+        segments.clear()
+        currentSegment = null
+        segmentCounter = 0
+        bufferDir = null
+        isInitialized = false
+        consecutiveWriteFailures = 0
     }
     
     @Synchronized
@@ -744,6 +1221,10 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
     private var isAudioCapturing = false
     private var activeCaptureProfile: CaptureProfile? = null
     
+    // Storage management for low-storage handling
+    private var storageManager: StorageManager? = null
+    private var currentStorageMode: StorageMode = StorageMode.NORMAL
+    
     // Device orientation at recording time (for video metadata only, not preview)
     private var recordingOrientation: Int = 0
     
@@ -845,11 +1326,25 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
         
         cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         
-        // Initialize disk-based rolling buffer with context
-        // This allows the buffer to use the app's cache directory for segment storage
-        rollingBuffer.initialize(context, useRam = false)
+        // Initialize storage manager for low-storage handling
+        storageManager = StorageManager(context)
+        currentStorageMode = storageManager!!.getCurrentStorageMode()
         
-        Log.d(TAG, "CameraPlugin attached, disk buffer initialized")
+        // Clean up any old buffer files from previous sessions
+        storageManager?.cleanupOldBufferDirectories()
+        
+        // Initialize disk-based rolling buffer with context and storage manager
+        // This allows the buffer to use the app's cache directory for segment storage
+        rollingBuffer.initialize(context, useRam = false, manager = storageManager)
+        
+        // Set up storage full callback to handle write failures gracefully
+        rollingBuffer.setStorageFullCallback {
+            Handler(Looper.getMainLooper()).post {
+                handleStorageFullDuringRecording()
+            }
+        }
+        
+        Log.d(TAG, "CameraPlugin attached, disk buffer initialized, storageMode=$currentStorageMode")
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
@@ -889,6 +1384,12 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
             "getDeviceCapabilities" -> getDeviceCapabilities(result)
             "checkDetailedCapabilities" -> checkDetailedCapabilities(result)
             "getDebugInfo" -> getDebugInfo(result)
+            // Storage management methods
+            "getStorageStatus" -> getStorageStatus(result)
+            "checkBufferStorageSpace" -> checkBufferStorageSpace(call, result)
+            "checkRecordingStorageSpace" -> checkRecordingStorageSpace(call, result)
+            "getAdjustedSettingsForStorage" -> getAdjustedSettingsForStorage(call, result)
+            "cleanupBufferFiles" -> cleanupBufferFiles(result)
             "dispose" -> {
                 dispose()
                 result.success(null)
@@ -943,13 +1444,196 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                 // Device info
                 "ramTier" to currentRamTier,
                 "bufferMode" to currentBufferMode,
-                "maxZoom" to maxZoom
+                "maxZoom" to maxZoom,
+                
+                // Storage info
+                "storageMode" to currentStorageMode.name.lowercase()
             )
             
             result.success(debugInfo)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to get debug info", e)
             result.success(hashMapOf<String, Any>())
+        }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // STORAGE MANAGEMENT METHODS - Exposed to Flutter for low-storage handling
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    /**
+     * Get current storage status for Flutter UI.
+     */
+    private fun getStorageStatus(result: MethodChannel.Result) {
+        try {
+            val manager = storageManager
+            if (manager == null) {
+                result.error("STORAGE_ERROR", "Storage manager not initialized", null)
+                return
+            }
+            
+            val status = manager.getStorageStatus()
+            currentStorageMode = manager.getCurrentStorageMode()
+            result.success(status)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get storage status", e)
+            result.error("STORAGE_ERROR", "Failed to get storage status: ${e.message}", null)
+        }
+    }
+    
+    /**
+     * Check if there's enough storage space to start buffering.
+     */
+    private fun checkBufferStorageSpace(call: MethodCall, result: MethodChannel.Result) {
+        try {
+            val manager = storageManager
+            if (manager == null) {
+                result.error("STORAGE_ERROR", "Storage manager not initialized", null)
+                return
+            }
+            
+            val resolution = call.argument<String>("resolution") ?: currentResolution
+            val fps = call.argument<Int>("fps") ?: currentFps
+            
+            val checkResult = manager.checkBufferStartSpace(resolution, fps)
+            currentStorageMode = checkResult.storageMode
+            
+            result.success(mapOf(
+                "hasEnoughSpace" to checkResult.hasEnoughSpace,
+                "availableBytes" to checkResult.availableBytes,
+                "requiredBytes" to checkResult.requiredBytes,
+                "availableMB" to (checkResult.availableBytes / 1024 / 1024),
+                "requiredMB" to (checkResult.requiredBytes / 1024 / 1024),
+                "storageMode" to checkResult.storageMode.name.lowercase(),
+                "message" to (checkResult.message ?: "")
+            ))
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to check buffer storage space", e)
+            result.error("STORAGE_ERROR", "Failed to check storage: ${e.message}", null)
+        }
+    }
+    
+    /**
+     * Check if there's enough storage space to start recording.
+     */
+    private fun checkRecordingStorageSpace(call: MethodCall, result: MethodChannel.Result) {
+        try {
+            val manager = storageManager
+            if (manager == null) {
+                result.error("STORAGE_ERROR", "Storage manager not initialized", null)
+                return
+            }
+            
+            val resolution = call.argument<String>("resolution") ?: currentResolution
+            val fps = call.argument<Int>("fps") ?: currentFps
+            val bufferDurationSeconds = call.argument<Int>("bufferDurationSeconds") ?: selectedBufferSeconds
+            val expectedRecordingSeconds = call.argument<Int>("expectedRecordingSeconds") ?: 60 // Default 1 minute
+            
+            val checkResult = manager.checkRecordingStartSpace(
+                resolution, fps, bufferDurationSeconds, expectedRecordingSeconds
+            )
+            currentStorageMode = checkResult.storageMode
+            
+            result.success(mapOf(
+                "hasEnoughSpace" to checkResult.hasEnoughSpace,
+                "availableBytes" to checkResult.availableBytes,
+                "requiredBytes" to checkResult.requiredBytes,
+                "availableMB" to (checkResult.availableBytes / 1024 / 1024),
+                "requiredMB" to (checkResult.requiredBytes / 1024 / 1024),
+                "storageMode" to checkResult.storageMode.name.lowercase(),
+                "message" to (checkResult.message ?: "")
+            ))
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to check recording storage space", e)
+            result.error("STORAGE_ERROR", "Failed to check storage: ${e.message}", null)
+        }
+    }
+    
+    /**
+     * Get adjusted settings for low storage mode.
+     */
+    private fun getAdjustedSettingsForStorage(call: MethodCall, result: MethodChannel.Result) {
+        try {
+            val manager = storageManager
+            if (manager == null) {
+                result.error("STORAGE_ERROR", "Storage manager not initialized", null)
+                return
+            }
+            
+            val resolution = call.argument<String>("resolution") ?: currentResolution
+            val fps = call.argument<Int>("fps") ?: currentFps
+            val bufferSeconds = call.argument<Int>("bufferSeconds") ?: selectedBufferSeconds
+            
+            val adjustedSettings = manager.getAdjustedSettingsForLowStorage(resolution, fps, bufferSeconds)
+            currentStorageMode = if (adjustedSettings["adjusted"] == true) StorageMode.LOW else StorageMode.NORMAL
+            
+            result.success(adjustedSettings)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get adjusted settings", e)
+            result.error("STORAGE_ERROR", "Failed to get adjusted settings: ${e.message}", null)
+        }
+    }
+    
+    /**
+     * Manually cleanup buffer files. Called when stopping buffer or during maintenance.
+     */
+    private fun cleanupBufferFiles(result: MethodChannel.Result) {
+        try {
+            storageManager?.cleanupBufferFiles()
+            storageManager?.cleanupOldBufferDirectories()
+            result.success(true)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to cleanup buffer files", e)
+            result.error("STORAGE_ERROR", "Failed to cleanup: ${e.message}", null)
+        }
+    }
+    
+    /**
+     * Handle storage full condition detected during recording.
+     * Gracefully stops recording and saves partial video.
+     */
+    private fun handleStorageFullDuringRecording() {
+        Log.e(TAG, "═══════════════════════════════════════════════════════════")
+        Log.e(TAG, "STORAGE FULL - Stopping recording gracefully")
+        Log.e(TAG, "═══════════════════════════════════════════════════════════")
+        
+        if (isRecording) {
+            // Mark stop timestamp
+            recordingStopGlobalPtsUs = nowUs()
+            val recordingDurationUs = recordingStopGlobalPtsUs - recordingStartGlobalPtsUs
+            
+            // Clear recording flag
+            isRecording = false
+            
+            // Cancel auto-stop timer
+            recordingAutoStopTimer?.cancel()
+            recordingAutoStopTimer = null
+            
+            // Notify Flutter with error
+            sendEvent("recordingError", mapOf(
+                "code" to "STORAGE_FULL",
+                "error" to "Recording stopped: storage is full. Your video has been saved up to this point."
+            ))
+            
+            // Try to export what we have
+            if (recordingDurationUs > 1_000_000L) { // At least 1 second recorded
+                Log.d(TAG, "Attempting to save partial recording (${recordingDurationUs / 1_000_000.0}s)")
+                startBackgroundExport()
+            } else {
+                Log.w(TAG, "Recording too short to save (${recordingDurationUs / 1_000_000.0}s)")
+                sendEvent("recordingStopped", mapOf("id" to currentRecordingId))
+            }
+        }
+        
+        // Also stop buffering to prevent further disk writes
+        if (isBuffering) {
+            isBuffering = false
+            isBufferInitialized = false
+            shutdownContinuousBuffer()
+            
+            sendEvent("lowStorage", mapOf(
+                "message" to "Buffer stopped due to low storage"
+            ))
         }
     }
 
@@ -1502,6 +2186,35 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                 result.success(null)
                 return
             }
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // STORAGE CHECK - Verify sufficient space before starting buffer
+            // ═══════════════════════════════════════════════════════════════════
+            val manager = storageManager
+            if (manager != null) {
+                val storageCheck = manager.checkBufferStartSpace(currentResolution, currentFps)
+                currentStorageMode = storageCheck.storageMode
+                
+                if (!storageCheck.hasEnoughSpace) {
+                    Log.e(TAG, "❌ Insufficient storage to start buffer: " +
+                            "available=${storageCheck.availableBytes / 1024 / 1024}MB, " +
+                            "required=${storageCheck.requiredBytes / 1024 / 1024}MB")
+                    
+                    result.error(
+                        "INSUFFICIENT_STORAGE",
+                        storageCheck.message ?: "Not enough storage for buffer. Please free up space or reduce quality.",
+                        mapOf(
+                            "availableMB" to (storageCheck.availableBytes / 1024 / 1024),
+                            "requiredMB" to (storageCheck.requiredBytes / 1024 / 1024),
+                            "storageMode" to storageCheck.storageMode.name.lowercase()
+                        )
+                    )
+                    return
+                }
+                
+                Log.d(TAG, "✅ Storage check passed: ${storageCheck.availableBytes / 1024 / 1024}MB available, mode=$currentStorageMode")
+            }
+            
             isBuffering = true
             bufferSeconds = 0
 
@@ -1511,6 +2224,9 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                     "[Buffer] Applying profile -> tier=${it.ramTier}, res=${it.resolution}, fps=${it.fps}, codec=${it.codec}, buffer=${it.bufferSeconds}s, mode=${it.bufferMode}"
                 )
             }
+            
+            // Reinitialize the rolling buffer with storage manager
+            rollingBuffer.initialize(context, useRam = false, manager = storageManager)
             
             // Initialize continuous pre-roll buffer
             initializeContinuousBuffer()
@@ -1553,7 +2269,9 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
             
             // Update rolling buffer max duration
             rollingBuffer.updateMaxDuration(bufferDurationUs)
-            rollingBuffer.clear()
+            // Note: Do NOT call rollingBuffer.clear() here!
+            // The buffer was already initialized in startBuffer() with the proper directory.
+            // Calling clear() would destroy the bufferDir and prevent disk writes.
             
             // Create encoder thread
             encoderThread = HandlerThread("EncoderThread").apply { start() }
@@ -2211,6 +2929,14 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                 bufferFrames.clear()
             }
             shutdownContinuousBuffer()
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // CLEANUP - Delete buffer files when stopping buffer
+            // ═══════════════════════════════════════════════════════════════════
+            rollingBuffer.cleanup()
+            storageManager?.cleanupBufferFiles()
+            Log.d(TAG, "Buffer files cleaned up")
+            
             backgroundHandler?.post {
                 try {
                     captureSession?.close()
@@ -2254,6 +2980,45 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                 Log.w(TAG, "[Record] ⚠️ Previous export still running, waiting...")
                 result.error("EXPORT_IN_PROGRESS", "Previous recording is still being saved", null)
                 return
+            }
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // STORAGE CHECK - Verify sufficient space before starting recording
+            // ═══════════════════════════════════════════════════════════════════
+            val manager = storageManager
+            if (manager != null) {
+                // Calculate expected recording duration based on max recording time for current settings
+                val expectedRecordingSeconds = when {
+                    currentResolution == "4K" && currentFps >= 60 -> 5 * 60   // 5 minutes
+                    currentResolution == "4K" && currentFps <= 30 -> 10 * 60  // 10 minutes
+                    currentResolution == "1080P" && currentFps >= 60 -> 10 * 60 // 10 minutes
+                    currentResolution == "1080P" && currentFps <= 30 -> 15 * 60 // 15 minutes
+                    else -> 10 * 60 // Default: 10 minutes
+                }
+                
+                val storageCheck = manager.checkRecordingStartSpace(
+                    currentResolution, currentFps, selectedBufferSeconds, expectedRecordingSeconds
+                )
+                currentStorageMode = storageCheck.storageMode
+                
+                if (!storageCheck.hasEnoughSpace) {
+                    Log.e(TAG, "[Record] ❌ Insufficient storage to start recording: " +
+                            "available=${storageCheck.availableBytes / 1024 / 1024}MB, " +
+                            "required=${storageCheck.requiredBytes / 1024 / 1024}MB")
+                    
+                    result.error(
+                        "INSUFFICIENT_STORAGE",
+                        storageCheck.message ?: "Not enough storage to safely record. Try reducing resolution, frame rate, or buffer duration.",
+                        mapOf(
+                            "availableMB" to (storageCheck.availableBytes / 1024 / 1024),
+                            "requiredMB" to (storageCheck.requiredBytes / 1024 / 1024),
+                            "storageMode" to storageCheck.storageMode.name.lowercase()
+                        )
+                    )
+                    return
+                }
+                
+                Log.d(TAG, "[Record] ✅ Storage check passed: ${storageCheck.availableBytes / 1024 / 1024}MB available")
             }
             
             // ═══════════════════════════════════════════════════════════════════
@@ -4431,8 +5196,15 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
             encoderThread = null
             encoderHandler = null
             
-            // Clear rolling buffer
-            rollingBuffer.clear()
+            // Clear and cleanup rolling buffer
+            rollingBuffer.cleanup()
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // CLEANUP - Delete all buffer files when app closes
+            // ═══════════════════════════════════════════════════════════════════
+            storageManager?.cleanupBufferFiles()
+            storageManager?.cleanupOldBufferDirectories()
+            Log.d(TAG, "Buffer files cleaned up on dispose")
             
             // Clean up pending buffer file
             pendingBufferFile?.delete()

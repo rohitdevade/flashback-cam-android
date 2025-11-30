@@ -12,6 +12,46 @@ enum CameraEvent {
   bufferUpdate,
   subscriptionUpdated,
   recordingError,
+  storageFull, // Storage full during recording
+  insufficientStorage, // Not enough storage to start buffer/recording
+}
+
+/// Storage mode indicating current storage conditions.
+/// Used to adjust UI and available features.
+enum StorageMode {
+  normal, // Sufficient storage - all features available
+  low, // Low storage - 4K disabled, buffer duration limited
+}
+
+/// Result of storage check operations
+class StorageCheckResult {
+  final bool hasEnoughSpace;
+  final int availableBytes;
+  final int requiredBytes;
+  final StorageMode storageMode;
+  final String? message;
+
+  StorageCheckResult({
+    required this.hasEnoughSpace,
+    required this.availableBytes,
+    required this.requiredBytes,
+    required this.storageMode,
+    this.message,
+  });
+
+  factory StorageCheckResult.fromMap(Map<String, dynamic> map) {
+    return StorageCheckResult(
+      hasEnoughSpace: map['hasEnoughSpace'] as bool? ?? true,
+      availableBytes: (map['availableBytes'] as num?)?.toInt() ?? 0,
+      requiredBytes: (map['requiredBytes'] as num?)?.toInt() ?? 0,
+      storageMode:
+          map['storageMode'] == 'low' ? StorageMode.low : StorageMode.normal,
+      message: map['message'] as String?,
+    );
+  }
+
+  int get availableMB => availableBytes ~/ (1024 * 1024);
+  int get requiredMB => requiredBytes ~/ (1024 * 1024);
 }
 
 class CameraService {
@@ -244,6 +284,137 @@ class CameraService {
     } catch (e) {
       debugPrint('Failed to get debug info: $e');
       return {};
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // STORAGE MANAGEMENT - Low storage handling to prevent crashes and corruption
+  // ═══════════════════════════════════════════════════════════════════════════════
+
+  /// Get current storage status including available space and storage mode.
+  /// Returns a map with:
+  /// - availableBytes: Available storage in bytes
+  /// - totalBytes: Total storage in bytes
+  /// - availableMB: Available storage in MB
+  /// - totalMB: Total storage in MB
+  /// - storageMode: 'normal' or 'low'
+  /// - isLowStorage: boolean indicating if storage is low
+  /// - lowStorageThresholdMB: The threshold below which storage is considered low
+  Future<Map<String, dynamic>> getStorageStatus() async {
+    try {
+      final result = await _channel.invokeMethod<Map>('getStorageStatus');
+      return Map<String, dynamic>.from(result ?? {});
+    } catch (e) {
+      debugPrint('Failed to get storage status: $e');
+      return {
+        'availableBytes': 0,
+        'totalBytes': 0,
+        'storageMode': 'normal',
+        'isLowStorage': false,
+      };
+    }
+  }
+
+  /// Check if there's enough storage space to start buffering.
+  /// Returns a map with:
+  /// - hasEnoughSpace: boolean
+  /// - availableBytes/availableMB: Available storage
+  /// - requiredBytes/requiredMB: Required storage
+  /// - storageMode: 'normal' or 'low'
+  /// - message: Error message if space is insufficient
+  Future<Map<String, dynamic>> checkBufferStorageSpace({
+    String? resolution,
+    int? fps,
+  }) async {
+    try {
+      final result =
+          await _channel.invokeMethod<Map>('checkBufferStorageSpace', {
+        if (resolution != null) 'resolution': resolution,
+        if (fps != null) 'fps': fps,
+      });
+      return Map<String, dynamic>.from(result ?? {});
+    } catch (e) {
+      debugPrint('Failed to check buffer storage space: $e');
+      return {
+        'hasEnoughSpace': true, // Default to allowing buffer
+        'storageMode': 'normal',
+      };
+    }
+  }
+
+  /// Check if there's enough storage space to start recording.
+  /// Returns a map with:
+  /// - hasEnoughSpace: boolean
+  /// - availableBytes/availableMB: Available storage
+  /// - requiredBytes/requiredMB: Required storage
+  /// - storageMode: 'normal' or 'low'
+  /// - message: Error message if space is insufficient
+  Future<Map<String, dynamic>> checkRecordingStorageSpace({
+    String? resolution,
+    int? fps,
+    int? bufferDurationSeconds,
+    int? expectedRecordingSeconds,
+  }) async {
+    try {
+      final result =
+          await _channel.invokeMethod<Map>('checkRecordingStorageSpace', {
+        if (resolution != null) 'resolution': resolution,
+        if (fps != null) 'fps': fps,
+        if (bufferDurationSeconds != null)
+          'bufferDurationSeconds': bufferDurationSeconds,
+        if (expectedRecordingSeconds != null)
+          'expectedRecordingSeconds': expectedRecordingSeconds,
+      });
+      return Map<String, dynamic>.from(result ?? {});
+    } catch (e) {
+      debugPrint('Failed to check recording storage space: $e');
+      return {
+        'hasEnoughSpace': true, // Default to allowing recording
+        'storageMode': 'normal',
+      };
+    }
+  }
+
+  /// Get adjusted settings for low storage mode.
+  /// If storage is low, 4K is disabled and buffer duration is limited.
+  /// Returns a map with:
+  /// - resolution: Adjusted resolution (4K -> 1080P if low storage)
+  /// - fps: Adjusted fps (60 -> 30 if low storage)
+  /// - maxBufferSeconds: Limited buffer seconds if low storage
+  /// - storageMode: 'normal' or 'low'
+  /// - adjusted: boolean indicating if settings were adjusted
+  Future<Map<String, dynamic>> getAdjustedSettingsForStorage({
+    required String resolution,
+    required int fps,
+    required int bufferSeconds,
+  }) async {
+    try {
+      final result =
+          await _channel.invokeMethod<Map>('getAdjustedSettingsForStorage', {
+        'resolution': resolution,
+        'fps': fps,
+        'bufferSeconds': bufferSeconds,
+      });
+      return Map<String, dynamic>.from(result ?? {});
+    } catch (e) {
+      debugPrint('Failed to get adjusted settings: $e');
+      return {
+        'resolution': resolution,
+        'fps': fps,
+        'maxBufferSeconds': bufferSeconds,
+        'storageMode': 'normal',
+        'adjusted': false,
+      };
+    }
+  }
+
+  /// Manually cleanup buffer files.
+  Future<void> cleanupBufferFiles() async {
+    try {
+      await _channel.invokeMethod('cleanupBufferFiles');
+      debugPrint('Buffer files cleaned up');
+    } catch (e) {
+      debugPrint('Failed to cleanup buffer files: $e');
     }
   }
 

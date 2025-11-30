@@ -34,5 +34,5 @@ flutter:
 flutter_launcher_icons:
   android: true
   ios: true
-  image_path: assets/icons/flashbackcam_icon.png
+  image_path: assets/icons/flashback_cam_icon.png
   remove_alpha_ios: true
