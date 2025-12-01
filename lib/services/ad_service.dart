@@ -12,33 +12,31 @@ class AdService {
   static const int _showAdEveryNthGalleryVisit =
       3; // Show ad every 3rd gallery visit
 
-  // Test Ad IDs for AdMob
-  // Android Test IDs
-  static const String _androidTestInterstitialAdUnitId =
-      'ca-app-pub-3940256099942544/1033173712';
-  static const String _androidTestBannerAdUnitId =
-      'ca-app-pub-3940256099942544/6300978111';
+  // Production Ad IDs for AdMob
+  // Android Production IDs
+  static const String _androidInterstitialAdUnitId =
+      'ca-app-pub-6281772921050479/1838942262';
+  static const String _androidBannerAdUnitId =
+      'ca-app-pub-6281772921050479/8339829482';
 
-  // iOS Test IDs
-  static const String _iosTestInterstitialAdUnitId =
-      'ca-app-pub-3940256099942544/4411468910';
-  static const String _iosTestBannerAdUnitId =
-      'ca-app-pub-3940256099942544/2934735716';
+  // iOS Production IDs (not used currently)
+  static const String _iosInterstitialAdUnitId = '';
+  static const String _iosBannerAdUnitId = '';
 
   String get _interstitialAdUnitId {
     if (Platform.isAndroid) {
-      return _androidTestInterstitialAdUnitId;
+      return _androidInterstitialAdUnitId;
     } else if (Platform.isIOS) {
-      return _iosTestInterstitialAdUnitId;
+      return _iosInterstitialAdUnitId;
     }
     return '';
   }
 
   String get _bannerAdUnitId {
     if (Platform.isAndroid) {
-      return _androidTestBannerAdUnitId;
+      return _androidBannerAdUnitId;
     } else if (Platform.isIOS) {
-      return _iosTestBannerAdUnitId;
+      return _iosBannerAdUnitId;
     }
     return '';
   }

@@ -330,8 +330,10 @@ class SubscriptionService {
   /// Get remaining trial days
   int get trialDaysRemaining => _currentUser?.trialDaysRemaining ?? 0;
 
-  /// Start a 7-day free trial for the user
-  /// Returns true if trial was started successfully
+  /// Start a 7-day free trial by initiating the monthly subscription purchase
+  /// The free trial period must be configured in Google Play Console for the monthly product
+  /// After the 7-day trial, the user will be automatically charged the monthly subscription price
+  /// Returns true if the purchase flow was initiated successfully
   Future<bool> startFreeTrial() async {
     if (_currentUser == null) {
       debugPrint('Cannot start trial: no user loaded');
@@ -349,7 +351,11 @@ class SubscriptionService {
       return false;
     }
 
-    try {
+    // In debug mode, simulate the trial with local storage
+    if (_debugPurchasesEnabled) {
+      debugPrint('🔧 DEBUG MODE: Simulating free trial start');
+      await Future.delayed(const Duration(seconds: 1));
+
       final updatedUser = _currentUser!.copyWith(
         trialStartedAt: DateTime.now(),
         trialUsed: true,
@@ -357,12 +363,25 @@ class SubscriptionService {
       );
 
       await _saveUser(updatedUser);
-      debugPrint('✅ Free trial started successfully');
+      debugPrint('✅ DEBUG MODE: Free trial started successfully');
       return true;
-    } catch (e) {
-      debugPrint('Failed to start trial: $e');
-      return false;
     }
+
+    // In production, initiate the monthly subscription purchase
+    // The 7-day free trial is configured in Google Play Console
+    // Google handles the trial period and auto-charges after 7 days
+    debugPrint('Starting free trial via monthly subscription purchase...');
+
+    // Mark trial as used before purchase to prevent abuse
+    // This will be saved permanently even if purchase is cancelled
+    final updatedUser = _currentUser!.copyWith(
+      trialUsed: true,
+      updatedAt: DateTime.now(),
+    );
+    await _saveUser(updatedUser);
+
+    // Initiate the monthly subscription purchase (with free trial from Google Play)
+    return await purchaseSubscription('monthly');
   }
 
   /// Check if user can start a free trial

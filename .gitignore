@@ -10,6 +10,11 @@
 .svn/
 migrate_working_dir/
 
+# Release keys and credentials (NEVER commit these)
+android/key.properties
+*.jks
+*.keystore
+
 # IntelliJ related
 *.iml
 *.ipr
