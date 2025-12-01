@@ -316,8 +316,6 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
           price: yearlyProduct?.price ?? 'Loading...',
           period: 'per year',
           originalPrice: null,
-          badge: 'SAVE 78%',
-          isPopular: true,
         ),
         const SizedBox(height: 12),
         _buildPricingCard(
@@ -326,7 +324,6 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
           price: lifetimeProduct?.price ?? 'Loading...',
           period: 'one-time payment',
           originalPrice: null,
-          badge: 'BEST VALUE',
         ),
       ],
     );

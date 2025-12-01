@@ -356,7 +356,8 @@ class _CameraScreenState extends State<CameraScreen> {
       children: [
         if (!hideTopControls)
           Padding(
-            padding: const EdgeInsets.all(20),
+            padding:
+                const EdgeInsets.only(left: 20, right: 20, top: 8, bottom: 20),
             child: TopControls(
               selectedResolution: settings.resolution.toUpperCase(),
               selectedFps: settings.fps,
