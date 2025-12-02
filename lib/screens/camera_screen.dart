@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:flashback_cam/providers/app_state.dart';
 import 'package:flashback_cam/models/app_settings.dart';
 import 'package:flashback_cam/theme.dart';
@@ -35,6 +36,8 @@ class _CameraScreenState extends State<CameraScreen> {
   @override
   void initState() {
     super.initState();
+    // Keep screen on while camera is active
+    WakelockPlus.enable();
     _loadCapabilities();
   }
 
@@ -183,6 +186,8 @@ class _CameraScreenState extends State<CameraScreen> {
 
   @override
   void dispose() {
+    // Allow screen to turn off when leaving camera
+    WakelockPlus.disable();
     super.dispose();
   }
 
