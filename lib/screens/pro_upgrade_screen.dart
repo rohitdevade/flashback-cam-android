@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -5,6 +6,7 @@ import 'package:flashback_cam/providers/app_state.dart';
 import 'package:flashback_cam/theme.dart';
 import 'package:flashback_cam/widgets/glass_container.dart';
 import 'package:flashback_cam/widgets/frosted_glass_card.dart';
+import 'package:flashback_cam/services/subscription_service.dart';
 
 class ProUpgradeScreen extends StatefulWidget {
   const ProUpgradeScreen({super.key});
@@ -20,6 +22,7 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
   late AnimationController _pulseController;
   late Animation<double> _fadeAnimation;
   late Animation<double> _pulseAnimation;
+  StreamSubscription<PurchaseResult>? _purchaseSubscription;
 
   @override
   void initState() {
@@ -47,6 +50,7 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
 
   @override
   void dispose() {
+    _purchaseSubscription?.cancel();
     _fadeController.dispose();
     _pulseController.dispose();
     super.dispose();
@@ -515,11 +519,48 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
   }
 
   void _purchase(BuildContext context) async {
+    final appState = context.read<AppState>();
+
+    // Listen for purchase result BEFORE initiating purchase
+    _purchaseSubscription?.cancel();
+    _purchaseSubscription =
+        appState.subscriptionService.purchaseResultStream.listen((result) {
+      if (!mounted) return;
+
+      // Close any loading dialog that might be open
+      Navigator.of(context, rootNavigator: true).popUntil((route) {
+        return route is! DialogRoute;
+      });
+
+      switch (result) {
+        case PurchaseResult.success:
+          _showSuccessDialog(context);
+          break;
+        case PurchaseResult.cancelled:
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: const Text('Purchase was cancelled.'),
+              backgroundColor: AppColors.textSecondary,
+              behavior: SnackBarBehavior.floating,
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12)),
+            ),
+          );
+          break;
+        case PurchaseResult.error:
+          _showErrorDialog(context, 'Purchase failed. Please try again.');
+          break;
+        case PurchaseResult.pending:
+          // Keep showing loading - purchase is being processed
+          break;
+      }
+    });
+
     // Show loading dialog
     showDialog(
       context: context,
       barrierDismissible: false,
-      builder: (context) => Dialog(
+      builder: (dialogContext) => Dialog(
         backgroundColor: Colors.transparent,
         child: GlassContainer(
           padding: const EdgeInsets.all(32),
@@ -529,8 +570,8 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
               const CircularProgressIndicator(color: AppColors.electricBlue),
               const SizedBox(height: 20),
               Text(
-                'Processing purchase...',
-                style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                'Opening payment...',
+                style: Theme.of(dialogContext).textTheme.titleMedium?.copyWith(
                       color: AppColors.textPrimary,
                     ),
               ),
@@ -541,18 +582,24 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
     );
 
     try {
-      final appState = context.read<AppState>();
-      final success = await appState.purchasePro(_selectedTier);
+      final initiated = await appState.purchasePro(_selectedTier);
 
-      Navigator.pop(context); // Close loading dialog
+      if (!mounted) return;
 
-      if (success) {
-        _showSuccessDialog(context);
+      // If purchase flow couldn't start, close dialog and show error
+      if (!initiated) {
+        Navigator.pop(context); // Close loading dialog
+        _purchaseSubscription?.cancel();
+        _showErrorDialog(
+            context, 'Could not start purchase. Please try again.');
       } else {
-        _showErrorDialog(context, 'Purchase was canceled or failed');
+        // Close loading dialog - Google Play will show its own UI
+        Navigator.pop(context);
       }
     } catch (e) {
+      if (!mounted) return;
       Navigator.pop(context); // Close loading dialog
+      _purchaseSubscription?.cancel();
       _showErrorDialog(context, 'Purchase failed: ${e.toString()}');
     }
   }

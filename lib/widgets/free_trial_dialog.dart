@@ -1,9 +1,11 @@
+import 'dart:async';
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:flashback_cam/providers/app_state.dart';
 import 'package:flashback_cam/theme.dart';
 import 'package:flashback_cam/screens/pro_upgrade_screen.dart';
+import 'package:flashback_cam/services/subscription_service.dart';
 
 /// A frosted glass dialog offering a 7-day free trial
 /// User can dismiss this dialog without starting the trial
@@ -27,6 +29,7 @@ class _FreeTrialDialogState extends State<FreeTrialDialog>
   late Animation<double> _scaleAnimation;
   late Animation<double> _fadeAnimation;
   bool _isStartingTrial = false;
+  StreamSubscription<PurchaseResult>? _purchaseSubscription;
 
   @override
   void initState() {
@@ -51,6 +54,7 @@ class _FreeTrialDialogState extends State<FreeTrialDialog>
 
   @override
   void dispose() {
+    _purchaseSubscription?.cancel();
     _controller.dispose();
     super.dispose();
   }
@@ -61,18 +65,61 @@ class _FreeTrialDialogState extends State<FreeTrialDialog>
     setState(() => _isStartingTrial = true);
 
     final appState = context.read<AppState>();
-    final success = await appState.startFreeTrial();
+
+    // Listen for purchase result BEFORE initiating purchase
+    _purchaseSubscription?.cancel();
+    _purchaseSubscription =
+        appState.subscriptionService.purchaseResultStream.listen((result) {
+      if (!mounted) return;
+
+      switch (result) {
+        case PurchaseResult.success:
+          // Purchase completed successfully - show success and dismiss
+          widget.onTrialStarted?.call();
+          _showSuccessAndDismiss();
+          break;
+        case PurchaseResult.cancelled:
+          setState(() => _isStartingTrial = false);
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: const Text('Purchase was cancelled.'),
+              backgroundColor: AppColors.textSecondary,
+              behavior: SnackBarBehavior.floating,
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12)),
+            ),
+          );
+          break;
+        case PurchaseResult.error:
+          setState(() => _isStartingTrial = false);
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: const Text('Purchase failed. Please try again.'),
+              backgroundColor: AppColors.recordRed,
+              behavior: SnackBarBehavior.floating,
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12)),
+            ),
+          );
+          break;
+        case PurchaseResult.pending:
+          // Keep showing loading state
+          break;
+      }
+    });
+
+    // Initiate the purchase - this just starts the flow
+    final initiated = await appState.purchasePro('monthly');
 
     if (!mounted) return;
 
-    if (success) {
-      widget.onTrialStarted?.call();
-      _showSuccessAndDismiss();
-    } else {
+    // If purchase flow couldn't even start, show error
+    if (!initiated) {
+      _purchaseSubscription?.cancel();
       setState(() => _isStartingTrial = false);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: const Text('Failed to start trial. Please try again.'),
+          content: const Text('Could not start purchase. Please try again.'),
           backgroundColor: AppColors.recordRed,
           behavior: SnackBarBehavior.floating,
           shape:

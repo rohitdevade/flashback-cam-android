@@ -4,6 +4,14 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flashback_cam/models/user.dart';
 import 'package:in_app_purchase/in_app_purchase.dart';
 
+/// Purchase result status
+enum PurchaseResult {
+  success,
+  cancelled,
+  error,
+  pending,
+}
+
 class SubscriptionService {
   User? _currentUser;
   final InAppPurchase _iap = InAppPurchase.instance;
@@ -17,6 +25,12 @@ class SubscriptionService {
   // Store fetched products
   Map<String, ProductDetails> _products = {};
   bool _isAvailable = false;
+
+  // Stream controller for purchase updates
+  final _purchaseResultController =
+      StreamController<PurchaseResult>.broadcast();
+  Stream<PurchaseResult> get purchaseResultStream =>
+      _purchaseResultController.stream;
 
   // Debug mode - allows purchases to work in debug builds without real IAP
   static const bool _debugPurchasesEnabled = kDebugMode;
@@ -84,13 +98,20 @@ class SubscriptionService {
       if (purchaseDetails.status == PurchaseStatus.pending) {
         // Show pending UI
         debugPrint('Purchase pending: ${purchaseDetails.productID}');
+        _purchaseResultController.add(PurchaseResult.pending);
       } else if (purchaseDetails.status == PurchaseStatus.error) {
         // Handle error
         debugPrint('Purchase error: ${purchaseDetails.error}');
+        _purchaseResultController.add(PurchaseResult.error);
+      } else if (purchaseDetails.status == PurchaseStatus.canceled) {
+        // Handle cancellation
+        debugPrint('Purchase cancelled: ${purchaseDetails.productID}');
+        _purchaseResultController.add(PurchaseResult.cancelled);
       } else if (purchaseDetails.status == PurchaseStatus.purchased ||
           purchaseDetails.status == PurchaseStatus.restored) {
         // Verify and deliver product
         await _verifyAndDeliverProduct(purchaseDetails);
+        _purchaseResultController.add(PurchaseResult.success);
       }
 
       // Complete the purchase
@@ -307,6 +328,7 @@ class SubscriptionService {
 
   void dispose() {
     _subscription?.cancel();
+    _purchaseResultController.close();
   }
 
   User get currentUser =>
