@@ -283,6 +283,22 @@ class _SettingsScreenState extends State<SettingsScreen>
       showUpgradeButton = false;
       final tierLower = proTier.toLowerCase();
       switch (tierLower) {
+        case 'trial':
+          // Google Play free trial (stored as 'trial' tier)
+          planName = 'Free Trial';
+          final expiresAt =
+              appState.subscriptionService.currentUser.proExpiresAt;
+          if (expiresAt != null) {
+            final daysLeft = expiresAt.difference(DateTime.now()).inDays;
+            planSubtitle = daysLeft == 1
+                ? '1 day left • Then $monthlyPrice/month'
+                : '$daysLeft days left • Then $monthlyPrice/month';
+          } else {
+            planSubtitle = 'Free trial • Then $monthlyPrice/month';
+          }
+          showUpgradeButton = true;
+          canUpgradeToLifetime = true;
+          break;
         case 'monthly':
           planName = 'Monthly Plan';
           planSubtitle = 'All features unlocked • No ads';

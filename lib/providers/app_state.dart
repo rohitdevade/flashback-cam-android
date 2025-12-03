@@ -830,15 +830,6 @@ class AppState extends ChangeNotifier {
     return success;
   }
 
-  /// Start a 7-day free trial
-  Future<bool> startFreeTrial() async {
-    final success = await _subscriptionService.startFreeTrial();
-    if (success) {
-      notifyListeners();
-    }
-    return success;
-  }
-
   Future<void> deleteVideo(String id) async {
     await _storageService.deleteVideo(id);
     notifyListeners();

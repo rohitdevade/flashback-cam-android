@@ -125,6 +125,13 @@ class SubscriptionService {
     // In production, verify the purchase with your backend
     // For now, we'll trust the purchase
 
+    // Ensure user is loaded before verifying purchase
+    if (_currentUser == null) {
+      debugPrint(
+          'Warning: User not loaded when verifying purchase, loading now...');
+      await _loadUser();
+    }
+
     String? tier;
     if (purchaseDetails.productID == monthlyProductId) {
       tier = 'monthly';
@@ -134,13 +141,16 @@ class SubscriptionService {
       tier = 'lifetime';
     }
 
-    if (tier != null) {
+    debugPrint('Verifying purchase for product: ${purchaseDetails.productID}');
+
+    if (tier != null && _currentUser != null) {
       DateTime? expiresAt;
       if (tier == 'monthly') {
-        expiresAt = DateTime.now().add(Duration(days: 30));
+        expiresAt = DateTime.now().add(const Duration(days: 30));
       } else if (tier == 'yearly') {
-        expiresAt = DateTime.now().add(Duration(days: 365));
+        expiresAt = DateTime.now().add(const Duration(days: 365));
       }
+      // lifetime has no expiration (null)
 
       final updatedUser = _currentUser!.copyWith(
         isPro: true,
@@ -151,24 +161,41 @@ class SubscriptionService {
 
       await _saveUser(updatedUser);
       debugPrint('Product delivered: $tier');
+    } else if (tier == null) {
+      debugPrint('Error: Unknown product ID: ${purchaseDetails.productID}');
     }
   }
 
   Future<void> _loadUser() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      final isPro = prefs.getBool('isPro') ?? false;
-      final proTier = prefs.getString('proTier');
+      var isPro = prefs.getBool('isPro') ?? false;
+      var proTier = prefs.getString('proTier');
       final proExpiresAtStr = prefs.getString('proExpiresAt');
       final trialStartedAtStr = prefs.getString('trialStartedAt');
       final trialUsed = prefs.getBool('trialUsed') ?? false;
+
+      final proExpiresAt =
+          proExpiresAtStr != null ? DateTime.parse(proExpiresAtStr) : null;
+
+      // Check if subscription has expired (for monthly/yearly, not lifetime)
+      if (isPro &&
+          proExpiresAt != null &&
+          DateTime.now().isAfter(proExpiresAt)) {
+        debugPrint('Subscription expired on ${proExpiresAt.toIso8601String()}');
+        isPro = false;
+        proTier = null;
+        // Update SharedPreferences to reflect expired status
+        await prefs.setBool('isPro', false);
+        await prefs.remove('proTier');
+        await prefs.remove('proExpiresAt');
+      }
 
       _currentUser = User(
         id: 'default_user',
         isPro: isPro,
         proTier: proTier,
-        proExpiresAt:
-            proExpiresAtStr != null ? DateTime.parse(proExpiresAtStr) : null,
+        proExpiresAt: isPro ? proExpiresAt : null,
         createdAt: DateTime.now(),
         updatedAt: DateTime.now(),
         trialStartedAt: trialStartedAtStr != null
@@ -217,6 +244,16 @@ class SubscriptionService {
   }
 
   Future<bool> purchaseSubscription(String tier) async {
+    // Ensure user is initialized
+    if (_currentUser == null) {
+      debugPrint('Error: User not initialized, loading...');
+      await _loadUser();
+      if (_currentUser == null) {
+        debugPrint('Error: Failed to load user');
+        return false;
+      }
+    }
+
     // In debug mode, simulate successful purchases for testing
     if (_debugPurchasesEnabled) {
       debugPrint('🔧 DEBUG MODE: Simulating purchase for tier: $tier');
@@ -263,6 +300,7 @@ class SubscriptionService {
     final product = _products[productId];
     if (product == null) {
       debugPrint('Product not found: $productId');
+      debugPrint('Available products: ${_products.keys.toList()}');
       return false;
     }
 
@@ -271,6 +309,7 @@ class SubscriptionService {
         productDetails: product,
       );
 
+      // Use buyNonConsumable for subscriptions and one-time purchases
       final bool success = await _iap.buyNonConsumable(
         purchaseParam: purchaseParam,
       );
@@ -352,32 +391,30 @@ class SubscriptionService {
   /// Get remaining trial days
   int get trialDaysRemaining => _currentUser?.trialDaysRemaining ?? 0;
 
-  /// Start a 7-day free trial by initiating the monthly subscription purchase
-  /// The free trial period must be configured in Google Play Console for the monthly product
-  /// After the 7-day trial, the user will be automatically charged the monthly subscription price
-  /// Returns true if the purchase flow was initiated successfully
-  Future<bool> startFreeTrial() async {
+  /// Check if user can start a free trial
+  bool get canStartTrial {
+    if (_currentUser == null) return false;
+    if (_currentUser!.isPro) return false;
+    if (_currentUser!.trialUsed) return false;
+    if (_currentUser!.isTrialActive) return false; // Already in trial
+    return true;
+  }
+
+  /// Start a free trial for the user
+  /// Returns true if trial was started successfully, false otherwise
+  Future<bool> startTrial() async {
     if (_currentUser == null) {
-      debugPrint('Cannot start trial: no user loaded');
+      debugPrint('Error: Cannot start trial - user not loaded');
+      await _loadUser();
+    }
+
+    if (!canStartTrial) {
+      debugPrint(
+          'Cannot start trial: isPro=${_currentUser?.isPro}, trialUsed=${_currentUser?.trialUsed}, isTrialActive=${_currentUser?.isTrialActive}');
       return false;
     }
 
-    // Check if user already has Pro or has used trial
-    if (_currentUser!.isPro) {
-      debugPrint('Cannot start trial: user already has Pro');
-      return false;
-    }
-
-    if (_currentUser!.trialUsed) {
-      debugPrint('Cannot start trial: trial already used');
-      return false;
-    }
-
-    // In debug mode, simulate the trial with local storage
-    if (_debugPurchasesEnabled) {
-      debugPrint('🔧 DEBUG MODE: Simulating free trial start');
-      await Future.delayed(const Duration(seconds: 1));
-
+    try {
       final updatedUser = _currentUser!.copyWith(
         trialStartedAt: DateTime.now(),
         trialUsed: true,
@@ -385,32 +422,18 @@ class SubscriptionService {
       );
 
       await _saveUser(updatedUser);
-      debugPrint('✅ DEBUG MODE: Free trial started successfully');
+      debugPrint('✅ Free trial started successfully');
       return true;
+    } catch (e) {
+      debugPrint('Failed to start trial: $e');
+      return false;
     }
-
-    // In production, initiate the monthly subscription purchase
-    // The 7-day free trial is configured in Google Play Console
-    // Google handles the trial period and auto-charges after 7 days
-    debugPrint('Starting free trial via monthly subscription purchase...');
-
-    // Mark trial as used before purchase to prevent abuse
-    // This will be saved permanently even if purchase is cancelled
-    final updatedUser = _currentUser!.copyWith(
-      trialUsed: true,
-      updatedAt: DateTime.now(),
-    );
-    await _saveUser(updatedUser);
-
-    // Initiate the monthly subscription purchase (with free trial from Google Play)
-    return await purchaseSubscription('monthly');
   }
 
-  /// Check if user can start a free trial
-  bool get canStartTrial {
-    if (_currentUser == null) return false;
-    if (_currentUser!.isPro) return false;
-    if (_currentUser!.trialUsed) return false;
-    return true;
+  /// Check subscription status and refresh if needed
+  Future<void> refreshSubscriptionStatus() async {
+    await _loadUser();
+    debugPrint(
+        'Subscription status refreshed: isPro=$isPro, hasProAccess=$hasProAccess');
   }
 }
