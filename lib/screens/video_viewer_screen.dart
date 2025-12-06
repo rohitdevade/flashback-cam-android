@@ -45,6 +45,8 @@ class _VideoViewerScreenState extends State<VideoViewerScreen> {
     if (appState.isPro) return; // Don't show ads for pro users
 
     _bannerAd = appState.adService.createVideoPlayerBannerAd();
+    if (_bannerAd == null) return; // No consent for ads
+
     _bannerAd!.load().then((_) {
       if (mounted) {
         setState(() => _isBannerAdLoaded = true);

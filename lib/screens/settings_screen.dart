@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:google_mobile_ads/google_mobile_ads.dart' hide AppState;
+import 'package:url_launcher/url_launcher.dart';
 import 'package:flashback_cam/providers/app_state.dart';
 import 'package:flashback_cam/models/app_settings.dart';
 import 'package:flashback_cam/theme.dart';
@@ -47,6 +48,8 @@ class _SettingsScreenState extends State<SettingsScreen>
     if (appState.isPro) return; // Don't show ads for pro users
 
     _bannerAd = appState.adService.createSettingsBannerAd();
+    if (_bannerAd == null) return; // No consent for ads
+
     _bannerAd!.load().then((_) {
       if (mounted) {
         setState(() => _isBannerAdLoaded = true);
@@ -723,6 +726,24 @@ class _SettingsScreenState extends State<SettingsScreen>
                 color: AppColors.textSecondary, size: 20),
           ),
           const Divider(height: 1, color: AppColors.glassBorder),
+          // Ad Privacy Preferences (GDPR/UMP consent)
+          FutureBuilder<bool>(
+            future: appState.adService.isPrivacyOptionsRequired(),
+            builder: (context, snapshot) {
+              if (snapshot.data != true) return const SizedBox.shrink();
+              return Column(
+                children: [
+                  _buildSettingTile(
+                    icon: Icons.ads_click_outlined,
+                    title: 'Ad Preferences',
+                    subtitle: 'Manage personalized ad settings',
+                    onTap: () => _showAdPrivacyOptions(context, appState),
+                  ),
+                  const Divider(height: 1, color: AppColors.glassBorder),
+                ],
+              );
+            },
+          ),
           _buildSettingTile(
             icon: Icons.description_outlined,
             title: 'Terms of Service',
@@ -739,6 +760,18 @@ class _SettingsScreenState extends State<SettingsScreen>
             onTap: () => _restorePurchases(context, appState),
           ),
           const Divider(height: 1, color: AppColors.glassBorder),
+          // Show Manage Subscription only for Pro users
+          if (appState.isPro) ...[
+            _buildSettingTile(
+              icon: Icons.subscriptions_outlined,
+              title: 'Manage Subscription',
+              subtitle: 'Cancel or modify in Google Play',
+              onTap: () => _openSubscriptionManagement(),
+              trailing: const Icon(Icons.open_in_new,
+                  color: AppColors.textSecondary, size: 20),
+            ),
+            const Divider(height: 1, color: AppColors.glassBorder),
+          ],
           _buildSettingTile(
             icon: Icons.info_outline,
             title: 'App Version',
@@ -1274,6 +1307,31 @@ class _SettingsScreenState extends State<SettingsScreen>
     );
   }
 
+  /// Show ad privacy options using UMP consent form
+  Future<void> _showAdPrivacyOptions(
+      BuildContext context, AppState appState) async {
+    try {
+      await appState.adService.showPrivacyOptionsForm();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Ad preferences updated'),
+            backgroundColor: AppColors.successGreen,
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to update ad preferences: $e'),
+            backgroundColor: AppColors.recordRed,
+          ),
+        );
+      }
+    }
+  }
+
   void _showInfo(BuildContext context, String title) {
     if (title == 'Privacy Policy') {
       _showPrivacyPolicy(context);
@@ -1691,6 +1749,37 @@ class _SettingsScreenState extends State<SettingsScreen>
             height: 1.6,
           ),
     );
+  }
+
+  /// Open Google Play subscription management page
+  Future<void> _openSubscriptionManagement() async {
+    const subscriptionUrl =
+        'https://play.google.com/store/account/subscriptions';
+    final uri = Uri.parse(subscriptionUrl);
+
+    try {
+      if (await canLaunchUrl(uri)) {
+        await launchUrl(uri, mode: LaunchMode.externalApplication);
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Could not open subscription management'),
+              backgroundColor: AppColors.recordRed,
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error: $e'),
+            backgroundColor: AppColors.recordRed,
+          ),
+        );
+      }
+    }
   }
 
   void _restorePurchases(BuildContext context, AppState appState) async {

@@ -55,6 +55,8 @@ class _GalleryScreenState extends State<GalleryScreen>
     if (appState.isPro) return; // Don't show ads for pro users
 
     _bannerAd = appState.adService.createGalleryBannerAd();
+    if (_bannerAd == null) return; // No consent for ads
+
     _bannerAd!.load().then((_) {
       if (mounted) {
         setState(() => _isBannerAdLoaded = true);

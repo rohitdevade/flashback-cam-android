@@ -10,17 +10,22 @@ void main() {
 
   WidgetsFlutterBinding.ensureInitialized();
 
+  // Use edge-to-edge mode for Android 15+ compatibility
+  // This replaces deprecated setStatusBarColor/setNavigationBarColor APIs
   SystemChrome.setEnabledSystemUIMode(
-    SystemUiMode.immersiveSticky,
-    overlays: [],
+    SystemUiMode.edgeToEdge,
   );
 
-  // Hide system UI overlays for full-screen camera experience
+  // Configure system UI overlay style for edge-to-edge
+  // On Android 15+, these are hints rather than hard settings
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+    // Use transparent to let content draw behind system bars
     statusBarColor: Colors.transparent,
     statusBarIconBrightness: Brightness.light,
+    // For Android 15+ edge-to-edge, navigation bar should be transparent
     systemNavigationBarColor: Colors.transparent,
     systemNavigationBarIconBrightness: Brightness.light,
+    systemNavigationBarDividerColor: Colors.transparent,
   ));
 
   print('===== ABOUT TO RUN APP =====');
@@ -52,7 +57,9 @@ class FlashbackCamApp extends StatelessWidget {
         // Global error handling
         builder: (context, child) {
           return MediaQuery(
-            data: MediaQuery.of(context).copyWith(textScaleFactor: 1.0),
+            data: MediaQuery.of(context).copyWith(
+              textScaler: TextScaler.noScaling,
+            ),
             child: child!,
           );
         },

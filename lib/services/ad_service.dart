@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:google_mobile_ads/google_mobile_ads.dart';
@@ -11,6 +12,10 @@ class AdService {
   int _galleryVisitCount = 0;
   static const int _showAdEveryNthGalleryVisit =
       3; // Show ad every 3rd gallery visit
+
+  // UMP Consent status
+  bool _consentGathered = false;
+  bool _canShowAds = false;
 
   // Production Ad IDs for AdMob
   // Android Production IDs
@@ -41,15 +46,203 @@ class AdService {
     return '';
   }
 
+  /// Check if we can request ads based on consent status
+  bool get canShowAds => _canShowAds;
+
+  /// Check if consent has been gathered
+  bool get consentGathered => _consentGathered;
+
   Future<void> initialize() async {
     debugPrint('AdService: Initializing Mobile Ads SDK...');
+
+    // First, gather consent using UMP before loading any ads
+    await _gatherConsent();
+
+    // Initialize Mobile Ads SDK
     await MobileAds.instance.initialize();
     debugPrint('AdService: Mobile Ads SDK initialized');
-    await loadInterstitialAd();
+
+    // Only load ads if we can show them
+    if (_canShowAds) {
+      await loadInterstitialAd();
+    } else {
+      debugPrint(
+          'AdService: Cannot show ads - consent not given or not required');
+    }
+  }
+
+  /// Gather user consent using UMP (User Messaging Platform)
+  /// This is required for GDPR compliance in EU/EEA
+  Future<void> _gatherConsent() async {
+    debugPrint('AdService: Gathering user consent...');
+
+    final completer = Completer<void>();
+
+    // Configure consent request parameters
+    final params = ConsentRequestParameters();
+
+    // For testing purposes in debug mode, you can enable test geography
+    // Uncomment the following lines to test consent flow:
+    // if (kDebugMode) {
+    //   final debugSettings = ConsentDebugSettings(
+    //     debugGeography: DebugGeography.debugGeographyEea,
+    //     testIdentifiers: ['YOUR_TEST_DEVICE_ID'], // Add your test device ID
+    //   );
+    //   params = ConsentRequestParameters(consentDebugSettings: debugSettings);
+    // }
+
+    // Request consent info update
+    ConsentInformation.instance.requestConsentInfoUpdate(
+      params,
+      () async {
+        debugPrint('AdService: Consent info updated successfully');
+
+        // Check if consent form is available and required
+        if (await ConsentInformation.instance.isConsentFormAvailable()) {
+          debugPrint('AdService: Consent form is available');
+          await _loadAndShowConsentFormIfRequired();
+        } else {
+          debugPrint('AdService: Consent form is not available');
+        }
+
+        // Update consent status
+        await _updateConsentStatus();
+        _consentGathered = true;
+
+        if (!completer.isCompleted) completer.complete();
+      },
+      (FormError error) {
+        debugPrint('AdService: Consent info update failed: ${error.message}');
+        // Even if consent update fails, we might still be able to show ads
+        // (e.g., in regions where consent is not required)
+        _updateConsentStatus();
+        _consentGathered = true;
+
+        if (!completer.isCompleted) completer.complete();
+      },
+    );
+
+    // Wait for consent gathering with timeout
+    await completer.future.timeout(
+      const Duration(seconds: 10),
+      onTimeout: () {
+        debugPrint('AdService: Consent gathering timed out');
+        _consentGathered = true;
+        _updateConsentStatus();
+      },
+    );
+  }
+
+  /// Load and show consent form if required
+  Future<void> _loadAndShowConsentFormIfRequired() async {
+    final status = await ConsentInformation.instance.getConsentStatus();
+    debugPrint('AdService: Current consent status: $status');
+
+    if (status == ConsentStatus.required) {
+      debugPrint('AdService: Consent is required, loading form...');
+
+      final completer = Completer<void>();
+
+      ConsentForm.loadConsentForm(
+        (ConsentForm consentForm) async {
+          debugPrint('AdService: Consent form loaded');
+
+          // Show the consent form
+          consentForm.show((FormError? formError) {
+            if (formError != null) {
+              debugPrint(
+                  'AdService: Error showing consent form: ${formError.message}');
+            } else {
+              debugPrint('AdService: Consent form shown and dismissed');
+            }
+            if (!completer.isCompleted) completer.complete();
+          });
+        },
+        (FormError error) {
+          debugPrint(
+              'AdService: Failed to load consent form: ${error.message}');
+          if (!completer.isCompleted) completer.complete();
+        },
+      );
+
+      await completer.future.timeout(
+        const Duration(seconds: 30),
+        onTimeout: () {
+          debugPrint('AdService: Consent form display timed out');
+        },
+      );
+    }
+  }
+
+  /// Update the consent status and determine if we can show ads
+  Future<void> _updateConsentStatus() async {
+    final status = await ConsentInformation.instance.getConsentStatus();
+    debugPrint('AdService: Final consent status: $status');
+
+    // Check if we can request ads
+    // We can show ads if:
+    // 1. Consent is not required (non-EEA users)
+    // 2. Consent was obtained
+    // 3. Consent status is unknown (we'll try to show ads)
+    _canShowAds = status == ConsentStatus.notRequired ||
+        status == ConsentStatus.obtained ||
+        status == ConsentStatus.unknown;
+
+    debugPrint('AdService: Can show ads: $_canShowAds');
+  }
+
+  /// Allow user to change consent preferences (for privacy settings)
+  Future<void> showPrivacyOptionsForm() async {
+    final status =
+        await ConsentInformation.instance.getPrivacyOptionsRequirementStatus();
+    debugPrint('AdService: Privacy options requirement status: $status');
+
+    if (status == PrivacyOptionsRequirementStatus.required) {
+      final completer = Completer<void>();
+
+      ConsentForm.showPrivacyOptionsForm((FormError? formError) {
+        if (formError != null) {
+          debugPrint(
+              'AdService: Error showing privacy options: ${formError.message}');
+        } else {
+          debugPrint('AdService: Privacy options form dismissed');
+        }
+        // Update consent status after user changes preferences
+        _updateConsentStatus();
+        if (!completer.isCompleted) completer.complete();
+      });
+
+      await completer.future;
+    } else {
+      debugPrint('AdService: Privacy options form not required');
+    }
+  }
+
+  /// Check if privacy options form should be shown in settings
+  Future<bool> isPrivacyOptionsRequired() async {
+    final status =
+        await ConsentInformation.instance.getPrivacyOptionsRequirementStatus();
+    return status == PrivacyOptionsRequirementStatus.required;
+  }
+
+  /// Reset consent for testing purposes (debug only)
+  Future<void> resetConsent() async {
+    if (kDebugMode) {
+      debugPrint('AdService: Resetting consent information');
+      await ConsentInformation.instance.reset();
+      _consentGathered = false;
+      _canShowAds = false;
+    }
   }
 
   Future<void> loadInterstitialAd() async {
     if (_interstitialAd != null) return;
+
+    // Check consent before loading ads
+    if (!_canShowAds) {
+      debugPrint('AdService: Cannot load interstitial ad - no consent');
+      return;
+    }
 
     debugPrint('AdService: Loading interstitial ad...');
     await InterstitialAd.load(
@@ -89,6 +282,12 @@ class AdService {
   }
 
   Future<void> showInterstitialAd() async {
+    // Check consent before showing ads
+    if (!_canShowAds) {
+      debugPrint('AdService: Cannot show interstitial ad - no consent');
+      return;
+    }
+
     if (!_isInterstitialAdLoaded || _interstitialAd == null) {
       debugPrint('AdService: Interstitial ad not loaded, loading now...');
       await loadInterstitialAd();
@@ -116,7 +315,14 @@ class AdService {
   }
 
   /// Create and return a banner ad for gallery screen
-  BannerAd createGalleryBannerAd() {
+  /// Returns null if consent is not given
+  BannerAd? createGalleryBannerAd() {
+    // Check consent before creating ads
+    if (!_canShowAds) {
+      debugPrint('AdService: Cannot create gallery banner ad - no consent');
+      return null;
+    }
+
     _galleryBannerAd?.dispose();
     _galleryBannerAd = BannerAd(
       adUnitId: _bannerAdUnitId,
@@ -139,7 +345,14 @@ class AdService {
   }
 
   /// Create and return a banner ad for settings screen
-  BannerAd createSettingsBannerAd() {
+  /// Returns null if consent is not given
+  BannerAd? createSettingsBannerAd() {
+    // Check consent before creating ads
+    if (!_canShowAds) {
+      debugPrint('AdService: Cannot create settings banner ad - no consent');
+      return null;
+    }
+
     _settingsBannerAd?.dispose();
     _settingsBannerAd = BannerAd(
       adUnitId: _bannerAdUnitId,
@@ -162,7 +375,15 @@ class AdService {
   }
 
   /// Create and return a banner ad for video player screen
-  BannerAd createVideoPlayerBannerAd() {
+  /// Returns null if consent is not given
+  BannerAd? createVideoPlayerBannerAd() {
+    // Check consent before creating ads
+    if (!_canShowAds) {
+      debugPrint(
+          'AdService: Cannot create video player banner ad - no consent');
+      return null;
+    }
+
     _videoPlayerBannerAd?.dispose();
     _videoPlayerBannerAd = BannerAd(
       adUnitId: _bannerAdUnitId,
