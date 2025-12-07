@@ -309,10 +309,21 @@ class SubscriptionService {
         productDetails: product,
       );
 
-      // Use buyNonConsumable for subscriptions and one-time purchases
-      final bool success = await _iap.buyNonConsumable(
-        purchaseParam: purchaseParam,
-      );
+      bool success;
+      if (tier == 'lifetime') {
+        // Use buyNonConsumable for one-time lifetime purchase
+        success = await _iap.buyNonConsumable(
+          purchaseParam: purchaseParam,
+        );
+      } else {
+        // Use buyNonConsumable for subscriptions (Google Play handles subscription logic)
+        // Note: in_app_purchase plugin uses buyNonConsumable for both subscriptions and
+        // non-consumables on Android. The product type is determined by how you set it up
+        // in Google Play Console (subscription vs in-app product).
+        success = await _iap.buyNonConsumable(
+          purchaseParam: purchaseParam,
+        );
+      }
 
       return success;
     } catch (e) {

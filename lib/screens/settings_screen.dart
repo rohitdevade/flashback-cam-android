@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:google_mobile_ads/google_mobile_ads.dart' hide AppState;
 import 'package:url_launcher/url_launcher.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:flashback_cam/providers/app_state.dart';
 import 'package:flashback_cam/models/app_settings.dart';
 import 'package:flashback_cam/theme.dart';
@@ -27,6 +28,7 @@ class _SettingsScreenState extends State<SettingsScreen>
   bool _isLoadingCapabilities = true;
   BannerAd? _bannerAd;
   bool _isBannerAdLoaded = false;
+  String _appVersion = '';
 
   @override
   void initState() {
@@ -41,6 +43,16 @@ class _SettingsScreenState extends State<SettingsScreen>
     _fadeController.forward();
     _loadCapabilities();
     _loadBannerAd();
+    _loadAppVersion();
+  }
+
+  Future<void> _loadAppVersion() async {
+    final packageInfo = await PackageInfo.fromPlatform();
+    if (mounted) {
+      setState(() {
+        _appVersion = '${packageInfo.version} (${packageInfo.buildNumber})';
+      });
+    }
   }
 
   void _loadBannerAd() {
@@ -775,7 +787,7 @@ class _SettingsScreenState extends State<SettingsScreen>
           _buildSettingTile(
             icon: Icons.info_outline,
             title: 'App Version',
-            subtitle: '1.0.0',
+            subtitle: _appVersion.isEmpty ? 'Loading...' : _appVersion,
             onTap: () => _onVersionTap(),
             trailing: _showDeveloperOptions
                 ? const Icon(Icons.developer_mode,
