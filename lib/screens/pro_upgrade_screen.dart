@@ -550,6 +550,10 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
         case PurchaseResult.error:
           _showErrorDialog(context, 'Purchase failed. Please try again.');
           break;
+        case PurchaseResult.verificationFailed:
+          _showErrorDialog(context,
+              'Purchase verification failed. Please contact support if you were charged.');
+          break;
         case PurchaseResult.pending:
           // Keep showing loading - purchase is being processed
           break;
