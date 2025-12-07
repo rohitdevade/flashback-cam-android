@@ -241,6 +241,12 @@ class AppState extends ChangeNotifier {
     // Only request the core permissions needed to show the system prompt.
     // Storage/media access is handled later (e.g. when exporting videos).
     final permissions = [Permission.camera, Permission.microphone];
+
+    // On Android 13+ (API 33+), we need notification permission for buffer indicator
+    if (Platform.isAndroid) {
+      permissions.add(Permission.notification);
+    }
+
     final statusMap = <Permission, PermissionStatus>{};
 
     bool granted = true;
@@ -256,10 +262,15 @@ class AppState extends ChangeNotifier {
       }
 
       statusMap[permission] = status;
-      if (status.isPermanentlyDenied) {
+
+      // Notification permission is optional - app works without it (just no buffer notification)
+      // Only block app if core permissions (camera/microphone) are denied
+      final isOptionalPermission = permission == Permission.notification;
+
+      if (status.isPermanentlyDenied && !isOptionalPermission) {
         permanentlyDenied = true;
       }
-      if (!status.isGranted) {
+      if (!status.isGranted && !isOptionalPermission) {
         granted = false;
       }
     }

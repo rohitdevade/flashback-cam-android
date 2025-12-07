@@ -2218,6 +2218,12 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
             isBuffering = true
             bufferSeconds = 0
 
+            // ═══════════════════════════════════════════════════════════════════
+            // START FOREGROUND SERVICE - Shows notification to user
+            // Required by Google Play policy for continuous camera use
+            // ═══════════════════════════════════════════════════════════════════
+            BufferForegroundService.start(context, preRollSeconds)
+
             activeCaptureProfile?.let {
                 Log.d(
                     TAG,
@@ -2924,6 +2930,11 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
             isBuffering = false
             bufferUpdateTask?.cancel()
             bufferUpdateTask = null
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // STOP FOREGROUND SERVICE - Remove notification
+            // ═══════════════════════════════════════════════════════════════════
+            BufferForegroundService.stop(context)
             
             synchronized(bufferFrames) {
                 bufferFrames.clear()
