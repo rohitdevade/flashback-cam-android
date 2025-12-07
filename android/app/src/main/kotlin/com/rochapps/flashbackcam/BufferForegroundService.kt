@@ -172,17 +172,29 @@ class BufferForegroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        // Build notification - setOngoing(true) makes it non-dismissible for foreground services
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Buffer Active")
             .setContentText("Recording last ${seconds}s • Tap record to save")
             .setSmallIcon(R.drawable.ic_buffer_notification)
-            .setOngoing(true)  // Cannot be swiped away
+            .setOngoing(true)  // CRITICAL: Cannot be swiped away
+            .setAutoCancel(false)  // Don't dismiss when tapped
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setContentIntent(pendingIntent)
             .setColor(0xFF2196F3.toInt())  // Material blue
             .setOnlyAlertOnce(true)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .build()
+        
+        // Explicitly set flags to ensure non-dismissible behavior
+        notification.flags = notification.flags or 
+            Notification.FLAG_ONGOING_EVENT or 
+            Notification.FLAG_NO_CLEAR or
+            Notification.FLAG_FOREGROUND_SERVICE
+        
+        return notification
     }
     
     /**
