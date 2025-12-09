@@ -156,6 +156,8 @@ class AppState extends ChangeNotifier {
     }
     _isInitializing = true;
     try {
+      // Initialize critical services that camera needs (storage, settings)
+      // and non-critical services (subscription, ads) in parallel
       await Future.wait([
         _storageService.initialize(),
         _subscriptionService.initialize(),
@@ -192,8 +194,12 @@ class AppState extends ChangeNotifier {
 
       debugPrint('Camera initialized, waiting for camera device to open...');
 
-      // Wait for camera to fully open
-      await Future.delayed(Duration(milliseconds: 800));
+      // Wait for native 'cameraOpened' event instead of fixed delay
+      // Falls back to proceeding after timeout if event not received
+      final cameraReady = await _cameraService.waitForCameraReady(
+        timeout: const Duration(seconds: 3),
+      );
+      debugPrint('Camera ready: $cameraReady');
 
       debugPrint('Creating preview texture...');
 
@@ -207,14 +213,15 @@ class AppState extends ChangeNotifier {
       debugPrint('Preview texture created: $_previewTextureId');
       notifyListeners(); // Update UI to show texture
 
-      // Wait a bit longer for texture to be fully ready
-      await Future.delayed(Duration(milliseconds: 200));
-
       // Start preview (this will create the capture session)
       debugPrint('Starting camera preview...');
       await _cameraService.startPreview();
 
-      debugPrint('Preview started successfully');
+      // Wait for native 'previewStarted' event instead of fixed delay
+      final previewReady = await _cameraService.waitForPreviewReady(
+        timeout: const Duration(seconds: 3),
+      );
+      debugPrint('Preview ready: $previewReady');
 
       // Fetch max zoom from camera
       debugPrint('Fetching max zoom from camera...');
@@ -448,6 +455,10 @@ class AppState extends ChangeNotifier {
           break;
         case 'recovered':
           debugPrint('Recovered video: ${event['video']}');
+          break;
+        case 'cameraOpened':
+          debugPrint('Camera device opened');
+          // This event is handled by waitForCameraReady() during initialization
           break;
         case 'previewStarted':
           debugPrint('Camera preview started');

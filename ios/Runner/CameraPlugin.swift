@@ -130,6 +130,8 @@ public class CameraPlugin: NSObject, FlutterPlugin, AVCaptureFileOutputRecording
             initialize(call: call, result: result)
         case "startBuffer", "startPreview":
             startSession(result: result)
+            // Send cameraOpened event to match Android behavior
+            sendEvent(event: "cameraOpened", data: [:])
         case "stopBuffer":
             stopSession(result: result)
         case "startRecording":

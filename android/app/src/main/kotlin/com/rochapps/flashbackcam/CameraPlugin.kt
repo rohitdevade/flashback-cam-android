@@ -1883,6 +1883,9 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                     cameraOpenCloseLock.release()
                     cameraDevice = camera
                     
+                    // Notify Flutter that camera hardware is ready
+                    sendEvent("cameraOpened", null)
+                    
                     // Only create session if preview surface already exists
                     // Otherwise wait for startPreview() to be called
                     if (previewSurface != null) {

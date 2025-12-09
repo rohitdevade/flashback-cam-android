@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart';
 
@@ -431,6 +432,85 @@ class CameraService {
       }
     });
     return _eventStream!;
+  }
+
+  /// Wait for the camera hardware to be ready (camera device opened).
+  /// Returns true if camera opened successfully, false on timeout.
+  /// Uses the native 'cameraOpened' event instead of fixed delays.
+  Future<bool> waitForCameraReady(
+      {Duration timeout = const Duration(seconds: 5)}) async {
+    try {
+      debugPrint('Waiting for camera to be ready...');
+      final completer = Completer<bool>();
+
+      late final StreamSubscription<Map<String, dynamic>> subscription;
+      Timer? timeoutTimer;
+
+      subscription = eventStream.listen((event) {
+        final eventType = event['type'] as String?;
+        if (eventType == 'cameraOpened') {
+          debugPrint('Camera opened event received');
+          timeoutTimer?.cancel();
+          if (!completer.isCompleted) {
+            completer.complete(true);
+          }
+          subscription.cancel();
+        }
+      });
+
+      // Set up timeout
+      timeoutTimer = Timer(timeout, () {
+        debugPrint('Camera ready timeout - proceeding anyway');
+        if (!completer.isCompleted) {
+          completer.complete(false);
+        }
+        subscription.cancel();
+      });
+
+      return await completer.future;
+    } catch (e) {
+      debugPrint('Error waiting for camera ready: $e');
+      return false;
+    }
+  }
+
+  /// Wait for the preview to be started (capture session configured).
+  /// Returns true if preview started successfully, false on timeout.
+  Future<bool> waitForPreviewReady(
+      {Duration timeout = const Duration(seconds: 5)}) async {
+    try {
+      debugPrint('Waiting for preview to be ready...');
+      final completer = Completer<bool>();
+
+      late final StreamSubscription<Map<String, dynamic>> subscription;
+      Timer? timeoutTimer;
+
+      subscription = eventStream.listen((event) {
+        final eventType = event['type'] as String?;
+        if (eventType == 'previewStarted') {
+          debugPrint('Preview started event received');
+          timeoutTimer?.cancel();
+          if (!completer.isCompleted) {
+            completer.complete(true);
+          }
+          subscription.cancel();
+        }
+      });
+
+      // Set up timeout
+      timeoutTimer = Timer(timeout, () {
+        debugPrint('Preview ready timeout - proceeding anyway');
+        if (!completer.isCompleted) {
+          completer.complete(false);
+        }
+        subscription.cancel();
+      });
+
+      return await completer.future;
+    } catch (e) {
+      debugPrint('Error waiting for preview ready: $e');
+      return false;
+    }
   }
 
   // Helper method to recursively convert Maps
