@@ -10,22 +10,16 @@ void main() {
 
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Use edge-to-edge mode for Android 15+ compatibility
-  // This replaces deprecated setStatusBarColor/setNavigationBarColor APIs
+  // Enable edge-to-edge mode (configured in Android styles.xml for Android 15+)
   SystemChrome.setEnabledSystemUIMode(
     SystemUiMode.edgeToEdge,
   );
 
-  // Configure system UI overlay style for edge-to-edge
-  // On Android 15+, these are hints rather than hard settings
+  // Set only the icon brightness for system UI
+  // Colors are now handled by Android theme (non-deprecated approach)
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
-    // Use transparent to let content draw behind system bars
-    statusBarColor: Colors.transparent,
     statusBarIconBrightness: Brightness.light,
-    // For Android 15+ edge-to-edge, navigation bar should be transparent
-    systemNavigationBarColor: Colors.transparent,
     systemNavigationBarIconBrightness: Brightness.light,
-    systemNavigationBarDividerColor: Colors.transparent,
   ));
 
   print('===== ABOUT TO RUN APP =====');
