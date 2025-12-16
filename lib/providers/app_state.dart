@@ -211,29 +211,35 @@ class AppState extends ChangeNotifier {
       }
 
       debugPrint('Preview texture created: $_previewTextureId');
-      notifyListeners(); // Update UI to show texture
+
+      // Mark as initialized and ready as soon as preview texture is created
+      // This enables the buffer button immediately when camera is visible
+      _initializationError = null;
+      _isInitialized = true;
+      _cameraMode = CameraMode.idle; // Start in IDLE state with preview ON
+      notifyListeners(); // Update UI to show texture and enable controls
+
+      debugPrint('✅ App initialized in IDLE mode - preview ON, buffer OFF');
 
       // Start preview (this will create the capture session)
       debugPrint('Starting camera preview...');
       await _cameraService.startPreview();
 
-      // Wait for native 'previewStarted' event instead of fixed delay
-      final previewReady = await _cameraService.waitForPreviewReady(
+      // Wait for native 'previewStarted' event (non-blocking for UI)
+      // This is just for logging/debugging, UI is already enabled
+      _cameraService
+          .waitForPreviewReady(
         timeout: const Duration(seconds: 3),
-      );
-      debugPrint('Preview ready: $previewReady');
+      )
+          .then((previewReady) {
+        debugPrint('Preview ready: $previewReady');
+      });
 
-      // Fetch max zoom from camera
+      // Fetch max zoom from camera (non-blocking for UI readiness)
       debugPrint('Fetching max zoom from camera...');
       _maxZoom = await _cameraService.getMaxZoom();
       debugPrint('🔍 Max zoom updated to: $_maxZoom');
-
-      _initializationError = null;
-      _isInitialized = true;
-      _cameraMode = CameraMode.idle; // Start in IDLE state with preview ON
       notifyListeners();
-
-      debugPrint('✅ App initialized in IDLE mode - preview ON, buffer OFF');
     } catch (e, stackTrace) {
       debugPrint('Failed to initialize app state: $e');
       debugPrint('Stack trace: $stackTrace');
