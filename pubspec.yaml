@@ -1,7 +1,8 @@
+
 name: flashback_cam
 description: "Capture every moment, even the ones you almost missed, with Flashback Cam – the innovative pre-roll camera app that ensures you never lose a memory!"
 publish_to: "none"
-version: 1.0.19+22
+version: 1.0.22+25
 
 environment:
   sdk: ^3.6.0
@@ -19,8 +20,8 @@ dependencies:
   share_plus: ^10.0.0
   permission_handler: ^11.3.1
   path: ^1.9.0
-  in_app_purchase: ^3.2.0
-  in_app_purchase_android: ^0.3.6+11
+  in_app_purchase: ^3.2.3
+  in_app_purchase_android: ^0.4.0+8
   google_mobile_ads: ^6.0.0
   wakelock_plus: ^1.2.8
   url_launcher: ^6.3.1
