@@ -12,6 +12,8 @@ import 'package:flashback_cam/services/storage_service.dart';
 import 'package:flashback_cam/services/subscription_service.dart';
 import 'package:flashback_cam/services/ad_service.dart';
 import 'package:flashback_cam/services/settings_service.dart';
+import 'package:flashback_cam/services/rating_service.dart';
+import 'package:flashback_cam/services/paywall_service.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 enum CameraMode {
@@ -28,6 +30,8 @@ class AppState extends ChangeNotifier {
   late final SubscriptionService _subscriptionService;
   final AdService _adService = AdService();
   final SettingsService _settingsService = SettingsService();
+  final RatingService _ratingService = RatingService();
+  final PaywallService _paywallService = PaywallService();
 
   // Expose AdService for screens that need banner ads
   AdService get adService => _adService;
@@ -157,12 +161,14 @@ class AppState extends ChangeNotifier {
     _isInitializing = true;
     try {
       // Initialize critical services that camera needs (storage, settings)
-      // and non-critical services (subscription, ads) in parallel
+      // and non-critical services (subscription, ads, rating, paywall) in parallel
       await Future.wait([
         _storageService.initialize(),
         _subscriptionService.initialize(),
         _adService.initialize(),
         _settingsService.initialize(),
+        _ratingService.initialize(),
+        _paywallService.initialize(),
       ]);
 
       final hasPermissions = await _ensureRequiredPermissions();
@@ -523,6 +529,9 @@ class AppState extends ChangeNotifier {
 
       _storageService.addVideo(video);
       debugPrint('Added video to gallery: ${video.id}');
+
+      // Track video save for rating/paywall services
+      onVideoSaved();
     } catch (e) {
       debugPrint('Failed to add video from event: $e');
       debugPrint('Video data: $videoData');
@@ -970,12 +979,66 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // RATING & PAYWALL SERVICES
+  // ═══════════════════════════════════════════════════════════════════════════════
+
+  /// Rating service for managing app rating prompts
+  RatingService get ratingService => _ratingService;
+
+  /// Paywall service for managing lifetime offer triggers
+  PaywallService get paywallService => _paywallService;
+
+  /// Check if buffer selection should trigger paywall (for free users)
+  bool shouldShowPaywallForBuffer(int seconds) {
+    if (isPro) return false;
+    return _paywallService.shouldTriggerBufferPaywall(seconds);
+  }
+
+  /// Check if Day 3 paywall should be shown (call on app open)
+  bool shouldShowDayThreePaywall() {
+    if (isPro) return false;
+    return _paywallService.shouldTriggerDayThreePaywall();
+  }
+
+  /// Record video saved and check for paywall/rating triggers
+  /// Call this after a successful video save
+  Future<void> onVideoSaved() async {
+    // Record for rating service
+    await _ratingService.recordVideoSaved();
+
+    // Record for paywall service (only matters for free users)
+    if (!isPro) {
+      await _paywallService.recordVideoSaved();
+    }
+
+    debugPrint(
+        '📊 Video saved tracked: rating=${_ratingService.savedVideoCount}, paywall=${_paywallService.savedVideoCount}');
+  }
+
+  /// Check if video save limit paywall should trigger (for free users)
+  bool shouldShowVideoLimitPaywall() {
+    if (isPro) return false;
+    return _paywallService.shouldTriggerVideoLimitPaywall();
+  }
+
+  /// Check if rating popup should be shown after video save
+  bool shouldShowRatingPopup() {
+    // Don't show during recording, buffering, or processing
+    if (_cameraMode != CameraMode.idle && _cameraMode != CameraMode.buffering) {
+      return false;
+    }
+    return _ratingService.shouldShowRatingPopup();
+  }
+
   @override
   void dispose() {
     _progressTimer?.cancel();
     _cameraService.dispose();
     _adService.dispose();
     _subscriptionService.dispose();
+    _ratingService.dispose();
+    _paywallService.dispose();
     super.dispose();
   }
 }

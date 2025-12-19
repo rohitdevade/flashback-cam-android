@@ -31,6 +31,47 @@ class PurchaseVerificationResult {
   });
 }
 
+/// Lifetime pricing information fetched from Play Console
+/// All prices are fetched from Google Play - NO hardcoded values
+class LifetimePricing {
+  /// The discounted/current price to pay (formatted with currency symbol)
+  final String discountedPrice;
+
+  /// Raw discounted price value for comparison
+  final double discountedRawPrice;
+
+  /// Original price before discount (formatted with currency symbol)
+  /// Null if no discount is active
+  final String? originalPrice;
+
+  /// Raw original price value for comparison
+  /// Null if no discount is active
+  final double? originalRawPrice;
+
+  /// Currency code (e.g., "USD", "INR")
+  final String currencyCode;
+
+  /// Whether a discount is currently active (determined by comparing prices)
+  final bool hasActiveDiscount;
+
+  LifetimePricing({
+    required this.discountedPrice,
+    required this.discountedRawPrice,
+    this.originalPrice,
+    this.originalRawPrice,
+    required this.currencyCode,
+    required this.hasActiveDiscount,
+  });
+
+  @override
+  String toString() {
+    if (hasActiveDiscount) {
+      return 'LifetimePricing(discounted: $discountedPrice, original: $originalPrice, currency: $currencyCode)';
+    }
+    return 'LifetimePricing(price: $discountedPrice, currency: $currencyCode, no discount)';
+  }
+}
+
 class SubscriptionService {
   User? _currentUser;
   final InAppPurchase _iap = InAppPurchase.instance;
@@ -40,6 +81,9 @@ class SubscriptionService {
   static const String monthlyProductId = 'flashback_cam_monthly';
   static const String yearlyProductId = 'flashback_cam_yearly';
   static const String lifetimeProductId = 'flashback_cam_lifetime';
+  // Original lifetime price product ID (for showing strikethrough price)
+  static const String lifetimeOriginalProductId =
+      'flashback_cam_lifetime_original';
 
   // Store fetched products
   Map<String, ProductDetails> _products = {};
@@ -114,6 +158,7 @@ class SubscriptionService {
         monthlyProductId,
         yearlyProductId,
         lifetimeProductId,
+        lifetimeOriginalProductId,
       };
 
       final ProductDetailsResponse response =
@@ -137,6 +182,12 @@ class SubscriptionService {
       for (var product in _products.values) {
         debugPrint(
             'Product: ${product.id} - ${product.title} - ${product.price}');
+        // Log additional pricing info for debugging
+        if (product.id == lifetimeProductId ||
+            product.id == lifetimeOriginalProductId) {
+          debugPrint(
+              '  Raw price: ${product.rawPrice} ${product.currencyCode}');
+        }
       }
     } catch (e) {
       debugPrint('Failed to load products: $e');
@@ -617,10 +668,37 @@ class SubscriptionService {
       productId = yearlyProductId;
     } else if (tier == 'lifetime') {
       productId = lifetimeProductId;
+    } else if (tier == 'lifetime_original') {
+      productId = lifetimeOriginalProductId;
     } else {
       return null;
     }
     return _products[productId];
+  }
+
+  /// Get lifetime pricing information from Play Console
+  /// Returns both original and discounted prices if discount is active
+  LifetimePricing? getLifetimePricing() {
+    final discountedProduct = _products[lifetimeProductId];
+    final originalProduct = _products[lifetimeOriginalProductId];
+
+    if (discountedProduct == null) {
+      debugPrint('⚠️ Lifetime product not found');
+      return null;
+    }
+
+    // If we have both products and original is more expensive, show discount UI
+    final hasDiscount = originalProduct != null &&
+        originalProduct.rawPrice > discountedProduct.rawPrice;
+
+    return LifetimePricing(
+      discountedPrice: discountedProduct.price,
+      discountedRawPrice: discountedProduct.rawPrice,
+      originalPrice: hasDiscount ? originalProduct.price : null,
+      originalRawPrice: hasDiscount ? originalProduct.rawPrice : null,
+      currencyCode: discountedProduct.currencyCode,
+      hasActiveDiscount: hasDiscount,
+    );
   }
 
   bool get isAvailable => _isAvailable;

@@ -9,6 +9,7 @@ class ModeChip extends StatelessWidget {
   final bool isLocked;
   final bool isUnsupported;
   final String? unsupportedMessage;
+  final VoidCallback? onLockedTap;
 
   const ModeChip({
     super.key,
@@ -19,6 +20,7 @@ class ModeChip extends StatelessWidget {
     this.isLocked = false,
     this.isUnsupported = false,
     this.unsupportedMessage,
+    this.onLockedTap,
   });
 
   void _showUnsupportedDialog(BuildContext context) {
@@ -71,7 +73,7 @@ class ModeChip extends StatelessWidget {
     return GestureDetector(
       onTap: isDisabled
           ? () => _showUnsupportedDialog(context)
-          : (isLocked ? null : onTap),
+          : (isLocked ? (onLockedTap ?? onTap) : onTap),
       child: Opacity(
         opacity: isDisabled ? 0.4 : 1.0,
         child: Container(

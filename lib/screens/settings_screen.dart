@@ -8,8 +8,10 @@ import 'package:flashback_cam/providers/app_state.dart';
 import 'package:flashback_cam/models/app_settings.dart';
 import 'package:flashback_cam/theme.dart';
 import 'package:flashback_cam/screens/pro_upgrade_screen.dart';
+import 'package:flashback_cam/screens/lifetime_paywall_screen.dart';
 import 'package:flashback_cam/widgets/glass_container.dart';
 import 'package:flashback_cam/widgets/camera_instructions_overlay.dart';
+import 'package:flashback_cam/services/paywall_service.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -986,11 +988,30 @@ class _SettingsScreenState extends State<SettingsScreen>
       (index) {
         final seconds = options[index];
         if (!isPro && seconds > 10) {
-          _showProUpgrade(context);
+          // Show lifetime paywall for PRO buffer durations (20s, 30s)
+          _showLifetimePaywall(
+            context,
+            appState,
+            trigger: seconds == 20
+                ? PaywallTrigger.bufferSelection20s
+                : PaywallTrigger.bufferSelection30s,
+          );
           return;
         }
         appState.updateSettings(settings.copyWith(preRollSeconds: seconds));
       },
+    );
+  }
+
+  /// Show lifetime paywall with specific trigger
+  void _showLifetimePaywall(BuildContext context, AppState appState,
+      {PaywallTrigger? trigger}) {
+    if (trigger != null) {
+      appState.paywallService.requestPaywall(trigger);
+    }
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const LifetimePaywallScreen()),
     );
   }
 

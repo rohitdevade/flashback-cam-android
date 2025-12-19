@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:in_app_review/in_app_review.dart';
 import 'package:flashback_cam/providers/app_state.dart';
 import 'package:flashback_cam/models/app_settings.dart';
 import 'package:flashback_cam/theme.dart';
@@ -11,8 +12,11 @@ import 'package:flashback_cam/widgets/record_button.dart';
 import 'package:flashback_cam/widgets/video_thumbnail.dart';
 import 'package:flashback_cam/widgets/debug_info_panel.dart';
 import 'package:flashback_cam/widgets/camera_instructions_overlay.dart';
+import 'package:flashback_cam/widgets/rating_popup.dart';
 import 'package:flashback_cam/screens/gallery_screen.dart';
 import 'package:flashback_cam/screens/settings_screen.dart';
+import 'package:flashback_cam/screens/lifetime_paywall_screen.dart';
+import 'package:flashback_cam/services/paywall_service.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 class CameraScreen extends StatefulWidget {
@@ -30,6 +34,8 @@ class _CameraScreenState extends State<CameraScreen>
   bool _showInstructions = false;
   bool _instructionsChecked = false;
   bool _lowMemoryWarningShown = false;
+  bool _dayThreePaywallChecked = false;
+  int _lastVideoCount = 0;
 
   // Focus indicator state
   Offset? _focusPoint;
@@ -54,6 +60,11 @@ class _CameraScreenState extends State<CameraScreen>
     _focusAnimation = Tween<double>(begin: 1.5, end: 1.0).animate(
       CurvedAnimation(parent: _focusAnimationController, curve: Curves.easeOut),
     );
+
+    // Check for Day 3 paywall after a short delay
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _checkDayThreePaywall();
+    });
   }
 
   /// Check if we should show instructions (only once after AppState is initialized)
@@ -169,6 +180,107 @@ class _CameraScreenState extends State<CameraScreen>
     });
   }
 
+  /// Check for Day 3 paywall trigger
+  void _checkDayThreePaywall() {
+    if (_dayThreePaywallChecked) return;
+    _dayThreePaywallChecked = true;
+
+    final appState = context.read<AppState>();
+
+    // Only show for free users, and not on first launch
+    if (appState.isPro) return;
+    if (appState.paywallService.isFirstLaunchDay) return;
+
+    // Check if Day 3 paywall should trigger
+    if (appState.shouldShowDayThreePaywall()) {
+      // Show paywall after a short delay to let the camera initialize
+      Future.delayed(const Duration(seconds: 2), () {
+        if (!mounted) return;
+        _showLifetimePaywall(appState, PaywallTrigger.dayThree);
+      });
+    }
+  }
+
+  /// Check for video save triggers (rating popup or paywall)
+  void _checkVideoSaveTriggers(AppState appState) {
+    final currentVideoCount = appState.videos.length;
+
+    // Check if a new video was added
+    if (currentVideoCount > _lastVideoCount) {
+      _lastVideoCount = currentVideoCount;
+
+      // Don't show popups during recording/processing
+      if (appState.isRecording || appState.isFinalizing) return;
+
+      // Schedule popup check after a short delay (1-2 seconds after save)
+      Future.delayed(const Duration(milliseconds: 1500), () {
+        if (!mounted) return;
+
+        // Re-check state hasn't changed
+        final currentState = context.read<AppState>();
+        if (currentState.isRecording || currentState.isFinalizing) return;
+
+        // Check paywall first (for free users)
+        if (!currentState.isPro && currentState.shouldShowVideoLimitPaywall()) {
+          _showLifetimePaywall(currentState, PaywallTrigger.videoSaveLimit);
+          return;
+        }
+
+        // Then check rating popup
+        if (currentState.shouldShowRatingPopup()) {
+          _showRatingPopup(currentState);
+        }
+      });
+    }
+  }
+
+  /// Show the rating popup
+  Future<void> _showRatingPopup(AppState appState) async {
+    final result = await showRatingPopup(context);
+
+    if (result == true) {
+      // High rating (4-5 stars) -> trigger Google Play in-app review
+      await appState.ratingService.markAsRated();
+      _triggerInAppReview();
+    } else if (result == false) {
+      // Low rating (1-3 stars) -> just mark as rated, don't open Play Store
+      await appState.ratingService.markAsRated();
+    } else {
+      // Dismissed -> mark dismissed for 5-day cooldown
+      await appState.ratingService.markDismissed();
+    }
+  }
+
+  /// Trigger Google Play in-app review
+  Future<void> _triggerInAppReview() async {
+    try {
+      final inAppReview = InAppReview.instance;
+      if (await inAppReview.isAvailable()) {
+        await inAppReview.requestReview();
+        debugPrint('✅ In-app review requested');
+      } else {
+        debugPrint('⚠️ In-app review not available');
+      }
+    } catch (e) {
+      debugPrint('❌ Failed to request in-app review: $e');
+    }
+  }
+
+  /// Show lifetime paywall
+  void _showLifetimePaywall(AppState appState, PaywallTrigger trigger) {
+    appState.paywallService.requestPaywall(trigger);
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const LifetimePaywallScreen()),
+    );
+  }
+
+  /// Open paywall for locked pro features (4K/60fps)
+  void _openPaywall(BuildContext context) {
+    final appState = context.read<AppState>();
+    _showLifetimePaywall(appState, PaywallTrigger.proFeatureTap);
+  }
+
   Future<void> _loadCapabilities() async {
     final appState = context.read<AppState>();
     final capabilities =
@@ -258,6 +370,9 @@ class _CameraScreenState extends State<CameraScreen>
 
     // Check for and display any recording errors
     _checkRecordingErrors(appState);
+
+    // Check for video save triggers (rating popup or paywall)
+    _checkVideoSaveTriggers(appState);
 
     return OrientationBuilder(
       builder: (context, orientation) {
@@ -406,6 +521,7 @@ class _CameraScreenState extends State<CameraScreen>
               onDebugLongPress: _showDebugPanel,
               capabilities: _capabilities,
               capabilitiesLoaded: _capabilitiesLoaded,
+              onLockedTap: () => _openPaywall(context),
             ),
           ),
         const Spacer(),
@@ -446,6 +562,7 @@ class _CameraScreenState extends State<CameraScreen>
                     onDebugLongPress: _showDebugPanel,
                     capabilities: _capabilities,
                     capabilitiesLoaded: _capabilitiesLoaded,
+                    onLockedTap: () => _openPaywall(context),
                   ),
                 const Spacer(),
                 if (appState.isFinalizing)
@@ -795,6 +912,7 @@ class TopControls extends StatelessWidget {
   final VoidCallback onDebugLongPress;
   final Map<String, bool> capabilities;
   final bool capabilitiesLoaded;
+  final VoidCallback? onLockedTap;
 
   const TopControls({
     super.key,
@@ -806,6 +924,7 @@ class TopControls extends StatelessWidget {
     required this.onDebugLongPress,
     required this.capabilities,
     required this.capabilitiesLoaded,
+    this.onLockedTap,
   });
 
   @override
@@ -861,6 +980,7 @@ class TopControls extends StatelessWidget {
                         isUnsupported: !supports4K,
                         unsupportedMessage:
                             '4K recording is not supported by your device camera.',
+                        onLockedTap: onLockedTap,
                       ),
                     ],
                   ),
@@ -892,6 +1012,7 @@ class TopControls extends StatelessWidget {
                         isUnsupported: !supports60fps,
                         unsupportedMessage:
                             '60fps recording at ${selectedResolution} is not supported by your device camera.',
+                        onLockedTap: onLockedTap,
                       ),
                     ],
                   ),
