@@ -1308,6 +1308,11 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
     private var maxZoom = 1.0f
     private var minZoom = 1.0f
     
+    // Focus
+    private var isFocusLocked = false
+    private var focusPointX = 0.5f  // Normalized 0-1, center by default
+    private var focusPointY = 0.5f  // Normalized 0-1, center by default
+    
     // Current recording info
     private var currentRecordingId: String? = null
     private var recordingStartTime: Long = 0
@@ -1379,6 +1384,10 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
             "setFlashMode" -> setFlashMode(call, result)
             "setZoom" -> setZoom(call, result)
             "getMaxZoom" -> getMaxZoom(result)
+            "setFocusPoint" -> setFocusPoint(call, result)
+            "lockFocus" -> lockFocus(call, result)
+            "unlockFocus" -> unlockFocus(result)
+            "isFocusLocked" -> result.success(isFocusLocked)
             "updateSettings" -> updateSettings(call, result)
             "updateSubscription" -> updateSubscription(call, result)
             "getDeviceCapabilities" -> getDeviceCapabilities(result)
@@ -4548,6 +4557,316 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
         } catch (e: Exception) {
             Log.e(TAG, "❌ Failed to apply zoom", e)
             e.printStackTrace()
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // FOCUS CONTROL - Tap to focus and focus lock
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Set focus point at normalized coordinates (0.0-1.0).
+     * Triggers auto-focus at the specified point.
+     */
+    private fun setFocusPoint(call: MethodCall, result: MethodChannel.Result) {
+        try {
+            val x = call.argument<Double>("x")?.toFloat() ?: 0.5f
+            val y = call.argument<Double>("y")?.toFloat() ?: 0.5f
+            
+            focusPointX = x.coerceIn(0f, 1f)
+            focusPointY = y.coerceIn(0f, 1f)
+            
+            Log.d(TAG, "📍 setFocusPoint: ($focusPointX, $focusPointY)")
+            
+            val success = triggerFocusAtPoint(focusPointX, focusPointY, lockAfterFocus = false)
+            result.success(success)
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Failed to set focus point", e)
+            result.error("FOCUS_ERROR", "Failed to set focus point: ${e.message}", null)
+        }
+    }
+
+    /**
+     * Lock focus at the current focus point or a specified point.
+     */
+    private fun lockFocus(call: MethodCall, result: MethodChannel.Result) {
+        try {
+            // If coordinates provided, focus there first
+            call.argument<Double>("x")?.let { x ->
+                call.argument<Double>("y")?.let { y ->
+                    focusPointX = x.toFloat().coerceIn(0f, 1f)
+                    focusPointY = y.toFloat().coerceIn(0f, 1f)
+                }
+            }
+            
+            Log.d(TAG, "🔒 lockFocus at: ($focusPointX, $focusPointY)")
+            
+            val success = triggerFocusAtPoint(focusPointX, focusPointY, lockAfterFocus = true)
+            if (success) {
+                isFocusLocked = true
+            }
+            result.success(success)
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Failed to lock focus", e)
+            result.error("FOCUS_ERROR", "Failed to lock focus: ${e.message}", null)
+        }
+    }
+
+    /**
+     * Unlock focus and return to continuous auto-focus mode.
+     */
+    private fun unlockFocus(result: MethodChannel.Result) {
+        try {
+            Log.d(TAG, "🔓 unlockFocus")
+            
+            val success = resetToContinuousAutoFocus()
+            if (success) {
+                isFocusLocked = false
+            }
+            result.success(success)
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Failed to unlock focus", e)
+            result.error("FOCUS_ERROR", "Failed to unlock focus: ${e.message}", null)
+        }
+    }
+
+    /**
+     * Trigger auto-focus at a specific point on the sensor.
+     * @param x Normalized x coordinate (0-1)
+     * @param y Normalized y coordinate (0-1)
+     * @param lockAfterFocus If true, focus will be locked after focusing
+     */
+    private fun triggerFocusAtPoint(x: Float, y: Float, lockAfterFocus: Boolean): Boolean {
+        val characteristics = cameraCharacteristics ?: run {
+            Log.e(TAG, "❌ triggerFocusAtPoint: cameraCharacteristics is null")
+            return false
+        }
+        val session = captureSession ?: run {
+            Log.e(TAG, "❌ triggerFocusAtPoint: captureSession is null")
+            return false
+        }
+        val builder = previewRequestBuilder ?: run {
+            Log.e(TAG, "❌ triggerFocusAtPoint: previewRequestBuilder is null")
+            return false
+        }
+        
+        // Check if the device supports AF regions
+        val maxAfRegions = characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0
+        Log.d(TAG, "📍 Device supports $maxAfRegions AF regions")
+        
+        if (maxAfRegions == 0) {
+            Log.w(TAG, "Device doesn't support AF regions, using simple trigger")
+            return triggerSimpleFocus(lockAfterFocus)
+        }
+        
+        // Get sensor array size for coordinate mapping
+        val sensorArraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            ?: run {
+                Log.e(TAG, "❌ triggerFocusAtPoint: sensorArraySize is null")
+                return false
+            }
+        
+        // Account for current zoom crop region
+        val cropRegion = builder.get(CaptureRequest.SCALER_CROP_REGION) ?: sensorArraySize
+        
+        // Calculate focus region size (use ~5% of crop region for more precise focus area)
+        val focusRegionWidth = (cropRegion.width() * 0.05f).toInt().coerceAtLeast(50)
+        val focusRegionHeight = (cropRegion.height() * 0.05f).toInt().coerceAtLeast(50)
+        
+        // Map normalized coordinates to crop region
+        val focusCenterX = cropRegion.left + (x * cropRegion.width()).toInt()
+        val focusCenterY = cropRegion.top + (y * cropRegion.height()).toInt()
+        
+        // Create focus region rectangle, clamped to sensor bounds
+        val focusLeft = (focusCenterX - focusRegionWidth / 2).coerceIn(sensorArraySize.left, sensorArraySize.right - focusRegionWidth)
+        val focusTop = (focusCenterY - focusRegionHeight / 2).coerceIn(sensorArraySize.top, sensorArraySize.bottom - focusRegionHeight)
+        val focusRight = (focusLeft + focusRegionWidth).coerceAtMost(sensorArraySize.right)
+        val focusBottom = (focusTop + focusRegionHeight).coerceAtMost(sensorArraySize.bottom)
+        
+        val focusRegion = android.graphics.Rect(focusLeft, focusTop, focusRight, focusBottom)
+        val meteringRectangle = android.hardware.camera2.params.MeteringRectangle(
+            focusRegion,
+            android.hardware.camera2.params.MeteringRectangle.METERING_WEIGHT_MAX
+        )
+        
+        Log.d(TAG, "📍 Focus region: $focusRegion (sensor: $sensorArraySize, crop: $cropRegion)")
+        Log.d(TAG, "📍 Focus center: ($focusCenterX, $focusCenterY), normalized: ($x, $y)")
+        
+        try {
+            // Step 1: Set AF regions on the builder
+            builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(meteringRectangle))
+            
+            // Also set AE regions for exposure metering at the same point
+            val maxAeRegions = characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
+            if (maxAeRegions > 0) {
+                builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(meteringRectangle))
+                Log.d(TAG, "📍 AE regions also set")
+            }
+            
+            // Step 2: Set AF mode to AUTO (required for AF_TRIGGER to work)
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+            
+            // Step 3: First, cancel any ongoing AF
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_CANCEL)
+            session.capture(builder.build(), null, backgroundHandler)
+            Log.d(TAG, "📍 AF cancel sent")
+            
+            // Step 4: Update repeating request with new AF regions (important!)
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
+            previewRequest = builder.build()
+            session.setRepeatingRequest(previewRequest!!, null, backgroundHandler)
+            Log.d(TAG, "📍 Repeating request updated with AF regions")
+            
+            // Step 5: Trigger AF start
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
+            session.capture(builder.build(), object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(
+                    session: CameraCaptureSession,
+                    request: CaptureRequest,
+                    captureResult: TotalCaptureResult
+                ) {
+                    val afState = captureResult.get(CaptureResult.CONTROL_AF_STATE)
+                    Log.d(TAG, "📍 AF trigger sent, initial state: $afState")
+                }
+            }, backgroundHandler)
+            
+            // Step 6: Reset trigger to IDLE and optionally return to continuous AF
+            backgroundHandler?.postDelayed({
+                try {
+                    builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
+                    
+                    if (!lockAfterFocus && !isFocusLocked) {
+                        // Return to continuous AF after 3 seconds
+                        backgroundHandler?.postDelayed({
+                            try {
+                                if (!isFocusLocked) {
+                                    builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                                    builder.set(CaptureRequest.CONTROL_AF_REGIONS, null)
+                                    builder.set(CaptureRequest.CONTROL_AE_REGIONS, null)
+                                    previewRequest = builder.build()
+                                    captureSession?.setRepeatingRequest(previewRequest!!, null, backgroundHandler)
+                                    Log.d(TAG, "📍 Returned to continuous AF")
+                                }
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Failed to return to continuous AF", e)
+                            }
+                        }, 2500)
+                    } else {
+                        // Keep focus locked - just update the repeating request
+                        previewRequest = builder.build()
+                        captureSession?.setRepeatingRequest(previewRequest!!, null, backgroundHandler)
+                        Log.d(TAG, "📍 Focus locked at point")
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to reset AF trigger", e)
+                }
+            }, 500)
+            
+            Log.d(TAG, "✅ Focus trigger initiated successfully")
+            return true
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Failed to trigger focus at point", e)
+            e.printStackTrace()
+            return false
+        }
+    }
+
+    /**
+     * Simple focus trigger for devices that don't support AF regions.
+     */
+    private fun triggerSimpleFocus(lockAfterFocus: Boolean): Boolean {
+        val session = captureSession ?: return false
+        val builder = previewRequestBuilder ?: return false
+        
+        try {
+            // Set AF mode to AUTO
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+            
+            // Cancel any ongoing AF
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_CANCEL)
+            session.capture(builder.build(), null, backgroundHandler)
+            
+            // Update repeating request with AUTO mode
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
+            previewRequest = builder.build()
+            session.setRepeatingRequest(previewRequest!!, null, backgroundHandler)
+            
+            // Trigger AF start
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
+            session.capture(builder.build(), object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(
+                    session: CameraCaptureSession,
+                    request: CaptureRequest,
+                    captureResult: TotalCaptureResult
+                ) {
+                    val afState = captureResult.get(CaptureResult.CONTROL_AF_STATE)
+                    Log.d(TAG, "📍 Simple AF trigger sent, state: $afState")
+                }
+            }, backgroundHandler)
+            
+            // Reset trigger and optionally return to continuous
+            backgroundHandler?.postDelayed({
+                try {
+                    builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
+                    
+                    if (!lockAfterFocus && !isFocusLocked) {
+                        backgroundHandler?.postDelayed({
+                            try {
+                                if (!isFocusLocked) {
+                                    builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                                    previewRequest = builder.build()
+                                    captureSession?.setRepeatingRequest(previewRequest!!, null, backgroundHandler)
+                                    Log.d(TAG, "📍 Returned to continuous AF (simple)")
+                                }
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Failed to return to continuous AF", e)
+                            }
+                        }, 2500)
+                    } else {
+                        previewRequest = builder.build()
+                        captureSession?.setRepeatingRequest(previewRequest!!, null, backgroundHandler)
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to reset AF trigger", e)
+                }
+            }, 500)
+            
+            Log.d(TAG, "✅ Simple focus trigger initiated")
+            return true
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Failed to trigger simple focus", e)
+            return false
+        }
+    }
+
+    /**
+     * Reset to continuous auto-focus mode.
+     */
+    private fun resetToContinuousAutoFocus(): Boolean {
+        val session = captureSession ?: return false
+        val builder = previewRequestBuilder ?: return false
+        
+        try {
+            // Clear focus regions
+            builder.set(CaptureRequest.CONTROL_AF_REGIONS, null)
+            builder.set(CaptureRequest.CONTROL_AE_REGIONS, null)
+            
+            // Set continuous AF mode
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_CANCEL)
+            
+            // Apply changes
+            session.capture(builder.build(), null, backgroundHandler)
+            
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
+            previewRequest = builder.build()
+            session.setRepeatingRequest(previewRequest!!, null, backgroundHandler)
+            
+            Log.d(TAG, "🔓 Reset to continuous auto-focus")
+            return true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to reset to continuous AF", e)
+            return false
         }
     }
 

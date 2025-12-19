@@ -22,7 +22,8 @@ class CameraScreen extends StatefulWidget {
   State<CameraScreen> createState() => _CameraScreenState();
 }
 
-class _CameraScreenState extends State<CameraScreen> {
+class _CameraScreenState extends State<CameraScreen>
+    with SingleTickerProviderStateMixin {
   double _baseZoomLevel = 1.0;
   Map<String, bool> _capabilities = {};
   bool _capabilitiesLoaded = false;
@@ -30,12 +31,29 @@ class _CameraScreenState extends State<CameraScreen> {
   bool _instructionsChecked = false;
   bool _lowMemoryWarningShown = false;
 
+  // Focus indicator state
+  Offset? _focusPoint;
+  Offset? _pendingFocusPoint;
+  bool _showFocusIndicator = false;
+  bool _isFocusLocked = false;
+  late AnimationController _focusAnimationController;
+  late Animation<double> _focusAnimation;
+
   @override
   void initState() {
     super.initState();
     // Keep screen on while camera is active
     WakelockPlus.enable();
     _loadCapabilities();
+
+    // Initialize focus animation
+    _focusAnimationController = AnimationController(
+      duration: const Duration(milliseconds: 300),
+      vsync: this,
+    );
+    _focusAnimation = Tween<double>(begin: 1.5, end: 1.0).animate(
+      CurvedAnimation(parent: _focusAnimationController, curve: Curves.easeOut),
+    );
   }
 
   /// Check if we should show instructions (only once after AppState is initialized)
@@ -106,10 +124,7 @@ class _CameraScreenState extends State<CameraScreen> {
                 const Icon(Icons.error_outline, color: Colors.white, size: 20),
                 const SizedBox(width: 12),
                 Expanded(
-                  child: Text(
-                    error,
-                    style: const TextStyle(fontSize: 13),
-                  ),
+                  child: Text(error, style: const TextStyle(fontSize: 13)),
                 ),
               ],
             ),
@@ -117,8 +132,9 @@ class _CameraScreenState extends State<CameraScreen> {
             backgroundColor: AppColors.recordRed,
             behavior: SnackBarBehavior.floating,
             margin: const EdgeInsets.all(16),
-            shape:
-                RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
           ),
         );
       }
@@ -144,8 +160,9 @@ class _CameraScreenState extends State<CameraScreen> {
             backgroundColor: AppColors.warningOrange,
             behavior: SnackBarBehavior.floating,
             margin: const EdgeInsets.all(16),
-            shape:
-                RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
           ),
         );
       }
@@ -168,6 +185,7 @@ class _CameraScreenState extends State<CameraScreen> {
   void dispose() {
     // Allow screen to turn off when leaving camera
     WakelockPlus.disable();
+    _focusAnimationController.dispose();
     super.dispose();
   }
 
@@ -179,8 +197,10 @@ class _CameraScreenState extends State<CameraScreen> {
     // Show a snackbar to confirm
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text('🐛 Debug Panel Opening...',
-            style: TextStyle(fontWeight: FontWeight.bold)),
+        content: Text(
+          '🐛 Debug Panel Opening...',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
         duration: Duration(seconds: 2),
         backgroundColor: Colors.orange,
         behavior: SnackBarBehavior.floating,
@@ -258,23 +278,55 @@ class _CameraScreenState extends State<CameraScreen> {
                   ],
                 ),
               ),
-              // Zoom gesture detector - only responds to multi-touch gestures
+              // Tap to focus and zoom gesture detector
               Positioned.fill(
                 child: GestureDetector(
-                  behavior: HitTestBehavior.translucent,
+                  behavior: HitTestBehavior.opaque,
+                  onTapDown: (details) {
+                    // Store tap position immediately
+                    _pendingFocusPoint = details.localPosition;
+                  },
+                  onTapUp: (details) {
+                    // Use the stored position for focus
+                    if (_pendingFocusPoint != null) {
+                      _handleTapToFocus(
+                        TapUpDetails(
+                          kind: details.kind,
+                          localPosition: _pendingFocusPoint!,
+                          globalPosition: details.globalPosition,
+                        ),
+                        appState,
+                      );
+                    }
+                    _pendingFocusPoint = null;
+                  },
+                  onTapCancel: () {
+                    _pendingFocusPoint = null;
+                  },
+                  onLongPressStart: (details) {
+                    _pendingFocusPoint = details.localPosition;
+                    _handleLongPressToLockFocus(
+                        appState, details.localPosition);
+                  },
+                  onDoubleTap: () => _handleDoubleTapToUnlockFocus(appState),
                   onScaleStart: (details) {
                     if (details.pointerCount > 1) {
+                      _pendingFocusPoint = null; // Cancel any pending focus
                       _baseZoomLevel = appState.zoomLevel;
                       print(
-                          '🔍 Scale gesture started: base zoom = $_baseZoomLevel');
+                        '🔍 Scale gesture started: base zoom = $_baseZoomLevel',
+                      );
                     }
                   },
                   onScaleUpdate: (details) {
                     if (details.pointerCount > 1) {
-                      final newZoom = (_baseZoomLevel * details.scale)
-                          .clamp(1.0, appState.maxZoom);
+                      final newZoom = (_baseZoomLevel * details.scale).clamp(
+                        1.0,
+                        appState.maxZoom,
+                      );
                       print(
-                          '🔍 Scale gesture update: scale=${details.scale}, newZoom=$newZoom');
+                        '🔍 Scale gesture update: scale=${details.scale}, newZoom=$newZoom',
+                      );
                       appState.setZoom(newZoom);
                     }
                   },
@@ -284,6 +336,21 @@ class _CameraScreenState extends State<CameraScreen> {
                   child: Container(color: Colors.transparent),
                 ),
               ),
+              // Focus indicator
+              if (_showFocusIndicator && _focusPoint != null)
+                Positioned(
+                  left: _focusPoint!.dx - 40,
+                  top: _focusPoint!.dy - 40,
+                  child: AnimatedBuilder(
+                    animation: _focusAnimation,
+                    builder: (context, child) {
+                      return Transform.scale(
+                        scale: _focusAnimation.value,
+                        child: FocusIndicator(isLocked: _isFocusLocked),
+                      );
+                    },
+                  ),
+                ),
               // UI controls - pointer events enabled for buttons
               SafeArea(
                 child: isPortraitLayout
@@ -296,9 +363,7 @@ class _CameraScreenState extends State<CameraScreen> {
                   top: MediaQuery.of(context).padding.top + 80,
                   left: 0,
                   right: 0,
-                  child: Center(
-                    child: ZoomIndicator(zoom: appState.zoomLevel),
-                  ),
+                  child: Center(child: ZoomIndicator(zoom: appState.zoomLevel)),
                 ),
               // Camera instructions overlay (shown on first launch)
               if (_showInstructions)
@@ -322,8 +387,12 @@ class _CameraScreenState extends State<CameraScreen> {
       children: [
         if (!hideTopControls)
           Padding(
-            padding:
-                const EdgeInsets.only(left: 20, right: 20, top: 8, bottom: 20),
+            padding: const EdgeInsets.only(
+              left: 20,
+              right: 20,
+              top: 8,
+              bottom: 20,
+            ),
             child: TopControls(
               selectedResolution: settings.resolution.toUpperCase(),
               selectedFps: settings.fps,
@@ -383,7 +452,8 @@ class _CameraScreenState extends State<CameraScreen> {
                   Align(
                     alignment: Alignment.bottomLeft,
                     child: FinalizingIndicator(
-                        progress: appState.finalizeProgress),
+                      progress: appState.finalizeProgress,
+                    ),
                   ),
               ],
             ),
@@ -427,13 +497,136 @@ class _CameraScreenState extends State<CameraScreen> {
     );
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // FOCUS CONTROL - Tap to focus and focus lock
+  // ═══════════════════════════════════════════════════════════════════════════════
+
+  /// Handle tap to focus at a point
+  void _handleTapToFocus(TapUpDetails details, AppState appState) {
+    if (!appState.isCameraReady) return;
+
+    final RenderBox? box = context.findRenderObject() as RenderBox?;
+    if (box == null) return;
+
+    final localPosition = details.localPosition;
+    final size = box.size;
+
+    // Convert to normalized coordinates (0.0 - 1.0)
+    final normalizedX = localPosition.dx / size.width;
+    final normalizedY = localPosition.dy / size.height;
+
+    print('📍 Tap to focus at: ($normalizedX, $normalizedY)');
+
+    // Show focus indicator
+    setState(() {
+      _focusPoint = localPosition;
+      _showFocusIndicator = true;
+      _isFocusLocked = false;
+    });
+
+    // Start animation
+    _focusAnimationController.reset();
+    _focusAnimationController.forward();
+
+    // Call native focus
+    appState.cameraService.setFocusPoint(normalizedX, normalizedY);
+
+    // Hide indicator after a delay
+    Future.delayed(const Duration(seconds: 2), () {
+      if (mounted && !_isFocusLocked) {
+        setState(() {
+          _showFocusIndicator = false;
+        });
+      }
+    });
+  }
+
+  /// Handle long press to lock focus at current point
+  void _handleLongPressToLockFocus(AppState appState, Offset position) {
+    if (!appState.isCameraReady) return;
+
+    final RenderBox? box = context.findRenderObject() as RenderBox?;
+    if (box == null) return;
+
+    final size = box.size;
+    final normalizedX = position.dx / size.width;
+    final normalizedY = position.dy / size.height;
+
+    print('🔒 Lock focus at: ($normalizedX, $normalizedY)');
+
+    setState(() {
+      _focusPoint = position;
+      _isFocusLocked = true;
+      _showFocusIndicator = true;
+    });
+
+    // Animate to locked state
+    _focusAnimationController.reset();
+    _focusAnimationController.forward();
+
+    // Call native lock focus
+    appState.cameraService.lockFocus(x: normalizedX, y: normalizedY);
+
+    // Show confirmation
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            Icon(Icons.lock, color: Colors.white, size: 18),
+            SizedBox(width: 8),
+            Text('Focus locked. Double-tap to unlock.'),
+          ],
+        ),
+        duration: Duration(seconds: 2),
+        backgroundColor: AppColors.electricBlue,
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.all(16),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      ),
+    );
+  }
+
+  /// Handle double tap to unlock focus
+  void _handleDoubleTapToUnlockFocus(AppState appState) {
+    if (!_isFocusLocked) return;
+
+    print('🔓 Unlock focus');
+
+    setState(() {
+      _isFocusLocked = false;
+      _showFocusIndicator = false;
+    });
+
+    // Call native unlock focus
+    appState.cameraService.unlockFocus();
+
+    // Show confirmation
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            Icon(Icons.lock_open, color: Colors.white, size: 18),
+            SizedBox(width: 8),
+            Text('Focus unlocked'),
+          ],
+        ),
+        duration: Duration(seconds: 1),
+        backgroundColor: AppColors.textSecondary,
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.all(16),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      ),
+    );
+  }
+
   Future<void> _openGallery(AppState appState) async {
     if (appState.isRecording) {
       if (!mounted) return;
       final messenger = ScaffoldMessenger.maybeOf(context);
       messenger?.showSnackBar(
         const SnackBar(
-            content: Text('Stop recording before opening the gallery.')),
+          content: Text('Stop recording before opening the gallery.'),
+        ),
       );
       return;
     }
@@ -561,10 +754,7 @@ class GridOverlay extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => IgnorePointer(
-        child: CustomPaint(
-          size: Size.infinite,
-          painter: GridPainter(),
-        ),
+        child: CustomPaint(size: Size.infinite, painter: GridPainter()),
       );
 }
 
@@ -580,9 +770,15 @@ class GridPainter extends CustomPainter {
 
     for (int i = 1; i < 3; i++) {
       canvas.drawLine(
-          Offset(0, hStep * i), Offset(size.width, hStep * i), paint);
+        Offset(0, hStep * i),
+        Offset(size.width, hStep * i),
+        paint,
+      );
       canvas.drawLine(
-          Offset(vStep * i, 0), Offset(vStep * i, size.height), paint);
+        Offset(vStep * i, 0),
+        Offset(vStep * i, size.height),
+        paint,
+      );
     }
   }
 
@@ -629,7 +825,9 @@ class TopControls extends StatelessWidget {
       children: [
         GestureDetector(
           onTap: () => Navigator.push(
-              context, MaterialPageRoute(builder: (_) => SettingsScreen())),
+            context,
+            MaterialPageRoute(builder: (_) => SettingsScreen()),
+          ),
           onLongPress: onDebugLongPress,
           child: GlassContainer(
             padding: EdgeInsets.all(12),
@@ -669,8 +867,12 @@ class TopControls extends StatelessWidget {
                 ),
                 SizedBox(width: 12),
                 GlassContainer(
-                  padding:
-                      EdgeInsets.only(left: 12, top: 8, right: 12, bottom: 10),
+                  padding: EdgeInsets.only(
+                    left: 12,
+                    top: 8,
+                    right: 12,
+                    bottom: 10,
+                  ),
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
@@ -763,8 +965,9 @@ class _BufferIndicatorState extends State<BufferIndicator>
                   child: CircularProgressIndicator(
                     value: progress,
                     strokeWidth: 2,
-                    valueColor:
-                        AlwaysStoppedAnimation<Color>(AppColors.electricBlue),
+                    valueColor: AlwaysStoppedAnimation<Color>(
+                      AppColors.electricBlue,
+                    ),
                     backgroundColor: Colors.white.withValues(alpha: 0.3),
                   ),
                 ),
@@ -832,9 +1035,10 @@ class FinalizingIndicator extends StatelessWidget {
             Text(
               'Saving...',
               style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 14,
-                  fontWeight: FontWeight.w600),
+                color: Colors.white,
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+              ),
             ),
             SizedBox(height: 8),
             Container(
@@ -911,8 +1115,12 @@ class BottomControls extends StatelessWidget {
             // Buffer control button
             Padding(
               padding: const EdgeInsets.only(bottom: 16),
-              child: _buildBufferButton(isIdle, isBuffering, isRecording,
-                  isCameraReady: isCameraReady),
+              child: _buildBufferButton(
+                isIdle,
+                isBuffering,
+                isRecording,
+                isCameraReady: isCameraReady,
+              ),
             ),
             // Main controls row
             Row(
@@ -959,14 +1167,14 @@ class BottomControls extends StatelessWidget {
         mainAxisAlignment: MainAxisAlignment.center,
         crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          VideoThumbnail(
-            video: latestVideo,
-            size: 72,
-            onTap: onGalleryTap,
-          ),
+          VideoThumbnail(video: latestVideo, size: 72, onTap: onGalleryTap),
           const SizedBox(height: 16),
-          _buildBufferButton(isIdle, isBuffering, isRecording,
-              isCameraReady: isCameraReady),
+          _buildBufferButton(
+            isIdle,
+            isBuffering,
+            isRecording,
+            isCameraReady: isCameraReady,
+          ),
           const SizedBox(height: 24),
           RecordButton(
             isRecording: isRecording,
@@ -996,8 +1204,12 @@ class BottomControls extends StatelessWidget {
     );
   }
 
-  Widget _buildBufferButton(bool isIdle, bool isBuffering, bool isRecording,
-      {required bool isCameraReady}) {
+  Widget _buildBufferButton(
+    bool isIdle,
+    bool isBuffering,
+    bool isRecording, {
+    required bool isCameraReady,
+  }) {
     return GestureDetector(
       onTap: (!isCameraReady || isRecording) ? null : onBufferToggle,
       child: Opacity(
@@ -1177,6 +1389,88 @@ class ZoomIndicator extends StatelessWidget {
           ),
         );
       },
+    );
+  }
+}
+
+/// Focus indicator shown when user taps to focus
+class FocusIndicator extends StatelessWidget {
+  final bool isLocked;
+
+  const FocusIndicator({super.key, this.isLocked = false});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 80,
+      height: 80,
+      decoration: BoxDecoration(
+        border: Border.all(
+          color: isLocked ? AppColors.electricBlue : Colors.white,
+          width: isLocked ? 2.5 : 2,
+        ),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Stack(
+        children: [
+          // Corner brackets
+          ...List.generate(4, (index) {
+            final isTop = index < 2;
+            final isLeft = index % 2 == 0;
+            return Positioned(
+              top: isTop ? 0 : null,
+              bottom: !isTop ? 0 : null,
+              left: isLeft ? 0 : null,
+              right: !isLeft ? 0 : null,
+              child: Container(
+                width: 16,
+                height: 16,
+                decoration: BoxDecoration(
+                  border: Border(
+                    top: isTop
+                        ? BorderSide(
+                            color: isLocked
+                                ? AppColors.electricBlue
+                                : Colors.white,
+                            width: 3,
+                          )
+                        : BorderSide.none,
+                    bottom: !isTop
+                        ? BorderSide(
+                            color: isLocked
+                                ? AppColors.electricBlue
+                                : Colors.white,
+                            width: 3,
+                          )
+                        : BorderSide.none,
+                    left: isLeft
+                        ? BorderSide(
+                            color: isLocked
+                                ? AppColors.electricBlue
+                                : Colors.white,
+                            width: 3,
+                          )
+                        : BorderSide.none,
+                    right: !isLeft
+                        ? BorderSide(
+                            color: isLocked
+                                ? AppColors.electricBlue
+                                : Colors.white,
+                            width: 3,
+                          )
+                        : BorderSide.none,
+                  ),
+                ),
+              ),
+            );
+          }),
+          // Lock icon when locked
+          if (isLocked)
+            Center(
+              child: Icon(Icons.lock, color: AppColors.electricBlue, size: 24),
+            ),
+        ],
+      ),
     );
   }
 }

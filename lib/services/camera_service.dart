@@ -45,8 +45,9 @@ class StorageCheckResult {
       hasEnoughSpace: map['hasEnoughSpace'] as bool? ?? true,
       availableBytes: (map['availableBytes'] as num?)?.toInt() ?? 0,
       requiredBytes: (map['requiredBytes'] as num?)?.toInt() ?? 0,
-      storageMode:
-          map['storageMode'] == 'low' ? StorageMode.low : StorageMode.normal,
+      storageMode: map['storageMode'] == 'low'
+          ? StorageMode.low
+          : StorageMode.normal,
       message: map['message'] as String?,
     );
   }
@@ -77,8 +78,9 @@ class CameraService {
   Future<void> disposePreview() async {
     if (_textureId != null) {
       try {
-        await _channel
-            .invokeMethod('disposePreview', {'textureId': _textureId});
+        await _channel.invokeMethod('disposePreview', {
+          'textureId': _textureId,
+        });
         _textureId = null;
         debugPrint('Camera preview disposed');
       } catch (e) {
@@ -191,8 +193,9 @@ class CameraService {
 
   Future<double> setZoom(double zoom) async {
     try {
-      final result =
-          await _channel.invokeMethod<double>('setZoom', {'zoom': zoom});
+      final result = await _channel.invokeMethod<double>('setZoom', {
+        'zoom': zoom,
+      });
       debugPrint('Zoom set to: $zoom, actual: $result');
       return result ?? zoom;
     } catch (e) {
@@ -212,10 +215,68 @@ class CameraService {
     }
   }
 
+  /// Set focus point at normalized coordinates (0.0-1.0)
+  /// x: horizontal position (0=left, 1=right)
+  /// y: vertical position (0=top, 1=bottom)
+  Future<bool> setFocusPoint(double x, double y) async {
+    try {
+      final result = await _channel.invokeMethod<bool>('setFocusPoint', {
+        'x': x,
+        'y': y,
+      });
+      debugPrint('📍 Focus point set to ($x, $y): $result');
+      return result ?? false;
+    } catch (e) {
+      debugPrint('❌ Failed to set focus point: $e');
+      return false;
+    }
+  }
+
+  /// Lock focus at current position (or at specified point if provided)
+  Future<bool> lockFocus({double? x, double? y}) async {
+    try {
+      final params = <String, dynamic>{};
+      if (x != null && y != null) {
+        params['x'] = x;
+        params['y'] = y;
+      }
+      final result = await _channel.invokeMethod<bool>('lockFocus', params);
+      debugPrint('🔒 Focus locked: $result');
+      return result ?? false;
+    } catch (e) {
+      debugPrint('❌ Failed to lock focus: $e');
+      return false;
+    }
+  }
+
+  /// Unlock focus and return to continuous auto-focus
+  Future<bool> unlockFocus() async {
+    try {
+      final result = await _channel.invokeMethod<bool>('unlockFocus');
+      debugPrint('🔓 Focus unlocked: $result');
+      return result ?? false;
+    } catch (e) {
+      debugPrint('❌ Failed to unlock focus: $e');
+      return false;
+    }
+  }
+
+  /// Check if focus is currently locked
+  Future<bool> isFocusLocked() async {
+    try {
+      final result = await _channel.invokeMethod<bool>('isFocusLocked');
+      return result ?? false;
+    } catch (e) {
+      debugPrint('❌ Failed to check focus lock: $e');
+      return false;
+    }
+  }
+
   Future<Map<String, dynamic>> getDeviceCapabilities() async {
     try {
-      final capabilities =
-          await _channel.invokeMethod<Map>('getDeviceCapabilities');
+      final capabilities = await _channel.invokeMethod<Map>(
+        'getDeviceCapabilities',
+      );
       return Map<String, dynamic>.from(capabilities ?? {});
     } catch (e) {
       debugPrint('Failed to get device capabilities: $e');
@@ -232,8 +293,9 @@ class CameraService {
   Future<Map<String, bool>> checkDetailedCapabilities() async {
     try {
       debugPrint('🔍 Checking detailed device capabilities...');
-      final result =
-          await _channel.invokeMethod<Map>('checkDetailedCapabilities');
+      final result = await _channel.invokeMethod<Map>(
+        'checkDetailedCapabilities',
+      );
       final capabilities = Map<String, bool>.from(result ?? {});
 
       debugPrint('✅ Device capabilities:');
@@ -328,11 +390,13 @@ class CameraService {
     int? fps,
   }) async {
     try {
-      final result =
-          await _channel.invokeMethod<Map>('checkBufferStorageSpace', {
-        if (resolution != null) 'resolution': resolution,
-        if (fps != null) 'fps': fps,
-      });
+      final result = await _channel.invokeMethod<Map>(
+        'checkBufferStorageSpace',
+        {
+          if (resolution != null) 'resolution': resolution,
+          if (fps != null) 'fps': fps,
+        },
+      );
       return Map<String, dynamic>.from(result ?? {});
     } catch (e) {
       debugPrint('Failed to check buffer storage space: $e');
@@ -357,15 +421,15 @@ class CameraService {
     int? expectedRecordingSeconds,
   }) async {
     try {
-      final result =
-          await _channel.invokeMethod<Map>('checkRecordingStorageSpace', {
-        if (resolution != null) 'resolution': resolution,
-        if (fps != null) 'fps': fps,
-        if (bufferDurationSeconds != null)
-          'bufferDurationSeconds': bufferDurationSeconds,
-        if (expectedRecordingSeconds != null)
-          'expectedRecordingSeconds': expectedRecordingSeconds,
-      });
+      final result = await _channel
+          .invokeMethod<Map>('checkRecordingStorageSpace', {
+            if (resolution != null) 'resolution': resolution,
+            if (fps != null) 'fps': fps,
+            if (bufferDurationSeconds != null)
+              'bufferDurationSeconds': bufferDurationSeconds,
+            if (expectedRecordingSeconds != null)
+              'expectedRecordingSeconds': expectedRecordingSeconds,
+          });
       return Map<String, dynamic>.from(result ?? {});
     } catch (e) {
       debugPrint('Failed to check recording storage space: $e');
@@ -390,12 +454,10 @@ class CameraService {
     required int bufferSeconds,
   }) async {
     try {
-      final result =
-          await _channel.invokeMethod<Map>('getAdjustedSettingsForStorage', {
-        'resolution': resolution,
-        'fps': fps,
-        'bufferSeconds': bufferSeconds,
-      });
+      final result = await _channel.invokeMethod<Map>(
+        'getAdjustedSettingsForStorage',
+        {'resolution': resolution, 'fps': fps, 'bufferSeconds': bufferSeconds},
+      );
       return Map<String, dynamic>.from(result ?? {});
     } catch (e) {
       debugPrint('Failed to get adjusted settings: $e');
@@ -437,8 +499,9 @@ class CameraService {
   /// Wait for the camera hardware to be ready (camera device opened).
   /// Returns true if camera opened successfully, false on timeout.
   /// Uses the native 'cameraOpened' event instead of fixed delays.
-  Future<bool> waitForCameraReady(
-      {Duration timeout = const Duration(seconds: 5)}) async {
+  Future<bool> waitForCameraReady({
+    Duration timeout = const Duration(seconds: 5),
+  }) async {
     try {
       debugPrint('Waiting for camera to be ready...');
       final completer = Completer<bool>();
@@ -476,8 +539,9 @@ class CameraService {
 
   /// Wait for the preview to be started (capture session configured).
   /// Returns true if preview started successfully, false on timeout.
-  Future<bool> waitForPreviewReady(
-      {Duration timeout = const Duration(seconds: 5)}) async {
+  Future<bool> waitForPreviewReady({
+    Duration timeout = const Duration(seconds: 5),
+  }) async {
     try {
       debugPrint('Waiting for preview to be ready...');
       final completer = Completer<bool>();

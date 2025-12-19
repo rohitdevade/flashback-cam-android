@@ -80,6 +80,11 @@ public class CameraPlugin: NSObject, FlutterPlugin, AVCaptureFileOutputRecording
     private var rollingBuffer: RollingMediaBuffer?
     private var bufferStartTime: Date?
     
+    // Focus
+    private var isFocusLocked: Bool = false
+    private var focusPointX: Float = 0.5
+    private var focusPointY: Float = 0.5
+    
     public override init() {
         super.init()
     }
@@ -160,6 +165,14 @@ public class CameraPlugin: NSObject, FlutterPlugin, AVCaptureFileOutputRecording
                 }
             }
             result(nil)
+        case "setFocusPoint":
+            setFocusPoint(call: call, result: result)
+        case "lockFocus":
+            lockFocus(call: call, result: result)
+        case "unlockFocus":
+            unlockFocus(result: result)
+        case "isFocusLocked":
+            result(isFocusLocked)
         case "dispose":
             stopSession(result: result)
         default:
@@ -348,6 +361,149 @@ public class CameraPlugin: NSObject, FlutterPlugin, AVCaptureFileOutputRecording
             DispatchQueue.main.async {
                 result(nil)
             }
+        }
+    }
+    
+    // MARK: - Focus Control
+    
+    /// Set focus point at normalized coordinates (0.0-1.0)
+    private func setFocusPoint(call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard let args = call.arguments as? [String: Any],
+              let x = args["x"] as? Double,
+              let y = args["y"] as? Double else {
+            result(false)
+            return
+        }
+        
+        focusPointX = Float(max(0, min(1, x)))
+        focusPointY = Float(max(0, min(1, y)))
+        
+        print("📍 setFocusPoint: (\(focusPointX), \(focusPointY))")
+        
+        let success = triggerFocusAtPoint(x: CGFloat(focusPointX), y: CGFloat(focusPointY), lockAfterFocus: false)
+        result(success)
+    }
+    
+    /// Lock focus at current or specified point
+    private func lockFocus(call: FlutterMethodCall, result: @escaping FlutterResult) {
+        if let args = call.arguments as? [String: Any] {
+            if let x = args["x"] as? Double, let y = args["y"] as? Double {
+                focusPointX = Float(max(0, min(1, x)))
+                focusPointY = Float(max(0, min(1, y)))
+            }
+        }
+        
+        print("🔒 lockFocus at: (\(focusPointX), \(focusPointY))")
+        
+        let success = triggerFocusAtPoint(x: CGFloat(focusPointX), y: CGFloat(focusPointY), lockAfterFocus: true)
+        if success {
+            isFocusLocked = true
+        }
+        result(success)
+    }
+    
+    /// Unlock focus and return to continuous auto-focus
+    private func unlockFocus(result: @escaping FlutterResult) {
+        print("🔓 unlockFocus")
+        
+        let success = resetToContinuousAutoFocus()
+        if success {
+            isFocusLocked = false
+        }
+        result(success)
+    }
+    
+    /// Trigger focus at a specific point
+    private func triggerFocusAtPoint(x: CGFloat, y: CGFloat, lockAfterFocus: Bool) -> Bool {
+        guard let device = videoDevice else {
+            print("No video device available for focus")
+            return false
+        }
+        
+        // Check if device supports focus point of interest
+        guard device.isFocusPointOfInterestSupported else {
+            print("Device doesn't support focus point of interest")
+            return false
+        }
+        
+        do {
+            try device.lockForConfiguration()
+            
+            // Set focus point (iOS uses 0-1 coordinates with origin at top-left)
+            // Note: In landscape, you might need to swap x/y or transform coordinates
+            let focusPoint = CGPoint(x: x, y: y)
+            device.focusPointOfInterest = focusPoint
+            
+            // Also set exposure point if supported
+            if device.isExposurePointOfInterestSupported {
+                device.exposurePointOfInterest = focusPoint
+            }
+            
+            if lockAfterFocus {
+                // Focus and lock
+                if device.isFocusModeSupported(.autoFocus) {
+                    device.focusMode = .autoFocus
+                }
+                if device.isExposureModeSupported(.autoExpose) {
+                    device.exposureMode = .autoExpose
+                }
+            } else {
+                // Focus once then return to continuous
+                if device.isFocusModeSupported(.autoFocus) {
+                    device.focusMode = .autoFocus
+                    // Schedule return to continuous after a delay
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                        guard let self = self, !self.isFocusLocked else { return }
+                        _ = self.resetToContinuousAutoFocus()
+                    }
+                }
+                if device.isExposureModeSupported(.continuousAutoExposure) {
+                    device.exposureMode = .continuousAutoExposure
+                }
+            }
+            
+            device.unlockForConfiguration()
+            print("📍 Focus triggered at (\(x), \(y)), lock=\(lockAfterFocus)")
+            return true
+            
+        } catch {
+            print("Failed to configure focus: \(error)")
+            return false
+        }
+    }
+    
+    /// Reset to continuous auto-focus mode
+    private func resetToContinuousAutoFocus() -> Bool {
+        guard let device = videoDevice else {
+            return false
+        }
+        
+        do {
+            try device.lockForConfiguration()
+            
+            // Reset focus to center and continuous
+            if device.isFocusPointOfInterestSupported {
+                device.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5)
+            }
+            if device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusMode = .continuousAutoFocus
+            }
+            
+            // Reset exposure
+            if device.isExposurePointOfInterestSupported {
+                device.exposurePointOfInterest = CGPoint(x: 0.5, y: 0.5)
+            }
+            if device.isExposureModeSupported(.continuousAutoExposure) {
+                device.exposureMode = .continuousAutoExposure
+            }
+            
+            device.unlockForConfiguration()
+            print("🔓 Reset to continuous auto-focus")
+            return true
+            
+        } catch {
+            print("Failed to reset focus: \(error)")
+            return false
         }
     }
     
