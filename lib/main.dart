@@ -5,25 +5,61 @@ import 'package:flashback_cam/theme.dart';
 import 'package:flashback_cam/providers/app_state.dart';
 import 'package:flashback_cam/screens/camera_screen.dart';
 
-void main() {
-  print('===== MAIN STARTED =====');
+/// ═══════════════════════════════════════════════════════════════════════════════
+/// COLD START OPTIMIZED MAIN.DART
+///
+/// COLD START OPTIMIZATION:
+/// This main() function does absolute minimum work before runApp():
+///
+/// 1. WidgetsFlutterBinding.ensureInitialized() - required for Flutter
+/// 2. SystemChrome settings - lightweight, non-blocking
+/// 3. runApp() - starts the Flutter engine
+///
+/// NO heavy work happens here:
+/// - NO AdMob SDK initialization
+/// - NO Billing client connection
+/// - NO Camera initialization
+/// - NO Network calls
+/// - NO Disk I/O beyond essential Flutter setup
+///
+/// All heavy work is deferred to AppState via phased initialization.
+/// Target: main() to first frame in <500ms
+/// ═══════════════════════════════════════════════════════════════════════════════
 
+void main() {
+  // Cold start timing
+  final startTime = DateTime.now();
+  debugPrint('═══════════════════════════════════════════════════════════════');
+  debugPrint('🚀 COLD START: main() started');
+  debugPrint('═══════════════════════════════════════════════════════════════');
+
+  // Required for Flutter - minimal overhead
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Enable edge-to-edge mode (configured in Android styles.xml for Android 15+)
+  // Enable edge-to-edge mode - lightweight system UI configuration
+  // This is non-blocking and essential for UI appearance
   SystemChrome.setEnabledSystemUIMode(
     SystemUiMode.edgeToEdge,
   );
 
-  // Set only the icon brightness for system UI
-  // Colors are now handled by Android theme (non-deprecated approach)
+  // Set system UI overlay style - lightweight, non-blocking
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+    statusBarColor: Colors.transparent,
     statusBarIconBrightness: Brightness.light,
+    systemNavigationBarColor: Colors.transparent,
     systemNavigationBarIconBrightness: Brightness.light,
+    systemNavigationBarDividerColor: Colors.transparent,
   ));
 
-  print('===== ABOUT TO RUN APP =====');
+  final setupDuration = DateTime.now().difference(startTime);
+  debugPrint(
+      '⚡ COLD START: Pre-runApp setup complete in ${setupDuration.inMilliseconds}ms');
+
+  // Launch the app - Flutter engine takes over from here
+  // Heavy initialization is deferred to AppState.initPhase1/2
   runApp(const FlashbackCamApp());
+
+  debugPrint('🎯 COLD START: runApp() called - Flutter engine starting');
 }
 
 class FlashbackCamApp extends StatelessWidget {
@@ -31,11 +67,13 @@ class FlashbackCamApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    print('===== BUILDING FLASHBACK CAM APP =====');
+    debugPrint('🏗️ COLD START: Building FlashbackCamApp widget tree');
 
     return ChangeNotifierProvider(
+      // COLD START: AppState constructor only starts Phase 1 (lightweight init)
+      // Camera and SDKs are initialized AFTER the first frame
       create: (_) {
-        print('===== CREATING APP STATE =====');
+        debugPrint('📦 COLD START: Creating AppState (Phase 1 starts)');
         return AppState();
       },
       child: MaterialApp(
@@ -43,7 +81,7 @@ class FlashbackCamApp extends StatelessWidget {
         debugShowCheckedModeBanner: false,
         theme: FlashbackTheme.lightTheme,
         darkTheme: FlashbackTheme.darkTheme,
-        themeMode: ThemeMode.dark, // Default to dark theme as per spec
+        themeMode: ThemeMode.dark,
         home: const CameraScreen(),
         routes: {
           '/camera': (context) => const CameraScreen(),

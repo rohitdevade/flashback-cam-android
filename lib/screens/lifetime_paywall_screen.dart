@@ -30,6 +30,7 @@ class _LifetimePaywallScreenState extends State<LifetimePaywallScreen>
   late Animation<double> _slideAnimation;
   StreamSubscription<PurchaseResult>? _purchaseSubscription;
   bool _isPurchasing = false;
+  bool _billingInitialized = false;
 
   @override
   void initState() {
@@ -48,6 +49,19 @@ class _LifetimePaywallScreenState extends State<LifetimePaywallScreen>
     );
 
     _animationController.forward();
+
+    // COLD START: Initialize billing client when paywall opens
+    // This is the first time billing is needed, so we lazy-init here
+    _initializeBilling();
+  }
+
+  /// COLD START: Lazy initialize billing when paywall opens
+  Future<void> _initializeBilling() async {
+    final appState = context.read<AppState>();
+    await appState.subscriptionService.ensureBillingInitialized();
+    if (mounted) {
+      setState(() => _billingInitialized = true);
+    }
   }
 
   @override

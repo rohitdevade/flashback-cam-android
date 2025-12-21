@@ -24,7 +24,7 @@ class AppSettings {
   });
 
   factory AppSettings.defaults() => AppSettings(
-        preRollSeconds: 5,
+        preRollSeconds: 10,
         resolution: '1080P',
         fps: 30,
         bitrate: 'Auto',
@@ -36,7 +36,7 @@ class AppSettings {
       );
 
   factory AppSettings.fromJson(Map<String, dynamic> json) => AppSettings(
-        preRollSeconds: json['preRollSeconds'] as int? ?? 5,
+        preRollSeconds: json['preRollSeconds'] as int? ?? 10,
         resolution: ((json['resolution'] as String?) ?? '1080P').toUpperCase(),
         fps: json['fps'] as int? ?? 30,
         bitrate: json['bitrate'] as String? ?? 'Auto',

@@ -41,8 +41,8 @@ android {
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdkVersion = flutter.minSdkVersion
         targetSdk = 35
-        versionCode = 25
-        versionName = "1.0.22"
+        versionCode = flutter.versionCode
+        versionName = flutter.versionName
     }
 
     buildTypes {
@@ -81,6 +81,12 @@ dependencies {
     // Force compatible versions for AGP 8.7.2
     implementation "androidx.core:core:1.15.0"
     implementation "androidx.browser:browser:1.8.0"
+    
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // COLD START: Android 12+ SplashScreen API
+    // Uses the new SplashScreen API for faster, smoother cold start
+    // ═══════════════════════════════════════════════════════════════════════════════
+    implementation "androidx.core:core-splashscreen:1.0.1"
 }
 
 configurations.all {

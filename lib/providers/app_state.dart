@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flashback_cam/models/app_settings.dart';
 import 'package:flashback_cam/models/debug_info.dart';
 import 'package:flashback_cam/models/device_capabilities.dart';
@@ -14,7 +15,31 @@ import 'package:flashback_cam/services/ad_service.dart';
 import 'package:flashback_cam/services/settings_service.dart';
 import 'package:flashback_cam/services/rating_service.dart';
 import 'package:flashback_cam/services/paywall_service.dart';
+import 'package:flashback_cam/services/deferred_init_service.dart';
 import 'package:permission_handler/permission_handler.dart';
+
+/// ═══════════════════════════════════════════════════════════════════════════════
+/// APP STATE - COLD START OPTIMIZED
+///
+/// COLD START OPTIMIZATION STRATEGY:
+///
+/// Phase 1 (Cold Start - runs immediately):
+/// - Load lightweight cached data (settings, user preferences)
+/// - NO camera initialization
+/// - NO SDK initialization (ads, billing)
+/// - UI shows immediately with placeholder/loading state
+///
+/// Phase 2 (Deferred - runs after first frame):
+/// - Camera preview initialization (when permissions granted)
+/// - Heavy services start in background
+///
+/// Phase 3 (User-Triggered - on demand):
+/// - Buffer/recording starts on "Start Buffer" tap
+/// - Ads SDK initializes on first ad request
+/// - Billing initializes on paywall open
+///
+/// This ensures first frame renders in <500ms.
+/// ═══════════════════════════════════════════════════════════════════════════════
 
 enum CameraMode {
   idle, // Camera and buffer OFF
@@ -64,6 +89,29 @@ class AppState extends ChangeNotifier {
   DateTime? _bufferStartTime;
   Timer? _progressTimer;
   int _bufferRemainingSeconds = 0;
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // BUFFER UNLOCK STATE - Track rewarded ad unlocks for buffer duration
+  // ═══════════════════════════════════════════════════════════════════════════════
+
+  /// Currently unlocked buffer duration (via rewarded ad) - resets after save
+  int? _rewardedBufferUnlock;
+
+  /// Number of rewarded buffer unlocks used in this session
+  int _rewardedUnlockCount = 0;
+
+  /// Maximum rewarded unlocks before showing paywall
+  static const int _maxRewardedUnlocksBeforePaywall = 2;
+
+  /// Get the currently unlocked buffer duration (null if none)
+  int? get rewardedBufferUnlock => _rewardedBufferUnlock;
+
+  /// Check if a buffer duration is currently unlocked via rewarded ad
+  bool get hasRewardedBufferUnlock => _rewardedBufferUnlock != null;
+
+  /// Check if user has used too many rewarded unlocks and should see paywall
+  bool get shouldShowPaywallInsteadOfRewardedAd =>
+      _rewardedUnlockCount >= _maxRewardedUnlocksBeforePaywall;
 
   // ═══════════════════════════════════════════════════════════════════════════════
   // STORAGE STATE - Track storage mode and errors for UI
@@ -146,50 +194,121 @@ class AppState extends ChangeNotifier {
     return (elapsedMs % bufferDurationMs) / bufferDurationMs;
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // COLD START: Track initialization phases
+  // ═══════════════════════════════════════════════════════════════════════════════
+  bool _phase1Complete = false; // Lightweight init (cached data)
+  bool _phase2Complete = false; // Camera preview
+  bool _cameraInitialized = false; // Camera hardware ready
+  final DeferredInitService _deferredInit = DeferredInitService();
+
+  /// Check if basic UI can be shown (Phase 1 complete)
+  bool get isUIReady => _phase1Complete;
+
+  /// Check if camera preview is ready (Phase 2 complete)
+  bool get isCameraReady => _cameraInitialized;
+
   AppState() {
     _subscriptionService = SubscriptionService();
     _deviceService = DeviceService(_cameraService);
-    _initialize();
+    // COLD START: Start Phase 1 (lightweight) immediately
+    _initializePhase1();
   }
 
-  Future<void> _initialize() async {
-    if (_isInitializing) {
-      debugPrint(
-          'Initialization already in progress, ignoring duplicate call.');
-      return;
-    }
-    _isInitializing = true;
+  /// ═══════════════════════════════════════════════════════════════════════════════
+  /// PHASE 1: Lightweight initialization - runs during cold start
+  ///
+  /// COLD START OPTIMIZATION:
+  /// - Only loads cached data from SharedPreferences
+  /// - NO camera, NO SDKs, NO network calls
+  /// - Target: complete in <100ms
+  /// - UI can render immediately after this
+  /// ═══════════════════════════════════════════════════════════════════════════════
+  Future<void> _initializePhase1() async {
+    final startTime = DateTime.now();
+    debugPrint('🚀 COLD START: Phase 1 starting...');
+
     try {
-      // Initialize critical services that camera needs (storage, settings)
-      // and non-critical services (subscription, ads, rating, paywall) in parallel
+      // Only load lightweight cached data - these read from SharedPreferences
+      // and don't involve any SDK initialization or network calls
       await Future.wait([
-        _storageService.initialize(),
-        _subscriptionService.initialize(),
+        _storageService.initialize(), // Loads cached video list
+        _settingsService.initialize(), // Loads user preferences
+        _subscriptionService
+            .initialize(), // Loads cached subscription status ONLY
+        _ratingService.initialize(), // Loads rating counters
+        _paywallService.initialize(), // Loads paywall counters
+        // NOTE: AdService.initialize() is now a no-op (deferred)
         _adService.initialize(),
-        _settingsService.initialize(),
-        _ratingService.initialize(),
-        _paywallService.initialize(),
       ]);
 
+      _phase1Complete = true;
+      _isInitialized = true; // Mark as initialized so UI can render
+
+      final duration = DateTime.now().difference(startTime);
+      debugPrint(
+          '✅ COLD START: Phase 1 complete in ${duration.inMilliseconds}ms');
+      debugPrint('   UI is now ready to render');
+
+      notifyListeners(); // Trigger UI rebuild
+
+      // Schedule Phase 2 after first frame
+      _schedulePhase2();
+    } catch (e, stackTrace) {
+      debugPrint('❌ Phase 1 initialization failed: $e');
+      debugPrint('Stack trace: $stackTrace');
+      _initializationError = 'Failed to initialize app: $e';
+      _phase1Complete = true;
+      notifyListeners();
+    }
+  }
+
+  /// ═══════════════════════════════════════════════════════════════════════════════
+  /// PHASE 2: Camera preview initialization - runs after first frame
+  ///
+  /// COLD START OPTIMIZATION:
+  /// - Deferred until after UI is visible
+  /// - Initializes camera preview for live viewfinder
+  /// - Buffer/recording is still NOT started (user must tap button)
+  /// ═══════════════════════════════════════════════════════════════════════════════
+  void _schedulePhase2() {
+    // Use addPostFrameCallback to ensure this runs after the first frame
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _initializePhase2();
+    });
+  }
+
+  Future<void> _initializePhase2() async {
+    if (_isInitializing || _phase2Complete) return;
+    _isInitializing = true;
+
+    final startTime = DateTime.now();
+    debugPrint('🎥 COLD START: Phase 2 starting (camera preview)...');
+
+    try {
+      // Check permissions first
       final hasPermissions = await _ensureRequiredPermissions();
       if (!hasPermissions) {
         debugPrint('Camera permissions not granted; camera setup skipped.');
-        _isInitialized = false;
         _cameraMode = CameraMode.idle;
+        _phase2Complete = true;
+        _isInitializing = false;
+        notifyListeners();
         return;
       }
 
+      // Detect device capabilities
       await _deviceService.detectCapabilities();
 
+      // Set up camera event listener
       _cameraService.eventStream.listen(_handleCameraEvent);
 
-      // Resolve preferred settings before initializing camera
+      // Initialize camera with user's saved settings
       final initialSettings = _settingsService.settings;
       final resolvedResolution =
           _resolveResolutionForCamera(initialSettings.resolution);
       final resolvedFps = _resolveFpsForCamera(initialSettings.fps);
 
-      // Initialize camera and preview on startup (but not buffer)
       await _cameraService.initialize(
         resolution: resolvedResolution,
         fps: resolvedFps,
@@ -200,54 +319,42 @@ class AppState extends ChangeNotifier {
 
       debugPrint('Camera initialized, waiting for camera device to open...');
 
-      // Wait for native 'cameraOpened' event instead of fixed delay
-      // Falls back to proceeding after timeout if event not received
       final cameraReady = await _cameraService.waitForCameraReady(
         timeout: const Duration(seconds: 3),
       );
       debugPrint('Camera ready: $cameraReady');
 
-      debugPrint('Creating preview texture...');
-
       // Create camera preview texture
       _previewTextureId = await _cameraService.createPreview();
-
       if (_previewTextureId == null) {
         throw Exception('Failed to create preview texture');
       }
 
       debugPrint('Preview texture created: $_previewTextureId');
 
-      // Mark as initialized and ready as soon as preview texture is created
-      // This enables the buffer button immediately when camera is visible
       _initializationError = null;
-      _isInitialized = true;
-      _cameraMode = CameraMode.idle; // Start in IDLE state with preview ON
-      notifyListeners(); // Update UI to show texture and enable controls
+      _cameraInitialized = true;
+      _cameraMode = CameraMode.idle; // Ready for user to start buffer
 
-      debugPrint('✅ App initialized in IDLE mode - preview ON, buffer OFF');
-
-      // Start preview (this will create the capture session)
-      debugPrint('Starting camera preview...');
+      // Start preview
       await _cameraService.startPreview();
 
-      // Wait for native 'previewStarted' event (non-blocking for UI)
-      // This is just for logging/debugging, UI is already enabled
-      _cameraService
-          .waitForPreviewReady(
-        timeout: const Duration(seconds: 3),
-      )
-          .then((previewReady) {
-        debugPrint('Preview ready: $previewReady');
-      });
-
-      // Fetch max zoom from camera (non-blocking for UI readiness)
-      debugPrint('Fetching max zoom from camera...');
+      // Get max zoom (non-blocking)
       _maxZoom = await _cameraService.getMaxZoom();
-      debugPrint('🔍 Max zoom updated to: $_maxZoom');
-      notifyListeners();
+      debugPrint('🔍 Max zoom: $_maxZoom');
+
+      _phase2Complete = true;
+
+      final duration = DateTime.now().difference(startTime);
+      debugPrint(
+          '✅ COLD START: Phase 2 complete in ${duration.inMilliseconds}ms');
+      debugPrint('   Camera preview is ready');
+      debugPrint('   Buffer will start when user taps "Start Buffer"');
+
+      // Print deferred init report
+      _deferredInit.printInitReport();
     } catch (e, stackTrace) {
-      debugPrint('Failed to initialize app state: $e');
+      debugPrint('❌ Phase 2 initialization failed: $e');
       debugPrint('Stack trace: $stackTrace');
       _initializationError = 'Failed to initialize camera: $e';
     } finally {
@@ -255,6 +362,12 @@ class AppState extends ChangeNotifier {
       notifyListeners();
     }
   }
+
+  /// ═══════════════════════════════════════════════════════════════════════════════
+  /// REMOVED: Old synchronous _initialize() that blocked cold start
+  /// This was the main cause of slow cold start - it initialized everything
+  /// including camera, ads, billing, etc. before the first frame.
+  /// ═══════════════════════════════════════════════════════════════════════════════
 
   Future<bool> _ensureRequiredPermissions() async {
     // Only request the core permissions needed to show the system prompt.
@@ -532,6 +645,9 @@ class AppState extends ChangeNotifier {
 
       // Track video save for rating/paywall services
       onVideoSaved();
+
+      // Clear rewarded buffer unlock after save (one-time use)
+      _clearRewardedBufferUnlock();
     } catch (e) {
       debugPrint('Failed to add video from event: $e');
       debugPrint('Video data: $videoData');
@@ -548,6 +664,184 @@ class AppState extends ChangeNotifier {
   Future<void> showGalleryAd() async {
     if (!isPro) {
       await _adService.showGalleryInterstitialAd();
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // BUFFER DURATION CONTROL - From camera preview screen
+  // ═══════════════════════════════════════════════════════════════════════════════
+
+  /// Available buffer durations (in seconds)
+  static const List<int> availableBufferDurations = [10, 20, 30];
+
+  /// Default buffer duration for all users
+  static const int defaultBufferDuration = 10;
+
+  /// Check if a buffer duration is available for the current user
+  /// Returns: 'available', 'locked', or 'unlocked' (via rewarded ad)
+  String getBufferDurationStatus(int seconds) {
+    // 10s is always available
+    if (seconds == 10) return 'available';
+
+    // Pro users have access to all durations
+    if (isPro) return 'available';
+
+    // Check if this duration is unlocked via rewarded ad
+    if (_rewardedBufferUnlock == seconds) return 'unlocked';
+
+    // Otherwise it's locked for free users
+    return 'locked';
+  }
+
+  /// Check if user can select a buffer duration
+  /// Returns true if selection is allowed, false if blocked
+  bool canSelectBufferDuration(int seconds) {
+    // Block during recording or processing
+    if (_cameraMode == CameraMode.recording ||
+        _cameraMode == CameraMode.processing) {
+      return false;
+    }
+    return true;
+  }
+
+  /// Attempt to select a buffer duration
+  /// For locked durations, this will trigger rewarded ad or paywall
+  /// Returns: 'success', 'blocked', 'needs_ad', 'needs_paywall'
+  String trySelectBufferDuration(int seconds) {
+    // Block during recording/processing
+    if (!canSelectBufferDuration(seconds)) {
+      return 'blocked';
+    }
+
+    // 10s is always available
+    if (seconds == 10) {
+      return 'success';
+    }
+
+    // Pro users can select any duration
+    if (isPro) {
+      return 'success';
+    }
+
+    // Check if already unlocked
+    if (_rewardedBufferUnlock == seconds) {
+      return 'success';
+    }
+
+    // Free user trying to select locked duration
+    // Check if they should see paywall instead of rewarded ad
+    if (shouldShowPaywallInsteadOfRewardedAd) {
+      return 'needs_paywall';
+    }
+
+    return 'needs_ad';
+  }
+
+  /// Show rewarded ad to unlock a buffer duration
+  /// Returns true if unlock was successful
+  Future<bool> showRewardedAdForBuffer(int seconds) async {
+    debugPrint('🎬 Showing rewarded ad to unlock ${seconds}s buffer');
+
+    final success = await _adService.showRewardedAdForBufferUnlock();
+
+    if (success) {
+      _rewardedBufferUnlock = seconds;
+      _rewardedUnlockCount++;
+      debugPrint(
+          '✅ Buffer ${seconds}s unlocked via rewarded ad (count: $_rewardedUnlockCount)');
+      notifyListeners();
+      return true;
+    }
+
+    debugPrint('❌ Rewarded ad failed or was cancelled');
+    return false;
+  }
+
+  /// Clear the rewarded buffer unlock (called after video save)
+  void _clearRewardedBufferUnlock() {
+    if (_rewardedBufferUnlock != null) {
+      debugPrint(
+          '🔒 Clearing rewarded buffer unlock, reverting to ${defaultBufferDuration}s');
+      _rewardedBufferUnlock = null;
+
+      // Revert to default buffer duration if currently using unlocked duration
+      final currentBuffer = _settingsService.settings.preRollSeconds;
+      if (currentBuffer > defaultBufferDuration && !isPro) {
+        _updateBufferDurationInternal(defaultBufferDuration);
+      }
+
+      notifyListeners();
+    }
+  }
+
+  /// Change buffer duration (internal, after validation)
+  Future<void> _updateBufferDurationInternal(int seconds) async {
+    final currentSettings = _settingsService.settings;
+    if (currentSettings.preRollSeconds == seconds) return;
+
+    debugPrint(
+        '⏱️ Changing buffer duration from ${currentSettings.preRollSeconds}s to ${seconds}s');
+
+    // Update settings
+    await updateSettings(currentSettings.copyWith(preRollSeconds: seconds));
+
+    // If buffer is active, restart it with new duration
+    if (_cameraMode == CameraMode.buffering) {
+      await _restartBufferWithNewDuration();
+    }
+  }
+
+  /// Change buffer duration with full validation
+  /// Returns true if change was successful
+  Future<bool> changeBufferDuration(int seconds) async {
+    final status = trySelectBufferDuration(seconds);
+
+    if (status != 'success') {
+      debugPrint('❌ Cannot change buffer to ${seconds}s: $status');
+      return false;
+    }
+
+    await _updateBufferDurationInternal(seconds);
+    return true;
+  }
+
+  /// Restart buffer with new duration (called when duration changes while buffering)
+  Future<void> _restartBufferWithNewDuration() async {
+    if (_cameraMode != CameraMode.buffering) return;
+
+    debugPrint('🔄 Restarting buffer with new duration...');
+
+    try {
+      // Stop current buffer
+      _progressTimer?.cancel();
+      await _cameraService.stopBuffer();
+
+      // Clear buffer state
+      _bufferStartTime = null;
+      _bufferSeconds = 0;
+      _bufferRemainingSeconds = 0;
+
+      // Start new buffer with updated duration
+      await _cameraService.startBuffer();
+
+      // Mark buffer start time
+      _bufferStartTime = DateTime.now();
+
+      // Restart progress timer
+      _progressTimer = Timer.periodic(Duration(milliseconds: 100), (timer) {
+        if (_cameraMode == CameraMode.idle) {
+          timer.cancel();
+          return;
+        }
+        if (hasListeners) {
+          _updateBufferFillLevel();
+          notifyListeners();
+        }
+      });
+
+      debugPrint('✅ Buffer restarted with ${selectedBufferSeconds}s duration');
+    } catch (e) {
+      debugPrint('❌ Failed to restart buffer: $e');
     }
   }
 
@@ -874,18 +1168,15 @@ class AppState extends ChangeNotifier {
 
   Future<bool> refreshPermissions() async {
     final granted = await _ensureRequiredPermissions();
-    if (granted && !_isInitialized && !_isInitializing) {
-      await _initialize();
+    if (granted && !_phase2Complete && !_isInitializing) {
+      // Re-trigger Phase 2 if permissions were just granted
+      _initializePhase2();
     }
     return granted;
   }
 
   bool get isInitialized => _isInitialized;
-  bool get isCameraReady =>
-      _permissionsGranted &&
-      _initializationError == null &&
-      _previewTextureId != null &&
-      _isInitialized;
+  // Note: isCameraReady is defined earlier in the class with the phase tracking
   bool get isInitializing => _isInitializing;
   bool get permissionsGranted => _permissionsGranted;
   bool get permissionsPermanentlyDenied => _permissionsPermanentlyDenied;

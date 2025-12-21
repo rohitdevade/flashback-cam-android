@@ -13,6 +13,8 @@ import 'package:flashback_cam/widgets/video_thumbnail.dart';
 import 'package:flashback_cam/widgets/debug_info_panel.dart';
 import 'package:flashback_cam/widgets/camera_instructions_overlay.dart';
 import 'package:flashback_cam/widgets/rating_popup.dart';
+import 'package:flashback_cam/widgets/buffer_duration_selector.dart';
+import 'package:flashback_cam/widgets/persistent_bottom_bar.dart';
 import 'package:flashback_cam/screens/gallery_screen.dart';
 import 'package:flashback_cam/screens/settings_screen.dart';
 import 'package:flashback_cam/screens/lifetime_paywall_screen.dart';
@@ -32,6 +34,7 @@ class _CameraScreenState extends State<CameraScreen>
   Map<String, bool> _capabilities = {};
   bool _capabilitiesLoaded = false;
   bool _showInstructions = false;
+  bool _showInstructionsManual = false; // Triggered from bottom bar
   bool _instructionsChecked = false;
   bool _lowMemoryWarningShown = false;
   bool _dayThreePaywallChecked = false;
@@ -487,6 +490,18 @@ class _CameraScreenState extends State<CameraScreen>
                     setState(() => _showInstructions = false);
                     appState.markCameraInstructionsSeen();
                   },
+                  onDontShowAgain: () {
+                    appState.markCameraInstructionsSeen();
+                  },
+                  showDontShowAgain: true,
+                ),
+              // Camera instructions overlay (manual trigger from bottom bar)
+              if (_showInstructionsManual)
+                CameraInstructionsOverlay(
+                  onDismiss: () {
+                    setState(() => _showInstructionsManual = false);
+                  },
+                  showDontShowAgain: false,
                 ),
             ],
           ),
@@ -525,13 +540,33 @@ class _CameraScreenState extends State<CameraScreen>
             ),
           ),
         const Spacer(),
+        // Rewarded buffer unlock badge
+        if (appState.hasRewardedBufferUnlock)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: RewardedBufferBadge(
+              duration: appState.rewardedBufferUnlock!,
+            ),
+          ),
         if (appState.isFinalizing)
           Padding(
             padding: const EdgeInsets.only(bottom: 24),
             child: FinalizingIndicator(progress: appState.finalizeProgress),
           ),
         _buildBottomControls(appState, isPortrait: true),
-        const SizedBox(height: 32),
+        const SizedBox(height: 16),
+        // Persistent bottom navigation bar
+        PersistentBottomBar(
+          onHowItWorksTap: () {
+            setState(() => _showInstructionsManual = true);
+          },
+          onShowPaywall: () => _openPaywall(context),
+          selectedBufferSeconds: appState.selectedBufferSeconds,
+          isBuffering: appState.isBuffering,
+          isRecording: appState.isRecording,
+          isFinalizing: appState.isFinalizing,
+        ),
+        const SizedBox(height: 24),
       ],
     );
   }
@@ -565,6 +600,14 @@ class _CameraScreenState extends State<CameraScreen>
                     onLockedTap: () => _openPaywall(context),
                   ),
                 const Spacer(),
+                // Rewarded buffer unlock badge
+                if (appState.hasRewardedBufferUnlock)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 12),
+                    child: RewardedBufferBadge(
+                      duration: appState.rewardedBufferUnlock!,
+                    ),
+                  ),
                 if (appState.isFinalizing)
                   Align(
                     alignment: Alignment.bottomLeft,
@@ -572,6 +615,17 @@ class _CameraScreenState extends State<CameraScreen>
                       progress: appState.finalizeProgress,
                     ),
                   ),
+                // Persistent bottom bar in landscape (positioned at bottom left)
+                PersistentBottomBar(
+                  onHowItWorksTap: () {
+                    setState(() => _showInstructionsManual = true);
+                  },
+                  onShowPaywall: () => _openPaywall(context),
+                  selectedBufferSeconds: appState.selectedBufferSeconds,
+                  isBuffering: appState.isBuffering,
+                  isRecording: appState.isRecording,
+                  isFinalizing: appState.isFinalizing,
+                ),
               ],
             ),
           ),

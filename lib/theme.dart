@@ -1,4 +1,5 @@
 ﻿import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 /// Flashback Cam color palette following modern, minimal, premium design
 class AppColors {
@@ -72,6 +73,16 @@ class FlashbackTheme {
         ),
         fontFamily: fontFamily,
         splashFactory: InkRipple.splashFactory,
+        // Edge-to-edge: transparent system bars
+        appBarTheme: const AppBarTheme(
+          systemOverlayStyle: SystemUiOverlayStyle(
+            statusBarColor: Colors.transparent,
+            statusBarIconBrightness: Brightness.light,
+            systemNavigationBarColor: Colors.transparent,
+            systemNavigationBarIconBrightness: Brightness.light,
+            systemNavigationBarDividerColor: Colors.transparent,
+          ),
+        ),
       );
 
   /// Light theme (fallback, but app defaults to dark)
@@ -91,5 +102,15 @@ class FlashbackTheme {
           onError: Colors.white,
         ),
         fontFamily: fontFamily,
+        // Edge-to-edge: transparent system bars
+        appBarTheme: const AppBarTheme(
+          systemOverlayStyle: SystemUiOverlayStyle(
+            statusBarColor: Colors.transparent,
+            statusBarIconBrightness: Brightness.dark,
+            systemNavigationBarColor: Colors.transparent,
+            systemNavigationBarIconBrightness: Brightness.dark,
+            systemNavigationBarDividerColor: Colors.transparent,
+          ),
+        ),
       );
 }

@@ -7,6 +7,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.core.view.WindowCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -17,15 +18,58 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.util.concurrent.Executors
 
+/**
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * MAIN ACTIVITY - COLD START OPTIMIZED
+ * 
+ * COLD START OPTIMIZATION STRATEGY:
+ * 
+ * 1. onCreate() does minimal work:
+ *    - Install splash screen (Android 12+ API)
+ *    - Enable edge-to-edge display
+ *    - Call super.onCreate()
+ *    - That's it - no heavy initialization
+ * 
+ * 2. All heavy work is deferred to Flutter:
+ *    - Camera initialization → User taps "Start Buffer"
+ *    - AdMob SDK → First ad request
+ *    - Billing client → Paywall opened
+ *    - Analytics → Background after UI visible
+ * 
+ * 3. First frame target: <500ms
+ *    - Splash screen shows branding only
+ *    - No blocking operations
+ *    - Flutter engine starts in parallel
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ */
 class MainActivity : FlutterActivity() {
     private val mediaChannel = "flashback_cam/media"
     private val ioExecutor = Executors.newSingleThreadExecutor()
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // ═══════════════════════════════════════════════════════════════════════
+        // COLD START: Install splash screen BEFORE super.onCreate()
+        // This uses the Android 12+ SplashScreen API for smoother cold start
+        // The splash is purely for branding - no blocking work happens here
+        // ═══════════════════════════════════════════════════════════════════════
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val splashScreen = installSplashScreen()
+            // Don't keep splash screen visible - let Flutter take over immediately
+            // The splash screen is just for branding during process creation
+            splashScreen.setKeepOnScreenCondition { false }
+        }
+        
         // Enable edge-to-edge display for Android 15+ compatibility
         // This tells the system we want to handle insets ourselves
         WindowCompat.setDecorFitsSystemWindows(window, false)
+        
+        // Call super - this starts Flutter engine
+        // COLD START: No other work should happen in onCreate
         super.onCreate(savedInstanceState)
+        
+        // Log cold start timing for debugging
+        android.util.Log.d("ColdStart", "MainActivity.onCreate() complete")
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {

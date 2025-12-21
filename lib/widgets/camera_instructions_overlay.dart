@@ -2,13 +2,37 @@ import 'package:flutter/material.dart';
 import 'package:flashback_cam/theme.dart';
 import 'package:flashback_cam/widgets/glass_container.dart';
 
-class CameraInstructionsOverlay extends StatelessWidget {
+class CameraInstructionsOverlay extends StatefulWidget {
   final VoidCallback onDismiss;
+
+  /// Optional callback when "Don't show again" is selected
+  final VoidCallback? onDontShowAgain;
+
+  /// Whether to show the "Don't show again" checkbox
+  /// Set to false for manual triggers from the bottom bar
+  final bool showDontShowAgain;
 
   const CameraInstructionsOverlay({
     super.key,
     required this.onDismiss,
+    this.onDontShowAgain,
+    this.showDontShowAgain = true,
   });
+
+  @override
+  State<CameraInstructionsOverlay> createState() =>
+      _CameraInstructionsOverlayState();
+}
+
+class _CameraInstructionsOverlayState extends State<CameraInstructionsOverlay> {
+  bool _dontShowAgain = false;
+
+  void _handleDismiss() {
+    if (_dontShowAgain && widget.onDontShowAgain != null) {
+      widget.onDontShowAgain!();
+    }
+    widget.onDismiss();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -100,11 +124,58 @@ class CameraInstructionsOverlay extends StatelessWidget {
 
                     const SizedBox(height: 24),
 
+                    // Don't show again checkbox (only show when appropriate)
+                    if (widget.showDontShowAgain)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 16),
+                        child: GestureDetector(
+                          onTap: () {
+                            setState(() => _dontShowAgain = !_dontShowAgain);
+                          },
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Container(
+                                width: 20,
+                                height: 20,
+                                decoration: BoxDecoration(
+                                  color: _dontShowAgain
+                                      ? AppColors.electricBlue
+                                      : Colors.transparent,
+                                  borderRadius: BorderRadius.circular(4),
+                                  border: Border.all(
+                                    color: _dontShowAgain
+                                        ? AppColors.electricBlue
+                                        : Colors.white.withOpacity(0.5),
+                                    width: 1.5,
+                                  ),
+                                ),
+                                child: _dontShowAgain
+                                    ? const Icon(
+                                        Icons.check,
+                                        color: Colors.white,
+                                        size: 14,
+                                      )
+                                    : null,
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                "Don't show again",
+                                style: TextStyle(
+                                  color: Colors.white.withOpacity(0.7),
+                                  fontSize: 13,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+
                     // Got it button
                     SizedBox(
                       width: double.infinity,
                       child: ElevatedButton(
-                        onPressed: onDismiss,
+                        onPressed: _handleDismiss,
                         style: ElevatedButton.styleFrom(
                           backgroundColor: AppColors.electricBlue,
                           foregroundColor: Colors.white,

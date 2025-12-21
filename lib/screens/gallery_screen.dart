@@ -50,13 +50,15 @@ class _GalleryScreenState extends State<GalleryScreen>
     });
   }
 
-  void _loadBannerAd() {
+  void _loadBannerAd() async {
     final appState = context.read<AppState>();
     if (appState.isPro) return; // Don't show ads for pro users
 
-    _bannerAd = appState.adService.createGalleryBannerAd();
-    if (_bannerAd == null) return; // No consent for ads
+    // COLD START: Banner ad creation is now async (SDK lazy-initializes)
+    final bannerAd = await appState.adService.createGalleryBannerAd();
+    if (bannerAd == null) return; // No consent for ads
 
+    _bannerAd = bannerAd;
     _bannerAd!.load().then((_) {
       if (mounted) {
         setState(() => _isBannerAdLoaded = true);

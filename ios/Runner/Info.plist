@@ -52,9 +52,9 @@
   <string>Flashback Cam needs microphone access to record audio with your videos.</string>
   <key>NSPhotoLibraryAddUsageDescription</key>
   <string>Allow Flashback Cam to save videos to your library.</string>
-  <!-- AdMob App ID (Test App ID) -->
+  <!-- AdMob App ID -->
   <key>GADApplicationIdentifier</key>
-  <string>ca-app-pub-3940256099942544~1458002511</string>
+  <string>ca-app-pub-6281772921050479~8837812493</string>
   <key>SKAdNetworkItems</key>
   <array>
     <dict>
