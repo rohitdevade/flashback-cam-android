@@ -166,8 +166,8 @@ class SubscriptionService {
           onError: (error) => debugPrint('Purchase stream error: $error'),
         );
 
-        // Load products
-        await loadProducts();
+        // Load products (use internal method to avoid circular dependency)
+        await _loadProductsInternal();
 
         // Sync subscription status with Google Play
         await _syncSubscriptionWithStore();
@@ -208,10 +208,16 @@ class SubscriptionService {
     }
   }
 
+  /// Public method to load products - ensures billing is initialized first
   Future<void> loadProducts() async {
     // COLD START: Ensure billing is initialized before loading products
     await ensureBillingInitialized();
+    // Products are already loaded during ensureBillingInitialized
+  }
 
+  /// Internal method to load products - called from ensureBillingInitialized
+  /// This avoids circular dependency
+  Future<void> _loadProductsInternal() async {
     if (!_isAvailable) return;
 
     try {
@@ -617,6 +623,9 @@ class SubscriptionService {
       }
     }
 
+    // CRITICAL: Ensure billing is initialized before any purchase operation
+    await ensureBillingInitialized();
+
     // In debug mode, simulate successful purchases for testing
     if (_debugPurchasesEnabled) {
       debugPrint('🔧 DEBUG MODE: Simulating purchase for tier: $tier');
@@ -696,6 +705,9 @@ class SubscriptionService {
   }
 
   Future<bool> restorePurchases() async {
+    // CRITICAL: Ensure billing is initialized before restore operation
+    await ensureBillingInitialized();
+
     // In debug mode, simulate restore - check if user was already pro
     if (_debugPurchasesEnabled) {
       debugPrint('🔧 DEBUG MODE: Simulating restore purchases');

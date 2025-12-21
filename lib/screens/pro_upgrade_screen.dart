@@ -23,6 +23,7 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
   late Animation<double> _fadeAnimation;
   late Animation<double> _pulseAnimation;
   StreamSubscription<PurchaseResult>? _purchaseSubscription;
+  bool _billingInitialized = false;
 
   @override
   void initState() {
@@ -46,6 +47,18 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
 
     _fadeController.forward();
     _pulseController.repeat(reverse: true);
+
+    // COLD START: Initialize billing when screen opens
+    _initializeBilling();
+  }
+
+  /// COLD START: Lazy initialize billing when paywall opens
+  Future<void> _initializeBilling() async {
+    final appState = context.read<AppState>();
+    await appState.subscriptionService.ensureBillingInitialized();
+    if (mounted) {
+      setState(() => _billingInitialized = true);
+    }
   }
 
   @override
@@ -291,9 +304,16 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
     final appState = context.watch<AppState>();
     final subscriptionService = appState.subscriptionService;
 
-    final monthlyProduct = subscriptionService.getProductDetails('monthly');
-    final yearlyProduct = subscriptionService.getProductDetails('yearly');
-    final lifetimeProduct = subscriptionService.getProductDetails('lifetime');
+    // Only fetch products after billing is initialized
+    final monthlyProduct = _billingInitialized
+        ? subscriptionService.getProductDetails('monthly')
+        : null;
+    final yearlyProduct = _billingInitialized
+        ? subscriptionService.getProductDetails('yearly')
+        : null;
+    final lifetimeProduct = _billingInitialized
+        ? subscriptionService.getProductDetails('lifetime')
+        : null;
 
     return Column(
       children: [

@@ -75,7 +75,9 @@ class _LifetimePaywallScreenState extends State<LifetimePaywallScreen>
   Widget build(BuildContext context) {
     final appState = context.watch<AppState>();
     final subscriptionService = appState.subscriptionService;
-    final lifetimePricing = subscriptionService.getLifetimePricing();
+    // Only get pricing after billing is initialized
+    final lifetimePricing =
+        _billingInitialized ? subscriptionService.getLifetimePricing() : null;
 
     return Scaffold(
       backgroundColor: AppColors.deepCharcoal,

@@ -2042,11 +2042,15 @@ class _SettingsScreenState extends State<SettingsScreen>
   void _upgradeToLifetime(BuildContext context, AppState appState) async {
     Navigator.pop(context); // Close upgrade dialog
 
+    // Store navigator and scaffold messenger before async operations
+    final navigator = Navigator.of(context);
+    final scaffoldMessenger = ScaffoldMessenger.of(context);
+
     // Show loading
     showDialog(
       context: context,
       barrierDismissible: false,
-      builder: (context) => Dialog(
+      builder: (dialogContext) => Dialog(
         backgroundColor: Colors.transparent,
         child: GlassContainer(
           padding: const EdgeInsets.all(32),
@@ -2057,7 +2061,7 @@ class _SettingsScreenState extends State<SettingsScreen>
               const SizedBox(height: 20),
               Text(
                 'Processing upgrade...',
-                style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                style: Theme.of(dialogContext).textTheme.titleMedium?.copyWith(
                       color: AppColors.textPrimary,
                     ),
               ),
@@ -2069,10 +2073,12 @@ class _SettingsScreenState extends State<SettingsScreen>
 
     try {
       final success = await appState.purchasePro('lifetime');
-      Navigator.pop(context); // Close loading dialog
+
+      if (!mounted) return;
+      navigator.pop(); // Close loading dialog
 
       if (success) {
-        ScaffoldMessenger.of(context).showSnackBar(
+        scaffoldMessenger.showSnackBar(
           SnackBar(
             content: Row(
               children: [
@@ -2090,7 +2096,7 @@ class _SettingsScreenState extends State<SettingsScreen>
           ),
         );
       } else {
-        ScaffoldMessenger.of(context).showSnackBar(
+        scaffoldMessenger.showSnackBar(
           SnackBar(
             content: const Text('Upgrade was canceled or failed'),
             backgroundColor: AppColors.recordRed,
@@ -2101,8 +2107,9 @@ class _SettingsScreenState extends State<SettingsScreen>
         );
       }
     } catch (e) {
-      Navigator.pop(context); // Close loading dialog
-      ScaffoldMessenger.of(context).showSnackBar(
+      if (!mounted) return;
+      navigator.pop(); // Close loading dialog
+      scaffoldMessenger.showSnackBar(
         SnackBar(
           content: Text('Upgrade failed: ${e.toString()}'),
           backgroundColor: AppColors.recordRed,
