@@ -21,9 +21,20 @@ class DeviceService {
 
   List<String> getAvailableResolutions(bool isPro) {
     final caps = _capabilities;
-    if (caps == null) return ['1080p'];
+    if (caps == null) return ['720P'];
 
     final resolutions = [...caps.supportedResolutions];
+
+    // LOW-MEMORY MODE: Restrict to 720P max on ≤4GB devices
+    if (caps.isLowMemoryDevice) {
+      resolutions.removeWhere((r) => r == '4K' || r == '1080P');
+      // Ensure 720P is available as fallback
+      if (!resolutions.contains('720P')) {
+        resolutions.insert(0, '720P');
+      }
+      return resolutions;
+    }
+
     if (!isPro) {
       resolutions.removeWhere((r) => r == '4K');
     }
@@ -35,11 +46,34 @@ class DeviceService {
     if (caps == null) return [30];
 
     final fpsList = [...caps.supportedFps];
+
+    // LOW-MEMORY MODE: Restrict to 30fps max on ≤4GB devices
+    if (caps.isLowMemoryDevice) {
+      fpsList.removeWhere((f) => f == 60);
+      return fpsList;
+    }
+
     if (!isPro) {
       fpsList.removeWhere((f) => f == 60);
     }
     return fpsList;
   }
+
+  /// Returns available buffer durations for low-memory devices
+  List<int> getAvailableBufferDurations(bool isPro) {
+    final caps = _capabilities;
+
+    // LOW-MEMORY MODE: Max 20s buffer on ≤4GB devices (hide 30s option)
+    if (caps != null && caps.isLowMemoryDevice) {
+      return [10, 20];
+    }
+
+    // Normal devices: all options available
+    return [10, 20, 30];
+  }
+
+  /// Check if device is in low-memory mode (≤4GB RAM)
+  bool get isLowMemoryDevice => _capabilities?.isLowMemoryDevice ?? false;
 
   List<String> getAvailableCodecs(bool isPro) {
     final caps = _capabilities;

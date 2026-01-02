@@ -17,6 +17,7 @@ import 'package:flashback_cam/services/rating_service.dart';
 import 'package:flashback_cam/services/paywall_service.dart';
 import 'package:flashback_cam/services/deferred_init_service.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 /// ═══════════════════════════════════════════════════════════════════════════════
 /// APP STATE - COLD START OPTIMIZED
@@ -220,6 +221,7 @@ class AppState extends ChangeNotifier {
   ///
   /// COLD START OPTIMIZATION:
   /// - Only loads cached data from SharedPreferences
+  /// - Quick permission pre-check (non-blocking)
   /// - NO camera, NO SDKs, NO network calls
   /// - Target: complete in <100ms
   /// - UI can render immediately after this
@@ -240,6 +242,7 @@ class AppState extends ChangeNotifier {
         _paywallService.initialize(), // Loads paywall counters
         // NOTE: AdService.initialize() is now a no-op (deferred)
         _adService.initialize(),
+        _quickPermissionCheck(), // Fast permission pre-check
       ]);
 
       _phase1Complete = true;
@@ -267,14 +270,19 @@ class AppState extends ChangeNotifier {
   /// PHASE 2: Camera preview initialization - runs after first frame
   ///
   /// COLD START OPTIMIZATION:
-  /// - Deferred until after UI is visible
+  /// - Deferred by 800ms to allow UI to become fully interactive
   /// - Initializes camera preview for live viewfinder
   /// - Buffer/recording is still NOT started (user must tap button)
   /// ═══════════════════════════════════════════════════════════════════════════════
   void _schedulePhase2() {
     // Use addPostFrameCallback to ensure this runs after the first frame
+    // Then add additional delay to let UI become fully interactive
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _initializePhase2();
+      Future.delayed(const Duration(milliseconds: 800), () {
+        if (!_phase2Complete && !_isInitializing) {
+          _initializePhase2();
+        }
+      });
     });
   }
 
@@ -368,6 +376,23 @@ class AppState extends ChangeNotifier {
   /// This was the main cause of slow cold start - it initialized everything
   /// including camera, ads, billing, etc. before the first frame.
   /// ═══════════════════════════════════════════════════════════════════════════════
+
+  /// Quick permission check during Phase 1 (non-blocking, just status check)
+  Future<void> _quickPermissionCheck() async {
+    try {
+      final cameraStatus = await Permission.camera.status;
+      final micStatus = await Permission.microphone.status;
+
+      _permissionsGranted = cameraStatus.isGranted && micStatus.isGranted;
+      _permissionsPermanentlyDenied =
+          cameraStatus.isPermanentlyDenied || micStatus.isPermanentlyDenied;
+
+      debugPrint(
+          '🔒 Quick permission check: granted=$_permissionsGranted, denied=$_permissionsPermanentlyDenied');
+    } catch (e) {
+      debugPrint('⚠️ Quick permission check failed: $e');
+    }
+  }
 
   Future<bool> _ensureRequiredPermissions() async {
     // Only request the core permissions needed to show the system prompt.
@@ -671,15 +696,28 @@ class AppState extends ChangeNotifier {
   // BUFFER DURATION CONTROL - From camera preview screen
   // ═══════════════════════════════════════════════════════════════════════════════
 
-  /// Available buffer durations (in seconds)
-  static const List<int> availableBufferDurations = [10, 20, 30];
+  /// Available buffer durations (in seconds) - dynamic based on device RAM
+  /// LOW-MEMORY MODE: Devices with ≤4GB RAM only get [10, 20] options
+  List<int> get availableBufferDurations =>
+      _deviceService.getAvailableBufferDurations(isPro);
+
+  /// Static fallback for when DeviceService isn't available yet
+  static const List<int> defaultBufferDurations = [10, 20, 30];
 
   /// Default buffer duration for all users
   static const int defaultBufferDuration = 10;
 
+  /// Maximum buffer duration for low-memory devices (≤4GB RAM)
+  static const int lowMemoryMaxBufferDuration = 20;
+
   /// Check if a buffer duration is available for the current user
   /// Returns: 'available', 'locked', or 'unlocked' (via rewarded ad)
   String getBufferDurationStatus(int seconds) {
+    // LOW-MEMORY MODE: 30s is not available on ≤4GB devices
+    if (isLowMemoryDevice && seconds > lowMemoryMaxBufferDuration) {
+      return 'unavailable';
+    }
+
     // 10s is always available
     if (seconds == 10) return 'available';
 
@@ -701,6 +739,12 @@ class AppState extends ChangeNotifier {
         _cameraMode == CameraMode.processing) {
       return false;
     }
+
+    // LOW-MEMORY MODE: Block selection of >20s buffer
+    if (isLowMemoryDevice && seconds > lowMemoryMaxBufferDuration) {
+      return false;
+    }
+
     return true;
   }
 
@@ -776,14 +820,23 @@ class AppState extends ChangeNotifier {
 
   /// Change buffer duration (internal, after validation)
   Future<void> _updateBufferDurationInternal(int seconds) async {
+    // LOW-MEMORY MODE: Clamp buffer duration to max allowed
+    int clampedSeconds = seconds;
+    if (isLowMemoryDevice && seconds > lowMemoryMaxBufferDuration) {
+      debugPrint(
+          '⚠️ Low-memory mode: clamping buffer from ${seconds}s to ${lowMemoryMaxBufferDuration}s');
+      clampedSeconds = lowMemoryMaxBufferDuration;
+    }
+
     final currentSettings = _settingsService.settings;
-    if (currentSettings.preRollSeconds == seconds) return;
+    if (currentSettings.preRollSeconds == clampedSeconds) return;
 
     debugPrint(
-        '⏱️ Changing buffer duration from ${currentSettings.preRollSeconds}s to ${seconds}s');
+        '⏱️ Changing buffer duration from ${currentSettings.preRollSeconds}s to ${clampedSeconds}s');
 
     // Update settings
-    await updateSettings(currentSettings.copyWith(preRollSeconds: seconds));
+    await updateSettings(
+        currentSettings.copyWith(preRollSeconds: clampedSeconds));
 
     // If buffer is active, restart it with new duration
     if (_cameraMode == CameraMode.buffering) {
@@ -864,6 +917,10 @@ class AppState extends ChangeNotifier {
     try {
       debugPrint('Starting buffer: checking storage and starting encoders...');
 
+      // COLD START: Enable wakelock when buffer starts (not at app launch)
+      await WakelockPlus.enable();
+      debugPrint('🔒 Wakelock enabled - screen will stay on during buffering');
+
       // Update storage mode before starting
       await _updateStorageMode();
 
@@ -932,6 +989,10 @@ class AppState extends ChangeNotifier {
 
       // Stop buffer only (keep preview running)
       await _cameraService.stopBuffer();
+
+      // COLD START: Disable wakelock when buffer stops
+      await WakelockPlus.disable();
+      debugPrint('🔓 Wakelock disabled - screen can turn off');
 
       // Clear buffer state (but keep preview texture)
       _bufferStartTime = null;
@@ -1125,12 +1186,28 @@ class AppState extends ChangeNotifier {
 
   String _resolveResolutionForCamera(String requestedResolution) {
     final normalized = requestedResolution.toUpperCase();
+    final caps = _deviceService.capabilities;
+
+    // LOW-MEMORY MODE SAFETY OVERRIDE:
+    // On ≤4GB devices, enforce strict resolution limits
+    if (caps != null && caps.isLowMemoryDevice) {
+      // If buffer >20s (edge case/legacy state), force 480P
+      if (selectedBufferSeconds > 20) {
+        debugPrint(
+            '⚠️ Low-memory safety: buffer ${selectedBufferSeconds}s >20s, forcing 480P');
+        return '480P';
+      }
+      // Max resolution is 720P on low-memory devices
+      if (normalized == '4K' || normalized == '1080P') {
+        debugPrint('⚠️ Low-memory mode: downgrading $normalized to 720P');
+        return '720P';
+      }
+    }
 
     if (!isPro && normalized == '4K') {
       return '1080P';
     }
 
-    final caps = _deviceService.capabilities;
     if (normalized == '4K' && caps != null && !caps.supports4K) {
       return '1080P';
     }
@@ -1139,11 +1216,22 @@ class AppState extends ChangeNotifier {
   }
 
   int _resolveFpsForCamera(int requestedFps) {
+    final caps = _deviceService.capabilities;
+
+    // LOW-MEMORY MODE: Force 30fps on ≤4GB devices
+    if (caps != null && caps.isLowMemoryDevice && requestedFps > 30) {
+      debugPrint('⚠️ Low-memory mode: downgrading ${requestedFps}fps to 30fps');
+      return 30;
+    }
+
     if (!isPro && requestedFps == 60) {
       return 30;
     }
     return requestedFps;
   }
+
+  /// Check if device is in low-memory mode (≤4GB RAM)
+  bool get isLowMemoryDevice => _deviceService.isLowMemoryDevice;
 
   Future<bool> purchasePro(String tier) async {
     final success = await _subscriptionService.purchaseSubscription(tier);

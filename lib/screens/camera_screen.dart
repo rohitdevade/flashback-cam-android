@@ -51,8 +51,7 @@ class _CameraScreenState extends State<CameraScreen>
   @override
   void initState() {
     super.initState();
-    // Keep screen on while camera is active
-    WakelockPlus.enable();
+    // COLD START: Don't enable wakelock until buffer starts
     _loadCapabilities();
 
     // Initialize focus animation
@@ -537,6 +536,7 @@ class _CameraScreenState extends State<CameraScreen>
               capabilities: _capabilities,
               capabilitiesLoaded: _capabilitiesLoaded,
               onLockedTap: () => _openPaywall(context),
+              isLowMemoryDevice: appState.isLowMemoryDevice,
             ),
           ),
         const Spacer(),
@@ -598,6 +598,7 @@ class _CameraScreenState extends State<CameraScreen>
                     capabilities: _capabilities,
                     capabilitiesLoaded: _capabilitiesLoaded,
                     onLockedTap: () => _openPaywall(context),
+                    isLowMemoryDevice: appState.isLowMemoryDevice,
                   ),
                 const Spacer(),
                 // Rewarded buffer unlock badge
@@ -873,7 +874,80 @@ class CameraPreview extends StatelessWidget {
       );
     }
 
-    // Show loading state while initializing
+    // Show feature carousel while camera initializes
+    return FeatureHighlightCarousel(isDark: isDark);
+  }
+}
+
+/// Feature highlight carousel shown during cold start
+class FeatureHighlightCarousel extends StatefulWidget {
+  final bool isDark;
+
+  const FeatureHighlightCarousel({super.key, required this.isDark});
+
+  @override
+  State<FeatureHighlightCarousel> createState() =>
+      _FeatureHighlightCarouselState();
+}
+
+class _FeatureHighlightCarouselState extends State<FeatureHighlightCarousel> {
+  final PageController _pageController = PageController();
+  int _currentPage = 0;
+  Timer? _autoPlayTimer;
+
+  final List<Map<String, dynamic>> _features = [
+    {
+      'icon': Icons.video_library_rounded,
+      'title': 'Capture Perfect Moments',
+      'description':
+          'Record moments that already happened with intelligent buffer',
+      'color': AppColors.electricBlue,
+    },
+    {
+      'icon': Icons.timer_outlined,
+      'title': 'Smart Buffer Recording',
+      'description': 'Tap pinch to zoom while recording for better shots',
+      'color': AppColors.successGreen,
+    },
+    {
+      'icon': Icons.hd_rounded,
+      'title': 'High Quality Videos',
+      'description': 'Record in up to 1080p at 60fps with stabilization',
+      'color': AppColors.warningOrange,
+    },
+    {
+      'icon': Icons.flash_on_rounded,
+      'title': 'Pro Features Available',
+      'description': 'Unlock longer buffers and unlimited recordings',
+      'color': AppColors.proGold,
+    },
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    // Auto-advance every 3 seconds
+    _autoPlayTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      if (mounted && _pageController.hasClients) {
+        final nextPage = (_currentPage + 1) % _features.length;
+        _pageController.animateToPage(
+          nextPage,
+          duration: const Duration(milliseconds: 500),
+          curve: Curves.easeInOut,
+        );
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _autoPlayTimer?.cancel();
+    _pageController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
     return Container(
       width: double.infinity,
       height: double.infinity,
@@ -882,8 +956,8 @@ class CameraPreview extends StatelessWidget {
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
           colors: [
-            isDark ? AppColors.deepCharcoal : AppColors.glassWhite,
-            isDark ? Color(0xFF1E2A3A) : Color(0xFFE0E8F0),
+            widget.isDark ? AppColors.deepCharcoal : AppColors.glassWhite,
+            widget.isDark ? Color(0xFF1E2A3A) : Color(0xFFE0E8F0),
           ],
         ),
       ),
@@ -891,26 +965,112 @@ class CameraPreview extends StatelessWidget {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            CircularProgressIndicator(
-              color: AppColors.electricBlue,
-              strokeWidth: 2,
-            ),
-            SizedBox(height: 16),
-            Text(
-              'Initializing Camera...',
-              style: TextStyle(
-                color: AppColors.textSecondary.withValues(alpha: 0.7),
-                fontSize: 18,
-                fontWeight: FontWeight.w600,
+            // Feature carousel
+            SizedBox(
+              height: 280,
+              child: PageView.builder(
+                controller: _pageController,
+                onPageChanged: (index) {
+                  setState(() => _currentPage = index);
+                },
+                itemCount: _features.length,
+                itemBuilder: (context, index) {
+                  final feature = _features[index];
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 40),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        // Icon
+                        Container(
+                          width: 80,
+                          height: 80,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: (feature['color'] as Color).withOpacity(0.2),
+                            border: Border.all(
+                              color: feature['color'] as Color,
+                              width: 2,
+                            ),
+                          ),
+                          child: Icon(
+                            feature['icon'] as IconData,
+                            size: 40,
+                            color: feature['color'] as Color,
+                          ),
+                        ),
+                        const SizedBox(height: 24),
+                        // Title
+                        Text(
+                          feature['title'] as String,
+                          style: TextStyle(
+                            fontSize: 24,
+                            fontWeight: FontWeight.bold,
+                            color:
+                                widget.isDark ? Colors.white : Colors.black87,
+                          ),
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 12),
+                        // Description
+                        Text(
+                          feature['description'] as String,
+                          style: TextStyle(
+                            fontSize: 16,
+                            color: widget.isDark
+                                ? Colors.white.withOpacity(0.7)
+                                : Colors.black54,
+                            height: 1.5,
+                          ),
+                          textAlign: TextAlign.center,
+                        ),
+                      ],
+                    ),
+                  );
+                },
               ),
             ),
-            SizedBox(height: 8),
+            const SizedBox(height: 32),
+            // Page indicators
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: List.generate(
+                _features.length,
+                (index) => AnimatedContainer(
+                  duration: const Duration(milliseconds: 300),
+                  margin: const EdgeInsets.symmetric(horizontal: 4),
+                  width: _currentPage == index ? 24 : 8,
+                  height: 8,
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(4),
+                    color: _currentPage == index
+                        ? AppColors.electricBlue
+                        : (widget.isDark ? Colors.white : Colors.black)
+                            .withOpacity(0.3),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 24),
+            // Subtle loading indicator
+            SizedBox(
+              width: 20,
+              height: 20,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                valueColor: AlwaysStoppedAnimation(
+                  (widget.isDark ? Colors.white : Colors.black)
+                      .withOpacity(0.3),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
             Text(
-              'Please wait',
+              'Preparing camera...',
               style: TextStyle(
-                color: AppColors.textSecondary.withValues(alpha: 0.5),
-                fontSize: 14,
-                fontWeight: FontWeight.w400,
+                fontSize: 12,
+                color: (widget.isDark ? Colors.white : Colors.black)
+                    .withOpacity(0.4),
               ),
             ),
           ],
@@ -967,6 +1127,7 @@ class TopControls extends StatelessWidget {
   final Map<String, bool> capabilities;
   final bool capabilitiesLoaded;
   final VoidCallback? onLockedTap;
+  final bool isLowMemoryDevice;
 
   const TopControls({
     super.key,
@@ -979,6 +1140,7 @@ class TopControls extends StatelessWidget {
     required this.capabilities,
     required this.capabilitiesLoaded,
     this.onLockedTap,
+    this.isLowMemoryDevice = false,
   });
 
   @override
@@ -993,6 +1155,11 @@ class TopControls extends StatelessWidget {
     // Determine if 60fps is supported for current resolution
     final supports60fps =
         selectedResolution == '1080P' ? supports1080p60fps : supports4K60fps;
+
+    // LOW-MEMORY MODE: Hide high-res and high-fps options entirely on ≤4GB devices
+    final show1080P = !isLowMemoryDevice;
+    final show4K = !isLowMemoryDevice;
+    final show60fps = !isLowMemoryDevice;
 
     return Row(
       children: [
@@ -1020,22 +1187,31 @@ class TopControls extends StatelessWidget {
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      ModeChip(
-                        label: '1080P',
-                        isSelected: selectedResolution == '1080P',
-                        onTap: () => onResolutionChanged('1080P'),
-                      ),
-                      SizedBox(width: 8),
-                      ModeChip(
-                        label: '4K',
-                        isSelected: selectedResolution == '4K',
-                        onTap: () => onResolutionChanged('4K'),
-                        isLocked: !isPro && supports4K,
-                        isUnsupported: !supports4K,
-                        unsupportedMessage:
-                            '4K recording is not supported by your device camera.',
-                        onLockedTap: onLockedTap,
-                      ),
+                      // LOW-MEMORY MODE: Show 720P as the only/default option
+                      if (isLowMemoryDevice)
+                        ModeChip(
+                          label: '720P',
+                          isSelected: true,
+                          onTap: () => onResolutionChanged('720P'),
+                        ),
+                      if (show1080P)
+                        ModeChip(
+                          label: '1080P',
+                          isSelected: selectedResolution == '1080P',
+                          onTap: () => onResolutionChanged('1080P'),
+                        ),
+                      if (show1080P && show4K) SizedBox(width: 8),
+                      if (show4K)
+                        ModeChip(
+                          label: '4K',
+                          isSelected: selectedResolution == '4K',
+                          onTap: () => onResolutionChanged('4K'),
+                          isLocked: !isPro && supports4K,
+                          isUnsupported: !supports4K,
+                          unsupportedMessage:
+                              '4K recording is not supported by your device camera.',
+                          onLockedTap: onLockedTap,
+                        ),
                     ],
                   ),
                 ),
@@ -1053,21 +1229,23 @@ class TopControls extends StatelessWidget {
                       ModeChip(
                         label: '30',
                         suffix: 'fps',
-                        isSelected: selectedFps == 30,
+                        isSelected: selectedFps == 30 || isLowMemoryDevice,
                         onTap: () => onFpsChanged(30),
                       ),
-                      SizedBox(width: 8),
-                      ModeChip(
-                        label: '60',
-                        suffix: 'fps',
-                        isSelected: selectedFps == 60,
-                        onTap: () => onFpsChanged(60),
-                        isLocked: !isPro && supports60fps,
-                        isUnsupported: !supports60fps,
-                        unsupportedMessage:
-                            '60fps recording at ${selectedResolution} is not supported by your device camera.',
-                        onLockedTap: onLockedTap,
-                      ),
+                      if (show60fps) ...[
+                        SizedBox(width: 8),
+                        ModeChip(
+                          label: '60',
+                          suffix: 'fps',
+                          isSelected: selectedFps == 60,
+                          onTap: () => onFpsChanged(60),
+                          isLocked: !isPro && supports60fps,
+                          isUnsupported: !supports60fps,
+                          unsupportedMessage:
+                              '60fps recording at ${selectedResolution} is not supported by your device camera.',
+                          onLockedTap: onLockedTap,
+                        ),
+                      ],
                     ],
                   ),
                 ),

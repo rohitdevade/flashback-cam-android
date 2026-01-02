@@ -144,8 +144,8 @@ class _PersistentBottomBarState extends State<PersistentBottomBar> {
         child: Row(
           mainAxisAlignment: MainAxisAlignment.spaceEvenly,
           children: [
-            // Duration options
-            ...AppState.availableBufferDurations.map((duration) {
+            // Duration options - uses dynamic list based on device RAM
+            ...appState.availableBufferDurations.map((duration) {
               final status = appState.getBufferDurationStatus(duration);
               final isSelected = selectedDuration == duration;
               final isLocked = status == 'locked';

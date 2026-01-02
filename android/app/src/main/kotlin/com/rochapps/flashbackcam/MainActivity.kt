@@ -1,6 +1,7 @@
 package com.rochapps.flashbackcam
 
 import android.content.ContentValues
+import android.graphics.Color
 import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
@@ -9,6 +10,7 @@ import android.os.Environment
 import android.provider.MediaStore
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -20,7 +22,20 @@ import java.util.concurrent.Executors
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════════
- * MAIN ACTIVITY - COLD START OPTIMIZED
+ * MAIN ACTIVITY - COLD START OPTIMIZED & ANDROID 15 EDGE-TO-EDGE COMPLIANT
+ * 
+ * ANDROID 15 (API 35) EDGE-TO-EDGE COMPLIANCE:
+ * 
+ * On Android 15, apps targeting SDK 35+ automatically run edge-to-edge.
+ * The following deprecated APIs are NO LONGER USED:
+ * - Window.setStatusBarColor() - deprecated, ignored on API 35+
+ * - Window.setNavigationBarColor() - deprecated, ignored on API 35+
+ * - Window.setNavigationBarDividerColor() - deprecated, ignored on API 35+
+ * 
+ * Instead, we use:
+ * - WindowCompat.setDecorFitsSystemWindows(window, false) - enables edge-to-edge
+ * - WindowInsetsControllerCompat - controls system bar appearance (light/dark icons)
+ * - App handles insets via Flutter's SafeArea/MediaQuery
  * 
  * COLD START OPTIMIZATION STRATEGY:
  * 
@@ -60,16 +75,34 @@ class MainActivity : FlutterActivity() {
             splashScreen.setKeepOnScreenCondition { false }
         }
         
-        // Enable edge-to-edge display for Android 15+ compatibility
-        // This tells the system we want to handle insets ourselves
+        // ═══════════════════════════════════════════════════════════════════════
+        // ANDROID 15 EDGE-TO-EDGE SETUP
+        // 
+        // CRITICAL: Do NOT use deprecated APIs:
+        // - window.statusBarColor = Color.TRANSPARENT (deprecated API 35)
+        // - window.navigationBarColor = Color.TRANSPARENT (deprecated API 35)
+        //
+        // Instead use WindowCompat and WindowInsetsControllerCompat
+        // ═══════════════════════════════════════════════════════════════════════
+        
+        // Enable edge-to-edge display - tells system we handle insets ourselves
         WindowCompat.setDecorFitsSystemWindows(window, false)
+        
+        // Use WindowInsetsControllerCompat for system bar appearance (not color!)
+        // This is the Android 15-compliant way to control light/dark system bar icons
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            // Light status bar icons (white) for dark backgrounds - camera app
+            isAppearanceLightStatusBars = false
+            // Light navigation bar icons (white) for dark backgrounds
+            isAppearanceLightNavigationBars = false
+        }
         
         // Call super - this starts Flutter engine
         // COLD START: No other work should happen in onCreate
         super.onCreate(savedInstanceState)
         
         // Log cold start timing for debugging
-        android.util.Log.d("ColdStart", "MainActivity.onCreate() complete")
+        android.util.Log.d("ColdStart", "MainActivity.onCreate() complete - Edge-to-edge enabled")
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {

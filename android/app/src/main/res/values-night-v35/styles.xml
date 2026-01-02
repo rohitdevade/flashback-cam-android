@@ -1,25 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+    Android 15 (API 35) Edge-to-Edge Styles - Dark Mode
+    
+    Android 15 enforces edge-to-edge by default for apps targeting SDK 35+.
+    
+    CRITICAL: These deprecated APIs are ignored on Android 15:
+    - android:statusBarColor
+    - android:navigationBarColor  
+    - android:navigationBarDividerColor
+    
+    Edge-to-edge is handled programmatically via MainActivity.kt and Flutter.
+-->
 <resources>
-    <!-- Theme applied to the Android Window while the process is starting when the OS's Dark Mode setting is on -->
-    <!-- Android 15 (API 35) enforces edge-to-edge by default -->
+    <!-- Theme applied to the Android Window while the process is starting -->
     <style name="LaunchTheme" parent="@android:style/Theme.Black.NoTitleBar">
         <item name="android:windowBackground">@drawable/launch_background</item>
-        <item name="android:windowSplashScreenBackground">@android:color/black</item>
-        <!-- Edge-to-edge: transparent system bars -->
-        <item name="android:navigationBarColor">@android:color/transparent</item>
-        <item name="android:statusBarColor">@android:color/transparent</item>
-        <!-- Disable default contrast enforcement for edge-to-edge -->
-        <item name="android:enforceNavigationBarContrast">false</item>
-        <item name="android:enforceStatusBarContrast">false</item>
+        <!-- Enable drawing under display cutouts (always for camera apps) -->
+        <item name="android:windowLayoutInDisplayCutoutMode">always</item>
     </style>
 
     <style name="NormalTheme" parent="@android:style/Theme.Black.NoTitleBar">
         <item name="android:windowBackground">@android:color/black</item>
-        <!-- Edge-to-edge: transparent system bars -->
-        <item name="android:navigationBarColor">@android:color/transparent</item>
-        <item name="android:statusBarColor">@android:color/transparent</item>
-        <!-- Disable default contrast enforcement for edge-to-edge -->
-        <item name="android:enforceNavigationBarContrast">false</item>
-        <item name="android:enforceStatusBarContrast">false</item>
+        <!-- Enable drawing under display cutouts (always for camera apps) -->
+        <item name="android:windowLayoutInDisplayCutoutMode">always</item>
     </style>
 </resources>

@@ -34,8 +34,8 @@ class BufferDurationSelector extends StatelessWidget {
             size: 16,
           ),
           const SizedBox(width: 8),
-          // Duration chips
-          ...AppState.availableBufferDurations.map((duration) {
+          // Duration chips - uses dynamic list based on device RAM
+          ...appState.availableBufferDurations.map((duration) {
             final status = appState.getBufferDurationStatus(duration);
             final isSelected = selectedDuration == duration;
             final isLocked = status == 'locked';
