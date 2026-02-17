@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flashback_cam/models/app_settings.dart';
 import 'package:flashback_cam/models/debug_info.dart';
 import 'package:flashback_cam/models/device_capabilities.dart';
@@ -50,6 +51,50 @@ enum CameraMode {
 }
 
 class AppState extends ChangeNotifier {
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // DEMO MODE (Debug Only)
+  // Uses video preview instead of camera for screen recording demos.
+  // Toggle via Settings > Developer Options. Persisted across restarts.
+  // ═══════════════════════════════════════════════════════════════════════════════
+  static bool _demoMode = false;
+  static bool _demoModeLoaded = false;
+
+  /// Whether demo mode is enabled (video preview instead of camera)
+  /// Only available in debug builds.
+  static bool get demoMode => kDebugMode && _demoMode;
+
+  /// Enable or disable demo mode. Persisted to SharedPreferences.
+  /// Only works in debug builds.
+  static Future<void> setDemoMode(bool value) async {
+    if (kDebugMode) {
+      _demoMode = value;
+      debugPrint(
+          '📹 Demo mode ${value ? "enabled" : "disabled"} (restart required)');
+      // Persist to SharedPreferences
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setBool('demo_mode', value);
+      } catch (e) {
+        debugPrint('Failed to save demo mode: $e');
+      }
+    }
+  }
+
+  /// Load demo mode setting from SharedPreferences (call during init)
+  static Future<void> loadDemoMode() async {
+    if (_demoModeLoaded) return;
+    _demoModeLoaded = true;
+    if (kDebugMode) {
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        _demoMode = prefs.getBool('demo_mode') ?? false;
+        debugPrint('📹 Demo mode loaded: $_demoMode');
+      } catch (e) {
+        debugPrint('Failed to load demo mode: $e');
+      }
+    }
+  }
+
   final CameraService _cameraService = CameraService();
   late final DeviceService _deviceService;
   final StorageService _storageService = StorageService();
@@ -231,6 +276,9 @@ class AppState extends ChangeNotifier {
     debugPrint('🚀 COLD START: Phase 1 starting...');
 
     try {
+      // Load demo mode setting first (debug only)
+      await loadDemoMode();
+
       // Only load lightweight cached data - these read from SharedPreferences
       // and don't involve any SDK initialization or network calls
       await Future.wait([
@@ -292,6 +340,18 @@ class AppState extends ChangeNotifier {
 
     final startTime = DateTime.now();
     debugPrint('🎥 COLD START: Phase 2 starting (camera preview)...');
+
+    // Skip camera initialization when using video preview for screen recording
+    if (AppState.demoMode) {
+      debugPrint('📹 Video preview mode: skipping camera initialization');
+      _cameraMode = CameraMode.idle;
+      _phase2Complete = true;
+      _isInitialized = true; // Mark as initialized so buttons work
+      _cameraInitialized = true;
+      _isInitializing = false;
+      notifyListeners();
+      return;
+    }
 
     try {
       // Check permissions first
@@ -361,6 +421,10 @@ class AppState extends ChangeNotifier {
 
       // Print deferred init report
       _deferredInit.printInitReport();
+
+      // Schedule background subscription validation
+      // This runs async and won't block user interaction
+      _scheduleSubscriptionValidation();
     } catch (e, stackTrace) {
       debugPrint('❌ Phase 2 initialization failed: $e');
       debugPrint('Stack trace: $stackTrace');
@@ -376,6 +440,27 @@ class AppState extends ChangeNotifier {
   /// This was the main cause of slow cold start - it initialized everything
   /// including camera, ads, billing, etc. before the first frame.
   /// ═══════════════════════════════════════════════════════════════════════════════
+
+  /// ═══════════════════════════════════════════════════════════════════════════════
+  /// SUBSCRIPTION VALIDATION - Background check after Phase 2
+  ///
+  /// Validates subscription status with Google Play in the background.
+  /// This ensures expired subscriptions are properly revoked and fall back to free.
+  /// Runs async after Phase 2 and won't block user interaction.
+  /// ═══════════════════════════════════════════════════════════════════════════════
+  void _scheduleSubscriptionValidation() {
+    // Run async in background - don't await, don't block
+    Future.delayed(const Duration(milliseconds: 1500), () async {
+      try {
+        await _subscriptionService.validateSubscriptionOnStartup();
+        // Notify listeners in case subscription status changed
+        notifyListeners();
+      } catch (e) {
+        debugPrint('❌ Background subscription validation failed: $e');
+        // Don't show error to user - just log it
+      }
+    });
+  }
 
   /// Quick permission check during Phase 1 (non-blocking, just status check)
   Future<void> _quickPermissionCheck() async {
@@ -508,7 +593,6 @@ class AppState extends ChangeNotifier {
 
           _addVideoFromEvent(videoData);
           notifyListeners();
-          _showAdIfNeeded();
           break;
 
         case 'recordingStopped':
@@ -531,9 +615,10 @@ class AppState extends ChangeNotifier {
           notifyListeners();
           break;
         case 'finalizeCompleted':
-          // Return to buffering state after processing
-          _cameraMode = CameraMode.buffering;
+          // Stop buffer and return to idle state after processing
+          // User must manually restart buffer if they want to record again
           _finalizeProgress = 0.0;
+          _cleanupBufferAfterRecording();
           final videoDataRaw = event['video'];
           if (videoDataRaw != null) {
             Map<String, dynamic>? videoData;
@@ -574,8 +659,8 @@ class AppState extends ChangeNotifier {
           debugPrint('Recording error: $error (code: $errorCode)');
           _lastRecordingError = error;
           _isPreparingRecording = false;
-          _cameraMode = CameraMode.buffering;
-          notifyListeners();
+          // Stop buffer and return to idle on error
+          _cleanupBufferAfterRecording();
           break;
         case 'thermalWarning':
           debugPrint('Thermal warning: ${event['message']}');
@@ -599,9 +684,9 @@ class AppState extends ChangeNotifier {
           }
           _isStorageLow = true;
           _storageErrorMessage = error;
-          _cameraMode = CameraMode.buffering;
           _isPreparingRecording = false;
-          notifyListeners();
+          // Stop buffer and return to idle on storage full
+          _cleanupBufferAfterRecording();
           break;
         case 'recovered':
           debugPrint('Recovered video: ${event['video']}');
@@ -681,7 +766,7 @@ class AppState extends ChangeNotifier {
 
   Future<void> _showAdIfNeeded() async {
     if (!isPro) {
-      await _adService.showInterstitialAd();
+      await _adService.showRecordingInterstitialAd();
     }
   }
 
@@ -793,6 +878,10 @@ class AppState extends ChangeNotifier {
       _rewardedUnlockCount++;
       debugPrint(
           '✅ Buffer ${seconds}s unlocked via rewarded ad (count: $_rewardedUnlockCount)');
+
+      // Trigger rating popup after successful ad view
+      _ratingService.markAdShownSuccessfully();
+
       notifyListeners();
       return true;
     }
@@ -914,6 +1003,29 @@ class AppState extends ChangeNotifier {
   Future<void> startBuffer() async {
     if (!_isInitialized || _cameraMode != CameraMode.idle) return;
 
+    // Video preview mode: simulate buffer start without camera
+    if (AppState.demoMode) {
+      debugPrint('📹 Video preview mode: simulating buffer start');
+      await WakelockPlus.enable();
+      _bufferStartTime = DateTime.now();
+      _bufferRemainingSeconds = 0;
+      _progressTimer?.cancel();
+      _progressTimer = Timer.periodic(Duration(milliseconds: 100), (timer) {
+        if (_cameraMode == CameraMode.idle) {
+          timer.cancel();
+          return;
+        }
+        if (hasListeners) {
+          _updateBufferFillLevel();
+          notifyListeners();
+        }
+      });
+      _cameraMode = CameraMode.buffering;
+      notifyListeners();
+      debugPrint('✅ Buffer started (video preview mode)');
+      return;
+    }
+
     try {
       debugPrint('Starting buffer: checking storage and starting encoders...');
 
@@ -973,10 +1085,61 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// Helper method to clean up buffer state after recording completes or errors.
+  /// This is called from event handlers (which are not async), so it fires
+  /// the async cleanup without awaiting.
+  void _cleanupBufferAfterRecording() {
+    debugPrint('🛑 Cleaning up buffer after recording...');
+
+    // Cancel progress timer
+    _progressTimer?.cancel();
+    _progressTimer = null;
+
+    // Clear buffer state
+    _bufferStartTime = null;
+    _bufferSeconds = 0;
+    _bufferRemainingSeconds = 0;
+
+    // Transition to idle
+    _cameraMode = CameraMode.idle;
+    notifyListeners();
+
+    // Fire async cleanup without blocking the event handler
+    Future.microtask(() async {
+      try {
+        // Stop native buffer
+        if (!AppState.demoMode) {
+          await _cameraService.stopBuffer();
+        }
+        // Disable wakelock
+        await WakelockPlus.disable();
+        debugPrint(
+            '✅ Buffer cleanup complete - user can restart buffer manually');
+      } catch (e) {
+        debugPrint('Error during buffer cleanup: $e');
+      }
+    });
+  }
+
   Future<void> stopBuffer() async {
     if (_cameraMode == CameraMode.idle) return;
     if (_cameraMode == CameraMode.recording) {
       debugPrint('Cannot stop buffer while recording');
+      return;
+    }
+
+    // Video preview mode: simulate buffer stop
+    if (AppState.demoMode) {
+      debugPrint('📹 Video preview mode: simulating buffer stop');
+      _progressTimer?.cancel();
+      _progressTimer = null;
+      await WakelockPlus.disable();
+      _bufferStartTime = null;
+      _bufferSeconds = 0;
+      _bufferRemainingSeconds = 0;
+      _cameraMode = CameraMode.idle;
+      notifyListeners();
+      debugPrint('✅ Buffer stopped (video preview mode)');
       return;
     }
 
@@ -1032,11 +1195,32 @@ class AppState extends ChangeNotifier {
       return;
     }
 
+    // Video preview mode: simulate recording start
+    if (AppState.demoMode) {
+      debugPrint('📹 Video preview mode: simulating recording start');
+      _isPreparingRecording = true;
+      notifyListeners();
+      // Simulate a brief delay then transition to recording
+      await Future.delayed(const Duration(milliseconds: 100));
+      _isPreparingRecording = false;
+      _cameraMode = CameraMode.recording;
+      notifyListeners();
+      debugPrint('✅ Recording started (video preview mode)');
+      return;
+    }
+
     try {
       _isPreparingRecording = true;
       notifyListeners();
 
       await _cameraService.startRecording();
+
+      // Preload interstitial ad for non-pro users while they're recording
+      // This ensures ad is ready to show immediately when recording stops
+      if (!isPro) {
+        _adService.loadInterstitialAd();
+      }
+
       // State will be updated by recordingStarted event
     } on PlatformException catch (e) {
       debugPrint('Failed to start recording: ${e.code} - ${e.message}');
@@ -1084,24 +1268,36 @@ class AppState extends ChangeNotifier {
   Future<void> stopRecording() async {
     if (_cameraMode != CameraMode.recording) return;
 
+    // Video preview mode: simulate recording stop
+    if (AppState.demoMode) {
+      debugPrint('📹 Video preview mode: simulating recording stop');
+      _cameraMode = CameraMode.processing;
+      notifyListeners();
+      // Simulate processing delay
+      await Future.delayed(const Duration(milliseconds: 500));
+      // Stop buffer and return to idle - user must manually restart buffer
+      _progressTimer?.cancel();
+      _progressTimer = null;
+      await WakelockPlus.disable();
+      _bufferStartTime = null;
+      _bufferSeconds = 0;
+      _bufferRemainingSeconds = 0;
+      _cameraMode = CameraMode.idle;
+      notifyListeners();
+      debugPrint('✅ Recording stopped (video preview mode) - buffer stopped');
+      return;
+    }
+
     // Optimistically transition to processing to prevent double-taps
     _cameraMode = CameraMode.processing;
     notifyListeners();
 
     try {
       await _cameraService.stopRecording();
-      _showAdIfNeeded();
     } catch (e) {
       debugPrint('Failed to stop recording: $e');
-      // If native side says no recording exists, force state reset
-      if (e.toString().contains('NO_RECORDING')) {
-        _cameraMode = CameraMode.buffering;
-        notifyListeners();
-      } else {
-        // On other errors, also reset to buffering to avoid getting stuck
-        _cameraMode = CameraMode.buffering;
-        notifyListeners();
-      }
+      // On error, stop buffer and return to idle
+      _cleanupBufferAfterRecording();
     }
   }
 

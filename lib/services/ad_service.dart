@@ -27,6 +27,7 @@ class AdService {
   bool _isInterstitialAdLoaded = false;
   bool _isRewardedAdLoaded = false;
   int _galleryVisitCount = 0;
+  int _recordingCount = 0; // Track recordings for ad frequency
   static const int _showAdEveryNthGalleryVisit =
       2; // Show ad every alternate gallery visit
 
@@ -357,6 +358,11 @@ class AdService {
         onAdFailedToLoad: (error) {
           debugPrint('AdService: Failed to load interstitial ad: $error');
           _isInterstitialAdLoaded = false;
+
+          // Retry loading ad after 2 seconds
+          Future.delayed(const Duration(seconds: 2), () {
+            loadInterstitialAd();
+          });
         },
       ),
     );
@@ -370,10 +376,10 @@ class AdService {
     }
 
     if (!_isInterstitialAdLoaded || _interstitialAd == null) {
-      debugPrint('AdService: Interstitial ad not loaded, loading now...');
+      debugPrint('AdService: Interstitial ad not ready, skipping');
+      // Non-blocking: load for next time instead of waiting
       await loadInterstitialAd();
-      // Wait a bit for ad to load
-      await Future.delayed(const Duration(milliseconds: 500));
+      return;
     }
 
     if (_interstitialAd != null) {
@@ -384,14 +390,24 @@ class AdService {
     }
   }
 
-  /// Show interstitial ad when opening gallery (not every time)
+  /// Show interstitial ad when opening gallery (every time now)
   Future<void> showGalleryInterstitialAd() async {
-    _galleryVisitCount++;
-    debugPrint('AdService: Gallery visit count: $_galleryVisitCount');
+    debugPrint('AdService: Showing gallery ad (every time)');
+    await showInterstitialAd();
+  }
 
-    if (_galleryVisitCount >= _showAdEveryNthGalleryVisit) {
-      _galleryVisitCount = 0;
+  /// Show interstitial ad after recording with custom frequency
+  /// Pattern: 1st (show), 2nd (skip), 3rd (show), 4th (skip), 5th (show), etc.
+  Future<void> showRecordingInterstitialAd() async {
+    _recordingCount++;
+    debugPrint('AdService: Recording count: $_recordingCount');
+
+    // Show on odd recordings only: 1st, 3rd, 5th, 7th...
+    if (_recordingCount.isOdd) {
+      debugPrint('AdService: Showing ad for recording #$_recordingCount');
       await showInterstitialAd();
+    } else {
+      debugPrint('AdService: Skipping ad for recording #$_recordingCount');
     }
   }
 
