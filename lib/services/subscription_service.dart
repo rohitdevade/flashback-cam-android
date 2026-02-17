@@ -108,6 +108,12 @@ class SubscriptionService {
   // Track if we've synced with Google Play this session
   bool _hasRestoredPurchases = false;
 
+  // Track if we're currently in a restore operation (vs new purchase)
+  bool _isRestoreOperation = false;
+
+  // Track if any valid purchases were found during restore
+  bool _foundValidPurchases = false;
+
   // Stream controller for purchase updates
   final _purchaseResultController =
       StreamController<PurchaseResult>.broadcast();
@@ -197,14 +203,21 @@ class SubscriptionService {
     try {
       debugPrint('📱 Syncing subscription status with Google Play...');
 
+      // Mark that we're doing a restore operation
+      _isRestoreOperation = true;
+      _foundValidPurchases = false;
+
       // Restore purchases to get current subscription status from Google Play
       await _iap.restorePurchases();
       _hasRestoredPurchases = true;
+
+      // Note: _onPurchaseUpdate will handle revoking access if no purchases found
 
       debugPrint('✅ Subscription sync completed');
     } catch (e) {
       debugPrint('⚠️ Failed to sync with store: $e');
       // Don't fail initialization if sync fails - user can still use cached status
+      _isRestoreOperation = false;
     }
   }
 
@@ -262,6 +275,17 @@ class SubscriptionService {
   }
 
   void _onPurchaseUpdate(List<PurchaseDetails> purchaseDetailsList) async {
+    // If this is a restore operation and we get purchases, mark that we found them
+    if (_isRestoreOperation && purchaseDetailsList.isNotEmpty) {
+      for (var purchaseDetails in purchaseDetailsList) {
+        if (purchaseDetails.status == PurchaseStatus.purchased ||
+            purchaseDetails.status == PurchaseStatus.restored) {
+          _foundValidPurchases = true;
+          break;
+        }
+      }
+    }
+
     for (var purchaseDetails in purchaseDetailsList) {
       if (purchaseDetails.status == PurchaseStatus.pending) {
         // Show pending UI
@@ -290,6 +314,21 @@ class SubscriptionService {
       if (purchaseDetails.pendingCompletePurchase) {
         await _iap.completePurchase(purchaseDetails);
       }
+    }
+
+    // After processing all purchases, check if restore found nothing
+    if (_isRestoreOperation) {
+      _isRestoreOperation = false; // Reset flag
+
+      // If no valid purchases found and user is marked as pro, revoke access
+      if (!_foundValidPurchases && _currentUser?.isPro == true) {
+        debugPrint(
+            '🚫 No active purchases found during restore - subscription expired');
+        debugPrint('   Revoking pro access');
+        await _revokeSubscription(reason: 'No active purchases found');
+      }
+
+      _foundValidPurchases = false; // Reset for next restore
     }
   }
 
@@ -511,7 +550,6 @@ class SubscriptionService {
 
   /// Revoke subscription access (called when verification fails or subscription expires)
   /// This is called when Google Play restore returns no active purchases
-  // ignore: unused_element
   Future<void> _revokeSubscription({String? reason}) async {
     debugPrint('🚫 Revoking subscription access: $reason');
 
@@ -724,10 +762,17 @@ class SubscriptionService {
     }
 
     try {
+      // Mark that we're doing a restore operation
+      _isRestoreOperation = true;
+      _foundValidPurchases = false;
+
       await _iap.restorePurchases();
+
+      // Note: _onPurchaseUpdate will handle revoking access if no purchases found
       return true;
     } catch (e) {
       debugPrint('Failed to restore purchases: $e');
+      _isRestoreOperation = false;
       return false;
     }
   }
@@ -848,5 +893,53 @@ class SubscriptionService {
     await _loadUser();
     debugPrint(
         'Subscription status refreshed: isPro=$isPro, hasProAccess=$hasProAccess');
+  }
+
+  /// ═══════════════════════════════════════════════════════════════════════════════
+  /// SUBSCRIPTION VALIDATION ON STARTUP
+  ///
+  /// Validates subscription status with Google Play on app startup.
+  /// This ensures expired subscriptions are revoked and falls back to free tier.
+  ///
+  /// Should be called after app initialization (Phase 2) in the background.
+  /// This is non-blocking and won't affect cold start performance.
+  /// ═══════════════════════════════════════════════════════════════════════════════
+  Future<void> validateSubscriptionOnStartup() async {
+    try {
+      debugPrint('🔍 Validating subscription status on startup...');
+
+      // Only validate if user is marked as pro locally
+      if (_currentUser?.isPro != true) {
+        debugPrint('   User is not pro, skipping validation');
+        return;
+      }
+
+      debugPrint('   User is marked as pro: tier=${_currentUser?.proTier}');
+      debugPrint('   Checking with Google Play...');
+
+      // Initialize billing client if needed (this is async and won't block)
+      await ensureBillingInitialized();
+
+      if (_debugPurchasesEnabled) {
+        debugPrint('🔧 DEBUG MODE: Skipping pro validation');
+        return;
+      }
+
+      // If billing is unavailable, trust local cache
+      if (!_isAvailable) {
+        debugPrint('   ⚠️ Billing unavailable, trusting local cache');
+        return;
+      }
+
+      // Sync will automatically revoke access if no valid purchases found
+      if (!_hasRestoredPurchases) {
+        await _syncSubscriptionWithStore();
+      }
+
+      debugPrint('✅ Subscription validation complete');
+    } catch (e) {
+      debugPrint('⚠️ Subscription validation failed: $e');
+      // Don't revoke on error - user keeps cached status
+    }
   }
 }

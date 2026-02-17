@@ -1313,6 +1313,10 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
     private var focusPointX = 0.5f  // Normalized 0-1, center by default
     private var focusPointY = 0.5f  // Normalized 0-1, center by default
     
+    // Session generation counter - prevents stale onConfigured callbacks from crashing
+    // Incremented each time we start creating a new session; callbacks check this to avoid races
+    @Volatile private var sessionGeneration: Int = 0
+    
     // Current recording info
     private var currentRecordingId: String? = null
     private var recordingStartTime: Long = 0
@@ -1747,8 +1751,25 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                 Log.d(TAG, "Added buffer surface to buffer session")
             }
             
+            // Capture current generation to detect stale callbacks
+            val myGeneration = ++sessionGeneration
+            Log.d(TAG, "Creating buffer session (generation $myGeneration)")
+            
             camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(session: CameraCaptureSession) {
+                    // Guard: skip if this callback is from an outdated session creation
+                    if (myGeneration != sessionGeneration) {
+                        Log.w(TAG, "Ignoring stale onConfigured callback (gen $myGeneration, current $sessionGeneration)")
+                        try { session.close() } catch (_: Exception) {}
+                        return
+                    }
+                    // Guard: skip if camera was closed
+                    if (cameraDevice == null) {
+                        Log.w(TAG, "Camera closed before session configured, aborting")
+                        try { session.close() } catch (_: Exception) {}
+                        return
+                    }
+                    
                     captureSession = session
                     
                     previewRequestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
@@ -1794,7 +1815,15 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                     }
 
                     previewRequest = previewRequestBuilder?.build()
-                    previewRequest?.let { session.setRepeatingRequest(it, null, backgroundHandler) }
+                    previewRequest?.let { req ->
+                        try {
+                            session.setRepeatingRequest(req, null, backgroundHandler)
+                        } catch (e: IllegalStateException) {
+                            // Session was closed between check and setRepeatingRequest (rare race)
+                            Log.w(TAG, "Session closed before setRepeatingRequest: ${e.message}")
+                            return
+                        }
+                    }
                     
                     // ⚠️ CRITICAL: Start BOTH video and audio encoders together AFTER session is configured!
                     // This ensures perfect A/V sync across all resolutions and FPS settings
@@ -2091,8 +2120,25 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
             previewRequestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             surfaces.forEach { previewRequestBuilder?.addTarget(it) }
             
+            // Capture current generation to detect stale callbacks
+            val myGeneration = ++sessionGeneration
+            Log.d(TAG, "Creating preview session (generation $myGeneration)")
+            
             camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(session: CameraCaptureSession) {
+                    // Guard: skip if this callback is from an outdated session creation
+                    if (myGeneration != sessionGeneration) {
+                        Log.w(TAG, "Ignoring stale onConfigured callback (gen $myGeneration, current $sessionGeneration)")
+                        try { session.close() } catch (_: Exception) {}
+                        return
+                    }
+                    // Guard: skip if camera was closed
+                    if (cameraDevice == null) {
+                        Log.w(TAG, "Camera closed before session configured, aborting")
+                        try { session.close() } catch (_: Exception) {}
+                        return
+                    }
+                    
                     captureSession = session
                     updatePreview()
                     Log.d(TAG, "Capture session configured successfully with ${surfaces.size} surfaces (preview-only)")
@@ -2162,7 +2208,13 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
             }
             
             previewRequest = builder.build()
-            session.setRepeatingRequest(previewRequest!!, null, backgroundHandler)
+            try {
+                session.setRepeatingRequest(previewRequest!!, null, backgroundHandler)
+            } catch (e: IllegalStateException) {
+                // Session was closed (camera switched, disposed, etc.) - not an error
+                Log.w(TAG, "Session closed during updatePreview: ${e.message}")
+                return
+            }
             
             sendEvent("previewStarted", null)
             
@@ -2320,12 +2372,10 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                 
                 backgroundHandler?.post {
                     try {
-                        // Close existing session
+                        // Close existing session (generation guard in createBufferPreviewSession
+                        // handles the race if this close happens after a new session started)
                         captureSession?.close()
                         captureSession = null
-                        
-                        // Wait a moment for cleanup
-                        Thread.sleep(100)
                         
                         // Recreate with encoder surface included
                         createBufferPreviewSession()

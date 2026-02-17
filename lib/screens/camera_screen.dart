@@ -15,6 +15,7 @@ import 'package:flashback_cam/widgets/camera_instructions_overlay.dart';
 import 'package:flashback_cam/widgets/rating_popup.dart';
 import 'package:flashback_cam/widgets/buffer_duration_selector.dart';
 import 'package:flashback_cam/widgets/persistent_bottom_bar.dart';
+import 'package:flashback_cam/widgets/video_preview.dart';
 import 'package:flashback_cam/screens/gallery_screen.dart';
 import 'package:flashback_cam/screens/settings_screen.dart';
 import 'package:flashback_cam/screens/lifetime_paywall_screen.dart';
@@ -39,6 +40,8 @@ class _CameraScreenState extends State<CameraScreen>
   bool _lowMemoryWarningShown = false;
   bool _dayThreePaywallChecked = false;
   int _lastVideoCount = 0;
+  bool _ratingPopupShowing =
+      false; // Track if rating popup is currently being shown
 
   // Focus indicator state
   Offset? _focusPoint;
@@ -203,7 +206,7 @@ class _CameraScreenState extends State<CameraScreen>
     }
   }
 
-  /// Check for video save triggers (rating popup or paywall)
+  /// Check for video save triggers (paywall and rating popup)
   void _checkVideoSaveTriggers(AppState appState) {
     final currentVideoCount = appState.videos.length;
 
@@ -222,49 +225,47 @@ class _CameraScreenState extends State<CameraScreen>
         final currentState = context.read<AppState>();
         if (currentState.isRecording || currentState.isFinalizing) return;
 
-        // Check paywall first (for free users)
+        // Check paywall for free users
         if (!currentState.isPro && currentState.shouldShowVideoLimitPaywall()) {
           _showLifetimePaywall(currentState, PaywallTrigger.videoSaveLimit);
           return;
         }
 
-        // Then check rating popup
-        if (currentState.shouldShowRatingPopup()) {
-          _showRatingPopup(currentState);
-        }
+        // Rating popup is intentionally not triggered here.
+        // It is shown only when returning from gallery.
       });
     }
   }
 
   /// Show the rating popup
   Future<void> _showRatingPopup(AppState appState) async {
+    appState.ratingService.markPopupShownThisSession();
+
     final result = await showRatingPopup(context);
 
     if (result == true) {
-      // High rating (4-5 stars) -> trigger Google Play in-app review
-      await appState.ratingService.markAsRated();
-      _triggerInAppReview();
+      await appState.ratingService.markHighRatingSubmitted();
+      await _openStoreListingForReview();
     } else if (result == false) {
-      // Low rating (1-3 stars) -> just mark as rated, don't open Play Store
-      await appState.ratingService.markAsRated();
+      await appState.ratingService.markLowRatingSubmitted();
+      debugPrint('📊 Rating: Low rating given (2-day cooldown)');
     } else {
-      // Dismissed -> mark dismissed for 5-day cooldown
-      await appState.ratingService.markDismissed();
+      debugPrint('📊 Rating: Dismissed');
     }
   }
 
-  /// Trigger Google Play in-app review
-  Future<void> _triggerInAppReview() async {
+  /// Redirect user to store listing to submit review.
+  Future<void> _openStoreListingForReview() async {
     try {
       final inAppReview = InAppReview.instance;
       if (await inAppReview.isAvailable()) {
-        await inAppReview.requestReview();
-        debugPrint('✅ In-app review requested');
+        await inAppReview.openStoreListing();
+        debugPrint('✅ Store listing opened for review');
       } else {
-        debugPrint('⚠️ In-app review not available');
+        debugPrint('⚠️ Store listing not available');
       }
     } catch (e) {
-      debugPrint('❌ Failed to request in-app review: $e');
+      debugPrint('❌ Failed to open store listing: $e');
     }
   }
 
@@ -373,7 +374,7 @@ class _CameraScreenState extends State<CameraScreen>
     // Check for and display any recording errors
     _checkRecordingErrors(appState);
 
-    // Check for video save triggers (rating popup or paywall)
+    // Check for video save triggers (paywall and rating popup)
     _checkVideoSaveTriggers(appState);
 
     return OrientationBuilder(
@@ -390,7 +391,9 @@ class _CameraScreenState extends State<CameraScreen>
                 height: double.infinity,
                 child: Stack(
                   children: [
-                    CameraPreview(isDark: isDark),
+                    AppState.demoMode
+                        ? const VideoPreview()
+                        : CameraPreview(isDark: isDark),
                     if (settings.showGrid) GridOverlay(),
                   ],
                 ),
@@ -815,6 +818,13 @@ class _CameraScreenState extends State<CameraScreen>
       context,
       MaterialPageRoute(builder: (_) => const GalleryScreen()),
     );
+
+    // Show rating popup after returning from gallery
+    if (mounted && appState.shouldShowRatingPopup() && !_ratingPopupShowing) {
+      _ratingPopupShowing = true;
+      await _showRatingPopup(appState);
+      _ratingPopupShowing = false;
+    }
 
     // Buffer stays stopped after returning from gallery - user must restart manually
   }

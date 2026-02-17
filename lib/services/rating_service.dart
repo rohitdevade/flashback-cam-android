@@ -3,24 +3,21 @@ import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// Service to manage app rating prompts
-/// Only shows rating popup when user has experienced real value
+/// Rules:
+/// 1) Show only when eligible and requested by UI flow (gallery return)
+/// 2) Show at most once per app session
+/// 3) After 4-5 stars, suppress for 30 days
+/// 4) After 1-3 stars, suppress for 2 days
 class RatingService {
   static const String _savedVideoCountKey = 'rating_saved_video_count';
-  static const String _appOpenDaysKey = 'rating_app_open_days';
-  static const String _hasRatedKey = 'rating_has_rated';
-  static const String _lastDismissedKey = 'rating_last_dismissed';
-  static const String _firstOpenDateKey = 'rating_first_open_date';
+  static const String _nextEligibleAtKey = 'rating_next_eligible_at';
 
-  // Thresholds for showing rating popup
-  static const int _minSavedVideos = 2;
-  static const int _minAppOpenDays = 2;
-  static const int _dismissCooldownDays = 5;
+  static const int _highRatingCooldownDays = 30;
+  static const int _lowRatingCooldownDays = 2;
 
   int _savedVideoCount = 0;
-  Set<String> _appOpenDays = {};
-  bool _hasRated = false;
-  DateTime? _lastDismissed;
-  DateTime? _firstOpenDate;
+  DateTime? _nextEligibleAt;
+  bool _shownInCurrentSession = false;
   bool _isInitialized = false;
 
   /// Stream controller for rating popup requests
@@ -35,145 +32,106 @@ class RatingService {
       final prefs = await SharedPreferences.getInstance();
 
       _savedVideoCount = prefs.getInt(_savedVideoCountKey) ?? 0;
-      _hasRated = prefs.getBool(_hasRatedKey) ?? false;
 
-      // Load app open days
-      final daysJson = prefs.getStringList(_appOpenDaysKey);
-      _appOpenDays = daysJson?.toSet() ?? {};
-
-      // Load last dismissed date
-      final lastDismissedStr = prefs.getString(_lastDismissedKey);
-      if (lastDismissedStr != null) {
-        _lastDismissed = DateTime.tryParse(lastDismissedStr);
+      final nextEligibleStr = prefs.getString(_nextEligibleAtKey);
+      if (nextEligibleStr != null) {
+        _nextEligibleAt = DateTime.tryParse(nextEligibleStr);
       }
-
-      // Load first open date
-      final firstOpenStr = prefs.getString(_firstOpenDateKey);
-      if (firstOpenStr != null) {
-        _firstOpenDate = DateTime.tryParse(firstOpenStr);
-      }
-
-      // Record today's app open
-      await _recordAppOpen();
 
       _isInitialized = true;
       debugPrint(
-          '📊 RatingService initialized: videos=$_savedVideoCount, days=${_appOpenDays.length}, rated=$_hasRated');
+          '📊 RatingService initialized: videos=$_savedVideoCount, nextEligibleAt=${_nextEligibleAt?.toIso8601String()}, shownThisSession=$_shownInCurrentSession');
     } catch (e) {
       debugPrint('❌ Failed to initialize RatingService: $e');
     }
   }
 
-  /// Record that the app was opened today
-  Future<void> _recordAppOpen() async {
-    final today = _getTodayKey();
-
-    // Set first open date if not set
-    if (_firstOpenDate == null) {
-      _firstOpenDate = DateTime.now();
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(
-          _firstOpenDateKey, _firstOpenDate!.toIso8601String());
-    }
-
-    if (!_appOpenDays.contains(today)) {
-      _appOpenDays.add(today);
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setStringList(_appOpenDaysKey, _appOpenDays.toList());
-      debugPrint(
-          '📅 New app open day recorded: $today (total: ${_appOpenDays.length})');
-    }
-  }
-
-  /// Record a successful video save
+  /// Record a saved video for analytics/debug counters.
   Future<void> recordVideoSaved() async {
     _savedVideoCount++;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setInt(_savedVideoCountKey, _savedVideoCount);
-    debugPrint('🎬 Video saved count: $_savedVideoCount');
+  }
+
+  /// Kept for compatibility with existing call sites; no longer affects rating flow.
+  void markAdShownSuccessfully() {
+    debugPrint('📺 Ad shown successfully');
   }
 
   /// Check if rating popup should be shown
-  /// This should be called 1-2 seconds after a successful save
+  /// Enforces once-per-session and persisted cooldown window.
   bool shouldShowRatingPopup() {
-    // Never show if already rated
-    if (_hasRated) {
-      debugPrint('📊 Rating: Already rated, skipping');
+    if (!_isInitialized) {
+      debugPrint('📊 Rating: Service not initialized, skipping');
       return false;
     }
 
-    // Never show on first launch (check first open date)
-    if (_firstOpenDate != null) {
-      final daysSinceFirstOpen =
-          DateTime.now().difference(_firstOpenDate!).inDays;
-      if (daysSinceFirstOpen == 0 && _appOpenDays.length <= 1) {
-        debugPrint('📊 Rating: First launch day, skipping');
-        return false;
-      }
+    if (_shownInCurrentSession) {
+      debugPrint('📊 Rating: Already shown this session, skipping');
+      return false;
     }
 
-    // Check saved video threshold
-    if (_savedVideoCount < _minSavedVideos) {
+    final now = DateTime.now();
+    if (_nextEligibleAt != null && now.isBefore(_nextEligibleAt!)) {
       debugPrint(
-          '📊 Rating: Not enough videos ($_savedVideoCount < $_minSavedVideos)');
+          '📊 Rating: In cooldown until ${_nextEligibleAt!.toIso8601String()}, skipping');
       return false;
     }
 
-    // Check app open days threshold
-    if (_appOpenDays.length < _minAppOpenDays) {
-      debugPrint(
-          '📊 Rating: Not enough open days (${_appOpenDays.length} < $_minAppOpenDays)');
-      return false;
-    }
-
-    // Check cooldown after dismissal
-    if (_lastDismissed != null) {
-      final daysSinceDismiss =
-          DateTime.now().difference(_lastDismissed!).inDays;
-      if (daysSinceDismiss < _dismissCooldownDays) {
-        debugPrint(
-            '📊 Rating: In cooldown ($daysSinceDismiss < $_dismissCooldownDays days)');
-        return false;
-      }
-    }
-
-    debugPrint('✅ Rating: All conditions met, should show popup');
+    debugPrint('✅ Rating: Should show popup');
     return true;
   }
 
-  /// Request to show rating popup (call after successful save with delay)
+  /// Mark popup as shown for current app session.
+  void markPopupShownThisSession() {
+    _shownInCurrentSession = true;
+    debugPrint('📊 Rating popup shown (session locked)');
+  }
+
+  /// Compatibility alias for older callers.
+  void markAsShown() {
+    markPopupShownThisSession();
+  }
+
+  /// Request to show rating popup.
   void requestRatingPopup() {
     if (shouldShowRatingPopup()) {
       _ratingRequestController.add(null);
     }
   }
 
-  /// Mark that user has given a rating (any rating)
-  Future<void> markAsRated() async {
-    _hasRated = true;
+  /// User gave 4-5 stars: suppress popup for 30 days.
+  Future<void> markHighRatingSubmitted() async {
+    final nextDate = DateTime.now().add(
+      const Duration(days: _highRatingCooldownDays),
+    );
+    _nextEligibleAt = nextDate;
+
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_hasRatedKey, true);
-    debugPrint('⭐ User marked as rated');
+    await prefs.setString(_nextEligibleAtKey, nextDate.toIso8601String());
+    debugPrint(
+        '⭐ High rating submitted: next eligible at ${nextDate.toIso8601String()}');
   }
 
-  /// Mark popup as dismissed (for 5-day cooldown)
-  Future<void> markDismissed() async {
-    _lastDismissed = DateTime.now();
+  /// User gave 1-3 stars: suppress popup for 2 days.
+  Future<void> markLowRatingSubmitted() async {
+    final nextDate = DateTime.now().add(
+      const Duration(days: _lowRatingCooldownDays),
+    );
+    _nextEligibleAt = nextDate;
+
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_lastDismissedKey, _lastDismissed!.toIso8601String());
-    debugPrint('❌ Rating popup dismissed, cooldown started');
+    await prefs.setString(_nextEligibleAtKey, nextDate.toIso8601String());
+    debugPrint(
+        '📊 Low rating submitted: next eligible at ${nextDate.toIso8601String()}');
   }
 
-  /// Get today's date key (YYYY-MM-DD format)
-  String _getTodayKey() {
-    final now = DateTime.now();
-    return '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
-  }
+  /// Compatibility aliases for older call sites.
+  Future<void> markAsRated() => markHighRatingSubmitted();
 
-  /// Getters for current state
+  Future<void> markDismissed() => markLowRatingSubmitted();
+
   int get savedVideoCount => _savedVideoCount;
-  int get appOpenDays => _appOpenDays.length;
-  bool get hasRated => _hasRated;
 
   void dispose() {
     _ratingRequestController.close();

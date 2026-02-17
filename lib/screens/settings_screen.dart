@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart';
 import 'package:provider/provider.dart';
 import 'package:google_mobile_ads/google_mobile_ads.dart' hide AppState;
 import 'package:url_launcher/url_launcher.dart';
@@ -191,6 +192,14 @@ class _SettingsScreenState extends State<SettingsScreen>
             _buildSectionHeader('Device & Diagnostics'),
             const SizedBox(height: 16),
             _buildDiagnosticsSection(context, appState),
+            const SizedBox(height: 32),
+          ],
+
+          // Demo Mode Section (debug build only)
+          if (_showDeveloperOptions && kDebugMode) ...[
+            _buildSectionHeader('Demo Mode'),
+            const SizedBox(height: 16),
+            _buildDemoModeSection(context),
             const SizedBox(height: 32),
           ],
 
@@ -716,6 +725,98 @@ class _SettingsScreenState extends State<SettingsScreen>
           _buildDiagnosticRow('Supported FPS', '30fps, 60fps'),
           const SizedBox(height: 12),
           _buildDiagnosticRow('Video Codec', 'H.264 (default)'),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDemoModeSection(BuildContext context) {
+    return GlassContainer(
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                Icons.videocam,
+                color:
+                    AppState.demoMode ? Colors.orange : AppColors.textSecondary,
+                size: 24,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Video Preview Mode',
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                            color: AppColors.textPrimary,
+                            fontWeight: FontWeight.w600,
+                          ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      AppState.demoMode
+                          ? 'Active - Using video instead of camera'
+                          : 'Off - Using real camera',
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                            color: AppState.demoMode
+                                ? Colors.orange
+                                : AppColors.textSecondary,
+                          ),
+                    ),
+                  ],
+                ),
+              ),
+              Switch(
+                value: AppState.demoMode,
+                onChanged: (value) async {
+                  await AppState.setDemoMode(value);
+                  setState(() {});
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text(
+                          value
+                              ? '📹 Demo mode enabled. Restart app to apply.'
+                              : '📷 Demo mode disabled. Restart app to use camera.',
+                        ),
+                        backgroundColor: Colors.orange,
+                        behavior: SnackBarBehavior.floating,
+                        duration: const Duration(seconds: 3),
+                      ),
+                    );
+                  }
+                },
+                activeColor: Colors.orange,
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.orange.withOpacity(0.1),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: Colors.orange.withOpacity(0.3)),
+            ),
+            child: Row(
+              children: [
+                const Icon(Icons.info_outline, color: Colors.orange, size: 20),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    'For screen recording demos. Plays a video instead of showing the real camera. Requires app restart.',
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: Colors.orange,
+                        ),
+                  ),
+                ),
+              ],
+            ),
+          ),
         ],
       ),
     );

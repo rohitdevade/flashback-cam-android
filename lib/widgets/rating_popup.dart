@@ -6,9 +6,9 @@ import 'package:flashback_cam/widgets/frosted_glass_card.dart';
 /// Rating popup widget that asks users for their rating
 /// Shows 1-5 stars and handles rating-based actions
 class RatingPopup extends StatefulWidget {
-  final VoidCallback onHighRating; // 4-5 stars -> trigger in-app review
-  final VoidCallback onLowRating; // 1-3 stars -> dismiss silently
-  final VoidCallback onDismiss; // Closed without rating
+  final VoidCallback onHighRating;
+  final VoidCallback onLowRating;
+  final VoidCallback onDismiss;
 
   const RatingPopup({
     super.key,
@@ -24,6 +24,7 @@ class RatingPopup extends StatefulWidget {
 class _RatingPopupState extends State<RatingPopup>
     with SingleTickerProviderStateMixin {
   int _selectedRating = 0;
+  bool _showCloseButton = false;
   late AnimationController _animationController;
   late Animation<double> _scaleAnimation;
   late Animation<double> _fadeAnimation;
@@ -45,6 +46,15 @@ class _RatingPopupState extends State<RatingPopup>
     );
 
     _animationController.forward();
+
+    // Show close button after 3 seconds
+    Future.delayed(const Duration(seconds: 3), () {
+      if (mounted) {
+        setState(() {
+          _showCloseButton = true;
+        });
+      }
+    });
   }
 
   @override
@@ -64,10 +74,8 @@ class _RatingPopupState extends State<RatingPopup>
     HapticFeedback.mediumImpact();
 
     if (_selectedRating >= 4) {
-      // High rating (4-5 stars) -> trigger in-app review
       widget.onHighRating();
     } else {
-      // Low rating (1-3 stars) -> dismiss silently
       widget.onLowRating();
     }
   }
@@ -86,21 +94,28 @@ class _RatingPopupState extends State<RatingPopup>
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                // Close button
+                // Close button - appears after 3 seconds
                 Align(
                   alignment: Alignment.topRight,
-                  child: GestureDetector(
-                    onTap: widget.onDismiss,
-                    child: Container(
-                      padding: const EdgeInsets.all(4),
-                      decoration: BoxDecoration(
-                        color: AppColors.glassWhite,
-                        shape: BoxShape.circle,
-                      ),
-                      child: const Icon(
-                        Icons.close,
-                        color: AppColors.textSecondary,
-                        size: 20,
+                  child: AnimatedOpacity(
+                    opacity: _showCloseButton ? 1.0 : 0.0,
+                    duration: const Duration(milliseconds: 300),
+                    child: IgnorePointer(
+                      ignoring: !_showCloseButton,
+                      child: GestureDetector(
+                        onTap: widget.onDismiss,
+                        child: Container(
+                          padding: const EdgeInsets.all(4),
+                          decoration: BoxDecoration(
+                            color: AppColors.glassWhite,
+                            shape: BoxShape.circle,
+                          ),
+                          child: const Icon(
+                            Icons.close,
+                            color: AppColors.textSecondary,
+                            size: 20,
+                          ),
+                        ),
                       ),
                     ),
                   ),
@@ -219,20 +234,6 @@ class _RatingPopupState extends State<RatingPopup>
                     ),
                   ),
                 ),
-
-                const SizedBox(height: 12),
-
-                // Maybe later link
-                TextButton(
-                  onPressed: widget.onDismiss,
-                  child: Text(
-                    'Maybe later',
-                    style: TextStyle(
-                      color: AppColors.textSecondary,
-                      fontSize: 14,
-                    ),
-                  ),
-                ),
               ],
             ),
           ),
@@ -243,7 +244,7 @@ class _RatingPopupState extends State<RatingPopup>
 }
 
 /// Shows the rating popup dialog
-/// Returns true if user gave a high rating (4-5 stars)
+/// Returns true if user gave a high rating
 Future<bool?> showRatingPopup(BuildContext context) async {
   return showDialog<bool>(
     context: context,

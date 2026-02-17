@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flashback_cam/models/debug_info.dart';
+import 'package:flashback_cam/providers/app_state.dart';
 
-class DebugInfoPanel extends StatelessWidget {
+class DebugInfoPanel extends StatefulWidget {
   final DebugInfo debugInfo;
   final VoidCallback onRefresh;
   final ScrollController? scrollController;
@@ -14,8 +16,14 @@ class DebugInfoPanel extends StatelessWidget {
   });
 
   @override
+  State<DebugInfoPanel> createState() => _DebugInfoPanelState();
+}
+
+class _DebugInfoPanelState extends State<DebugInfoPanel> {
+  @override
   Widget build(BuildContext context) {
-    print('🐛 DebugInfoPanel building with data: ${debugInfo.deviceTier}');
+    print(
+        '🐛 DebugInfoPanel building with data: ${widget.debugInfo.deviceTier}');
 
     return Container(
       padding: EdgeInsets.only(top: 8),
@@ -54,7 +62,7 @@ class DebugInfoPanel extends StatelessWidget {
                 Spacer(),
                 IconButton(
                   icon: Icon(Icons.refresh, color: Colors.white70),
-                  onPressed: onRefresh,
+                  onPressed: widget.onRefresh,
                   tooltip: 'Refresh',
                 ),
                 IconButton(
@@ -70,29 +78,41 @@ class DebugInfoPanel extends StatelessWidget {
           // Content
           Expanded(
             child: ListView(
-              controller: scrollController,
+              controller: widget.scrollController,
               padding: EdgeInsets.all(16),
               children: [
+                // Demo Mode Toggle (Debug Only)
+                if (kDebugMode) ...[
+                  _buildSectionTitle('Demo Mode'),
+                  _buildDemoModeToggle(),
+                  SizedBox(height: 16),
+                ],
+
                 // Device Info Section
                 _buildSectionTitle('Device'),
-                _buildInfoTile('Device Tier', debugInfo.deviceTier,
-                    _getTierIcon(debugInfo.deviceTier)),
-                _buildInfoTile('Buffer Strategy', debugInfo.bufferStrategy,
-                    _getStrategyIcon(debugInfo.bufferStrategy)),
+                _buildInfoTile('Device Tier', widget.debugInfo.deviceTier,
+                    _getTierIcon(widget.debugInfo.deviceTier)),
+                _buildInfoTile(
+                    'Buffer Strategy',
+                    widget.debugInfo.bufferStrategy,
+                    _getStrategyIcon(widget.debugInfo.bufferStrategy)),
 
                 SizedBox(height: 16),
 
                 // Video Settings Section
                 _buildSectionTitle('Video Settings'),
-                _buildInfoTile('Resolution', debugInfo.videoResolution,
+                _buildInfoTile('Resolution', widget.debugInfo.videoResolution,
                     Icons.aspect_ratio),
-                _buildInfoTile('FPS', '${debugInfo.videoFps} fps', Icons.speed),
                 _buildInfoTile(
-                    'Video Codec', debugInfo.videoCodec, Icons.video_settings),
+                    'FPS', '${widget.debugInfo.videoFps} fps', Icons.speed),
+                _buildInfoTile('Video Codec', widget.debugInfo.videoCodec,
+                    Icons.video_settings),
+                _buildInfoTile('Audio Codec', widget.debugInfo.audioCodec,
+                    Icons.audiotrack),
                 _buildInfoTile(
-                    'Audio Codec', debugInfo.audioCodec, Icons.audiotrack),
-                _buildInfoTile('Buffer Length',
-                    '${debugInfo.selectedBufferSeconds} seconds', Icons.timer),
+                    'Buffer Length',
+                    '${widget.debugInfo.selectedBufferSeconds} seconds',
+                    Icons.timer),
 
                 SizedBox(height: 16),
 
@@ -100,20 +120,21 @@ class DebugInfoPanel extends StatelessWidget {
                 _buildSectionTitle('Last Recording'),
                 _buildInfoTile(
                   'Status',
-                  debugInfo.lastRecordingStatus ?? 'N/A',
-                  _getStatusIcon(debugInfo.lastRecordingStatus),
-                  statusColor: _getStatusColor(debugInfo.lastRecordingStatus),
+                  widget.debugInfo.lastRecordingStatus ?? 'N/A',
+                  _getStatusIcon(widget.debugInfo.lastRecordingStatus),
+                  statusColor:
+                      _getStatusColor(widget.debugInfo.lastRecordingStatus),
                 ),
-                if (debugInfo.lastRecordingPath != null)
-                  _buildInfoTile('Path', debugInfo.lastRecordingPath!,
+                if (widget.debugInfo.lastRecordingPath != null)
+                  _buildInfoTile('Path', widget.debugInfo.lastRecordingPath!,
                       Icons.insert_drive_file),
 
                 SizedBox(height: 16),
 
                 // Debug Logs Section
-                if (debugInfo.debugLogs.isNotEmpty) ...[
+                if (widget.debugInfo.debugLogs.isNotEmpty) ...[
                   _buildSectionTitle(
-                      'Recent Logs (${debugInfo.debugLogs.length})'),
+                      'Recent Logs (${widget.debugInfo.debugLogs.length})'),
                   Container(
                     padding: EdgeInsets.all(12),
                     decoration: BoxDecoration(
@@ -123,7 +144,7 @@ class DebugInfoPanel extends StatelessWidget {
                     ),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
-                      children: debugInfo.debugLogs
+                      children: widget.debugInfo.debugLogs
                           .map((log) => Padding(
                                 padding:
                                     const EdgeInsets.symmetric(vertical: 2),
@@ -142,6 +163,79 @@ class DebugInfoPanel extends StatelessWidget {
                 ],
               ],
             ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDemoModeToggle() {
+    return Container(
+      margin: EdgeInsets.only(bottom: 8),
+      padding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: AppState.demoMode
+            ? Colors.orange.withOpacity(0.15)
+            : Colors.white.withOpacity(0.05),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(
+          color: AppState.demoMode ? Colors.orange : Colors.white12,
+        ),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            Icons.videocam,
+            color: AppState.demoMode ? Colors.orange : Colors.white54,
+            size: 20,
+          ),
+          SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Video Preview Mode',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 15,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+                SizedBox(height: 2),
+                Text(
+                  AppState.demoMode
+                      ? 'Active - Restart to use camera'
+                      : 'Off - Using real camera',
+                  style: TextStyle(
+                    color: AppState.demoMode ? Colors.orange : Colors.white54,
+                    fontSize: 11,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Switch(
+            value: AppState.demoMode,
+            onChanged: (value) async {
+              await AppState.setDemoMode(value);
+              setState(() {});
+              if (context.mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text(
+                      value
+                          ? '📹 Demo mode enabled. Restart app to apply.'
+                          : '📷 Demo mode disabled. Restart app to use camera.',
+                    ),
+                    backgroundColor: Colors.orange,
+                    behavior: SnackBarBehavior.floating,
+                    duration: Duration(seconds: 3),
+                  ),
+                );
+              }
+            },
+            activeColor: Colors.orange,
           ),
         ],
       ),
