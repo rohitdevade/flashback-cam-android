@@ -59,7 +59,7 @@ class DeviceService {
     return fpsList;
   }
 
-  /// Returns available buffer durations for low-memory devices
+  /// Returns available buffer durations based on device RAM
   List<int> getAvailableBufferDurations(bool isPro) {
     final caps = _capabilities;
 

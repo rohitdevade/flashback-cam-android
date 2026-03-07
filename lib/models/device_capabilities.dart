@@ -10,6 +10,10 @@ class DeviceCapabilities {
   /// Returns true if device has 4GB RAM or less (low-memory mode)
   /// These devices need restricted resolution, FPS, and buffer options
   bool get isLowMemoryDevice => ramMB <= 4096;
+
+  /// Returns true if device has 7GB RAM or more (high-memory mode)
+  /// Note: "8GB" phones typically report ~7500MB due to reserved memory
+  bool get isHighMemoryDevice => ramMB >= 7168;
   final List<String> supportedResolutions;
   final List<int> supportedFps;
   final List<String> supportedCodecs;

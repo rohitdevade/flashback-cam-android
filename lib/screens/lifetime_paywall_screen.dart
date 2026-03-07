@@ -8,7 +8,7 @@ import 'package:flashback_cam/widgets/glass_container.dart';
 import 'package:flashback_cam/widgets/frosted_glass_card.dart';
 import 'package:flashback_cam/services/subscription_service.dart';
 
-/// Lifetime Paywall Screen - Shows 70% discount offer
+/// Lifetime Paywall Screen - Shows Play Console pricing for the lifetime offer
 /// All prices are fetched from Google Play Console - NO hardcoded values
 class LifetimePaywallScreen extends StatefulWidget {
   /// Optional: reason for showing the paywall (for analytics/display)
@@ -75,6 +75,7 @@ class _LifetimePaywallScreenState extends State<LifetimePaywallScreen>
   Widget build(BuildContext context) {
     final appState = context.watch<AppState>();
     final subscriptionService = appState.subscriptionService;
+    final hasLifetimePurchase = subscriptionService.hasLifetimePurchase;
     // Only get pricing after billing is initialized
     final lifetimePricing =
         _billingInitialized ? subscriptionService.getLifetimePricing() : null;
@@ -107,7 +108,10 @@ class _LifetimePaywallScreenState extends State<LifetimePaywallScreen>
                       const SizedBox(height: 32),
                       _buildPricingCard(lifetimePricing),
                       const SizedBox(height: 24),
-                      _buildPurchaseButton(lifetimePricing),
+                      _buildPurchaseButton(
+                        pricing: lifetimePricing,
+                        hasLifetimePurchase: hasLifetimePurchase,
+                      ),
                       const SizedBox(height: 16),
                       _buildDisclaimer(),
                       const SizedBox(height: 32),
@@ -186,41 +190,40 @@ class _LifetimePaywallScreenState extends State<LifetimePaywallScreen>
       child: Column(
         children: [
           // Discount badge
-          if (pricing?.hasActiveDiscount ?? false)
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              margin: const EdgeInsets.only(bottom: 20),
-              decoration: BoxDecoration(
-                color: Colors.white.withValues(alpha: 0.2),
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(
-                  color: Colors.white.withValues(alpha: 0.3),
-                ),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(
-                    Icons.local_offer_rounded,
-                    color: Colors.white,
-                    size: 18,
-                  ),
-                  const SizedBox(width: 8),
-                  Text(
-                    'Save 70% – Limited Time',
-                    style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                          color: Colors.white,
-                          fontWeight: FontWeight.w700,
-                          letterSpacing: 0.5,
-                        ),
-                  ),
-                ],
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            margin: const EdgeInsets.only(bottom: 20),
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.2),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(
+                color: Colors.white.withValues(alpha: 0.3),
               ),
             ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(
+                  Icons.local_offer_rounded,
+                  color: Colors.white,
+                  size: 18,
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  '50% OFF - Limited Time',
+                  style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: 0.5,
+                      ),
+                ),
+              ],
+            ),
+          ),
 
           // Title
           Text(
-            'Limited-Time Lifetime Offer 🎉',
+            'Lifetime Access',
             style: Theme.of(context).textTheme.headlineMedium?.copyWith(
                   color: Colors.white,
                   fontWeight: FontWeight.w800,
@@ -233,7 +236,7 @@ class _LifetimePaywallScreenState extends State<LifetimePaywallScreen>
 
           // Subtitle
           Text(
-            'Unlock all buffer durations forever\nNo subscriptions • One-time payment',
+            'Unlock all Pro features forever\nNo subscriptions • One-time payment',
             style: Theme.of(context).textTheme.bodyLarge?.copyWith(
                   color: Colors.white.withValues(alpha: 0.9),
                   height: 1.5,
@@ -409,6 +412,32 @@ class _LifetimePaywallScreenState extends State<LifetimePaywallScreen>
       padding: const EdgeInsets.all(24),
       child: Column(
         children: [
+          Text(
+            'Lifetime Access',
+            style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                  color: AppColors.textPrimary,
+                  fontWeight: FontWeight.w700,
+                ),
+          ),
+          const SizedBox(height: 12),
+          Container(
+            margin: const EdgeInsets.only(bottom: 16),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            decoration: BoxDecoration(
+              color: AppColors.neonGreen.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(999),
+              border: Border.all(
+                color: AppColors.neonGreen.withValues(alpha: 0.35),
+              ),
+            ),
+            child: Text(
+              '50% OFF - Limited Time',
+              style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                    color: AppColors.neonGreen,
+                    fontWeight: FontWeight.w700,
+                  ),
+            ),
+          ),
           // Price display
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
@@ -468,7 +497,42 @@ class _LifetimePaywallScreenState extends State<LifetimePaywallScreen>
     );
   }
 
-  Widget _buildPurchaseButton(LifetimePricing? pricing) {
+  Widget _buildPurchaseButton({
+    required LifetimePricing? pricing,
+    required bool hasLifetimePurchase,
+  }) {
+    if (hasLifetimePurchase) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 16),
+        decoration: BoxDecoration(
+          color: AppColors.neonGreen.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+            color: AppColors.neonGreen.withValues(alpha: 0.35),
+          ),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(
+              Icons.check_circle_rounded,
+              color: AppColors.neonGreen,
+              size: 22,
+            ),
+            const SizedBox(width: 10),
+            Text(
+              'Lifetime already unlocked',
+              style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                    color: AppColors.textPrimary,
+                    fontWeight: FontWeight.w700,
+                  ),
+            ),
+          ],
+        ),
+      );
+    }
+
     final isLoading = pricing == null || _isPurchasing;
 
     return SizedBox(
@@ -501,7 +565,7 @@ class _LifetimePaywallScreenState extends State<LifetimePaywallScreen>
                   const Icon(Icons.lock_open_rounded, size: 22),
                   const SizedBox(width: 10),
                   Text(
-                    'Unlock Lifetime Access',
+                    'Buy Lifetime',
                     style: Theme.of(context).textTheme.titleMedium?.copyWith(
                           color: Colors.white,
                           fontWeight: FontWeight.w700,
@@ -519,7 +583,7 @@ class _LifetimePaywallScreenState extends State<LifetimePaywallScreen>
       child: Text(
         'One-time purchase. No subscription or recurring charges. '
         'All purchases are processed securely by Google Play. '
-        'Your purchase will be restored automatically if you reinstall the app.',
+        'If you already own lifetime through either Play product, it will be restored automatically after reinstall.',
         style: Theme.of(context).textTheme.bodySmall?.copyWith(
               color: AppColors.textTertiary,
               height: 1.5,

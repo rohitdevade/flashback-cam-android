@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -35,14 +36,24 @@ enum PurchaseResult {
 /// Purchase verification result
 class PurchaseVerificationResult {
   final bool isValid;
+  final SubscriptionStatus? status;
   final String? tier;
   final DateTime? expiresAt;
+  final DateTime? trialEndsAt;
+  final DateTime? gracePeriodExpiresAt;
+  final bool willAutoRenew;
+  final String validationSource;
   final String? errorMessage;
 
   PurchaseVerificationResult({
     required this.isValid,
+    this.status,
     this.tier,
     this.expiresAt,
+    this.trialEndsAt,
+    this.gracePeriodExpiresAt,
+    this.willAutoRenew = false,
+    this.validationSource = 'local',
     this.errorMessage,
   });
 }
@@ -89,6 +100,10 @@ class LifetimePricing {
 }
 
 class SubscriptionService {
+  static const Duration _trialDuration = Duration(days: 3);
+  static const String _subscriptionValidationUrl =
+      String.fromEnvironment('SUBSCRIPTION_VALIDATION_URL');
+
   User? _currentUser;
   final InAppPurchase _iap = InAppPurchase.instance;
   StreamSubscription<List<PurchaseDetails>>? _subscription;
@@ -96,10 +111,8 @@ class SubscriptionService {
   // Product IDs - Update these to match your Google Play Console product IDs
   static const String monthlyProductId = 'flashback_cam_monthly';
   static const String yearlyProductId = 'flashback_cam_yearly';
-  static const String lifetimeProductId = 'flashback_cam_lifetime';
-  // Original lifetime price product ID (for showing strikethrough price)
-  static const String lifetimeOriginalProductId =
-      'flashback_cam_lifetime_original';
+  static const String lifetimeDiscountProductId = 'lifetime_discount';
+  static const String lifetimeFullPriceProductId = 'flashback_cam_lifetime';
 
   // Store fetched products
   Map<String, ProductDetails> _products = {};
@@ -114,6 +127,9 @@ class SubscriptionService {
   // Track if any valid purchases were found during restore
   bool _foundValidPurchases = false;
 
+  // Allows the UI to await a restore result instead of only the restore kickoff.
+  Completer<bool>? _restoreOperationCompleter;
+
   // Stream controller for purchase updates
   final _purchaseResultController =
       StreamController<PurchaseResult>.broadcast();
@@ -122,6 +138,9 @@ class SubscriptionService {
 
   // Debug mode - allows purchases to work in debug builds without real IAP
   static const bool _debugPurchasesEnabled = kDebugMode;
+
+  // Debug mode - force Pro access for testing (only works in debug builds)
+  static const bool _debugForceProAccess = false;
 
   // COLD START: Track if billing has been fully initialized
   bool _billingInitialized = false;
@@ -136,6 +155,7 @@ class SubscriptionService {
   Future<void> initialize() async {
     // COLD START: Only load cached user data - no billing client connection
     await _loadUser();
+    await _refreshCachedStatus();
 
     debugPrint(
         'SubscriptionService: Loaded cached user status (billing deferred)');
@@ -221,6 +241,47 @@ class SubscriptionService {
     }
   }
 
+  Future<void> _refreshCachedStatus() async {
+    if (_currentUser == null) return;
+
+    final now = DateTime.now();
+    final currentStatus = _currentUser!.subscriptionStatus;
+    var nextStatus = currentStatus;
+
+    if (currentStatus == SubscriptionStatus.trialCancelled &&
+        _currentUser!.trialEndsAt != null &&
+        !now.isBefore(_currentUser!.trialEndsAt!)) {
+      nextStatus = SubscriptionStatus.expired;
+    } else if (currentStatus == SubscriptionStatus.trialActive &&
+        !_currentUser!.subscriptionWillRenew &&
+        _currentUser!.trialEndsAt != null &&
+        !now.isBefore(_currentUser!.trialEndsAt!)) {
+      nextStatus = SubscriptionStatus.expired;
+    } else if (currentStatus == SubscriptionStatus.gracePeriod &&
+        _currentUser!.gracePeriodExpiresAt != null &&
+        !now.isBefore(_currentUser!.gracePeriodExpiresAt!)) {
+      nextStatus = SubscriptionStatus.expired;
+    } else if (currentStatus == SubscriptionStatus.active &&
+        _currentUser!.proTier != 'lifetime' &&
+        !_currentUser!.subscriptionWillRenew &&
+        _currentUser!.proExpiresAt != null &&
+        !now.isBefore(_currentUser!.proExpiresAt!)) {
+      nextStatus = SubscriptionStatus.expired;
+    }
+
+    if (nextStatus == currentStatus) return;
+
+    final updatedUser = _currentUser!.copyWith(
+      isPro: _isPaidEntitlementStatus(nextStatus, _currentUser!.proTier),
+      subscriptionStatus: nextStatus.storageValue,
+      gracePeriodExpiresAt: null,
+      subscriptionWillRenew: false,
+      updatedAt: now,
+      lastValidatedAt: now,
+    );
+    await _saveUser(updatedUser);
+  }
+
   /// Public method to load products - ensures billing is initialized first
   Future<void> loadProducts() async {
     // COLD START: Ensure billing is initialized before loading products
@@ -237,8 +298,8 @@ class SubscriptionService {
       const productIds = {
         monthlyProductId,
         yearlyProductId,
-        lifetimeProductId,
-        lifetimeOriginalProductId,
+        lifetimeDiscountProductId,
+        lifetimeFullPriceProductId,
       };
 
       final ProductDetailsResponse response =
@@ -263,8 +324,8 @@ class SubscriptionService {
         debugPrint(
             'Product: ${product.id} - ${product.title} - ${product.price}');
         // Log additional pricing info for debugging
-        if (product.id == lifetimeProductId ||
-            product.id == lifetimeOriginalProductId) {
+        if (product.id == lifetimeDiscountProductId ||
+            product.id == lifetimeFullPriceProductId) {
           debugPrint(
               '  Raw price: ${product.rawPrice} ${product.currencyCode}');
         }
@@ -320,13 +381,15 @@ class SubscriptionService {
     if (_isRestoreOperation) {
       _isRestoreOperation = false; // Reset flag
 
-      // If no valid purchases found and user is marked as pro, revoke access
-      if (!_foundValidPurchases && _currentUser?.isPro == true) {
+      if (!_foundValidPurchases) {
         debugPrint(
             '🚫 No active purchases found during restore - subscription expired');
-        debugPrint('   Revoking pro access');
+        debugPrint('   Updating subscription status to no entitlement');
         await _revokeSubscription(reason: 'No active purchases found');
       }
+
+      _restoreOperationCompleter?.complete(_currentUser?.hasProAccess == true);
+      _restoreOperationCompleter = null;
 
       _foundValidPurchases = false; // Reset for next restore
     }
@@ -358,25 +421,31 @@ class SubscriptionService {
     }
 
     final tier = verificationResult.tier;
-    debugPrint('✅ Purchase verified: tier=$tier');
+    debugPrint(
+        '✅ Purchase verified: tier=$tier status=${verificationResult.status?.storageValue} source=${verificationResult.validationSource}');
 
-    if (tier != null && _currentUser != null) {
-      // For subscriptions, we don't set local expiration - Google Play manages this
-      // For lifetime, we also don't need expiration (null = never expires)
-      // The expiration is only used for local trial tracking
-      DateTime? expiresAt;
-
-      // Only set local expiration for restored purchases as a cache
-      // This will be overwritten on next sync with store
-      if (purchaseDetails.status == PurchaseStatus.restored) {
-        expiresAt = verificationResult.expiresAt;
-      }
-
+    if (tier != null &&
+        _currentUser != null &&
+        verificationResult.status != null) {
+      final now = DateTime.now();
+      final trialStartedAt = verificationResult.trialEndsAt != null
+          ? (_purchaseDateForDetails(purchaseDetails) ??
+              verificationResult.trialEndsAt!.subtract(_trialDuration))
+          : _currentUser!.trialStartedAt;
       final updatedUser = _currentUser!.copyWith(
-        isPro: true,
+        isPro: _isPaidEntitlementStatus(verificationResult.status!, tier),
         proTier: tier,
-        proExpiresAt: expiresAt,
-        updatedAt: DateTime.now(),
+        proExpiresAt:
+            verificationResult.expiresAt ?? verificationResult.trialEndsAt,
+        trialStartedAt: trialStartedAt,
+        trialUsed: _currentUser!.trialUsed ||
+            verificationResult.status!.isTrialState ||
+            verificationResult.trialEndsAt != null,
+        subscriptionStatus: verificationResult.status!.storageValue,
+        subscriptionWillRenew: verificationResult.willAutoRenew,
+        gracePeriodExpiresAt: verificationResult.gracePeriodExpiresAt,
+        updatedAt: now,
+        lastValidatedAt: now,
       );
 
       // Store purchase token for future verification
@@ -397,14 +466,7 @@ class SubscriptionService {
       PurchaseDetails purchaseDetails) async {
     try {
       // Get the tier from product ID
-      String? tier;
-      if (purchaseDetails.productID == monthlyProductId) {
-        tier = 'monthly';
-      } else if (purchaseDetails.productID == yearlyProductId) {
-        tier = 'yearly';
-      } else if (purchaseDetails.productID == lifetimeProductId) {
-        tier = 'lifetime';
-      }
+      final tier = _tierFromProductId(purchaseDetails.productID);
 
       if (tier == null) {
         return PurchaseVerificationResult(
@@ -413,106 +475,17 @@ class SubscriptionService {
         );
       }
 
-      // =========================================================================
-      // ANDROID PLATFORM-SPECIFIC VERIFICATION
-      // =========================================================================
-      if (Platform.isAndroid) {
-        final androidDetails = purchaseDetails as GooglePlayPurchaseDetails;
-        final billingClientPurchase = androidDetails.billingClientPurchase;
-
-        // Check purchase state - must be purchased (not pending/unspecified)
-        if (billingClientPurchase.purchaseState !=
-            PurchaseStateWrapper.purchased) {
-          debugPrint(
-              '⚠️ Purchase state is not purchased: ${billingClientPurchase.purchaseState}');
-          return PurchaseVerificationResult(
-            isValid: false,
-            errorMessage: 'Purchase not in purchased state',
-          );
-        }
-
-        // Check if purchase is acknowledged (for restored purchases)
-        final isAcknowledged = billingClientPurchase.isAcknowledged;
-        debugPrint('   Purchase acknowledged: $isAcknowledged');
-
-        // Get the purchase token for verification
-        final purchaseToken = billingClientPurchase.purchaseToken;
-        final orderId = billingClientPurchase.orderId;
-
-        debugPrint('   Order ID: $orderId');
-        debugPrint('   Purchase Token: ${purchaseToken.substring(0, 20)}...');
-
-        // =====================================================================
-        // TODO: BACKEND VERIFICATION (Recommended for production)
-        // =====================================================================
-        // For maximum security, you should verify the purchase token with your
-        // backend server, which then verifies with Google Play Developer API:
-        //
-        // 1. Send purchaseToken, productId, and packageName to your backend
-        // 2. Backend calls Google Play Developer API:
-        //    - For subscriptions: purchases.subscriptions.get
-        //    - For one-time products: purchases.products.get
-        // 3. Backend verifies the response and returns validity + expiration
-        //
-        // Example:
-        // final response = await http.post(
-        //   Uri.parse('https://your-backend.com/verify-purchase'),
-        //   body: jsonEncode({
-        //     'purchaseToken': purchaseToken,
-        //     'productId': purchaseDetails.productID,
-        //     'packageName': 'com.rochapps.flashbackcam',
-        //   }),
-        // );
-        // final result = jsonDecode(response.body);
-        // return PurchaseVerificationResult(
-        //   isValid: result['valid'],
-        //   tier: tier,
-        //   expiresAt: result['expiresAt'] != null
-        //       ? DateTime.parse(result['expiresAt'])
-        //       : null,
-        // );
-        // =====================================================================
-
-        // For now, we trust Google Play's verification since:
-        // 1. Purchase came through official Google Play billing
-        // 2. We verified the purchase state is "purchased"
-        // 3. We're storing the token for audit purposes
-        //
-        // This is acceptable for apps without backend, but has fraud risk:
-        // - Users could potentially exploit refunds
-        // - Subscription cancellation won't be detected until next sync
-
-        debugPrint('✅ Google Play purchase verified locally');
-
-        // For subscriptions, don't set expiration locally - rely on restore
-        DateTime? expiresAt;
-        if (tier == 'lifetime') {
-          expiresAt = null; // Never expires
-        }
-        // For monthly/yearly, Google Play manages expiration via restore
-
-        return PurchaseVerificationResult(
-          isValid: true,
-          tier: tier,
-          expiresAt: expiresAt,
-        );
-      }
-
-      // =========================================================================
-      // iOS VERIFICATION (placeholder for future iOS support)
-      // =========================================================================
-      if (Platform.isIOS) {
-        // iOS verification would use StoreKit verification
-        // For now, trust the purchase
-        return PurchaseVerificationResult(
-          isValid: true,
+      final validationUrl = _subscriptionValidationUrl.trim();
+      if (validationUrl.isNotEmpty) {
+        return await _verifyPurchaseWithBackend(
+          validationUrl: validationUrl,
+          purchaseDetails: purchaseDetails,
           tier: tier,
         );
       }
 
-      // Unknown platform
-      return PurchaseVerificationResult(
-        isValid: true,
+      return _verifyPurchaseLocally(
+        purchaseDetails: purchaseDetails,
         tier: tier,
       );
     } catch (e) {
@@ -522,6 +495,287 @@ class SubscriptionService {
         errorMessage: 'Verification error: $e',
       );
     }
+  }
+
+  Future<PurchaseVerificationResult> _verifyPurchaseWithBackend({
+    required String validationUrl,
+    required PurchaseDetails purchaseDetails,
+    required String tier,
+  }) async {
+    final client = HttpClient();
+    try {
+      final request = await client.postUrl(Uri.parse(validationUrl));
+      request.headers.contentType = ContentType.json;
+      request.add(
+        utf8.encode(
+          jsonEncode(_buildValidationPayload(purchaseDetails, tier)),
+        ),
+      );
+
+      final response =
+          await request.close().timeout(const Duration(seconds: 10));
+      final body = await response.transform(utf8.decoder).join();
+
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        return PurchaseVerificationResult(
+          isValid: false,
+          errorMessage:
+              'Validation backend returned ${response.statusCode}: $body',
+          validationSource: 'backend',
+        );
+      }
+
+      final payload = jsonDecode(body);
+      if (payload is! Map<String, dynamic>) {
+        return PurchaseVerificationResult(
+          isValid: false,
+          errorMessage: 'Validation backend returned an invalid response',
+          validationSource: 'backend',
+        );
+      }
+
+      final isValid = payload['isValid'] == true || payload['valid'] == true;
+      final status = _statusFromBackendPayload(payload, tier: tier);
+      return PurchaseVerificationResult(
+        isValid: isValid,
+        status: status,
+        tier: payload['tier'] as String? ?? tier,
+        expiresAt: _parseDateValue(payload['expiresAt']),
+        trialEndsAt: _parseDateValue(payload['trialEndsAt']),
+        gracePeriodExpiresAt: _parseDateValue(payload['gracePeriodEndsAt']),
+        willAutoRenew: payload['willAutoRenew'] as bool? ?? false,
+        validationSource: 'backend',
+        errorMessage: payload['errorMessage'] as String?,
+      );
+    } on TimeoutException {
+      return PurchaseVerificationResult(
+        isValid: false,
+        errorMessage: 'Validation backend timed out',
+        validationSource: 'backend',
+      );
+    } catch (e) {
+      return PurchaseVerificationResult(
+        isValid: false,
+        errorMessage: 'Validation backend error: $e',
+        validationSource: 'backend',
+      );
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  PurchaseVerificationResult _verifyPurchaseLocally({
+    required PurchaseDetails purchaseDetails,
+    required String tier,
+  }) {
+    if (tier == 'lifetime') {
+      return PurchaseVerificationResult(
+        isValid: true,
+        status: SubscriptionStatus.active,
+        tier: tier,
+        validationSource: 'local',
+      );
+    }
+
+    if (Platform.isAndroid) {
+      final androidDetails = purchaseDetails as GooglePlayPurchaseDetails;
+      final billingClientPurchase = androidDetails.billingClientPurchase;
+      if (billingClientPurchase.purchaseState !=
+          PurchaseStateWrapper.purchased) {
+        return PurchaseVerificationResult(
+          isValid: false,
+          errorMessage: 'Purchase not in purchased state',
+          validationSource: 'local',
+        );
+      }
+
+      final purchaseDate = _purchaseDateForDetails(purchaseDetails);
+      final trialEndsAt = _deriveTrialEndDate(
+        productId: purchaseDetails.productID,
+        purchaseDate: purchaseDate,
+      );
+
+      if (trialEndsAt != null && DateTime.now().isBefore(trialEndsAt)) {
+        final status = billingClientPurchase.isAutoRenewing
+            ? SubscriptionStatus.trialActive
+            : SubscriptionStatus.trialCancelled;
+        return PurchaseVerificationResult(
+          isValid: true,
+          status: status,
+          tier: tier,
+          expiresAt: trialEndsAt,
+          trialEndsAt: trialEndsAt,
+          willAutoRenew: billingClientPurchase.isAutoRenewing,
+          validationSource: 'local',
+        );
+      }
+
+      return PurchaseVerificationResult(
+        isValid: true,
+        status: SubscriptionStatus.active,
+        tier: tier,
+        willAutoRenew: billingClientPurchase.isAutoRenewing,
+        validationSource: 'local',
+      );
+    }
+
+    final purchaseDate = _purchaseDateForDetails(purchaseDetails);
+    final trialEndsAt = _deriveTrialEndDate(
+      productId: purchaseDetails.productID,
+      purchaseDate: purchaseDate,
+    );
+    if (trialEndsAt != null && DateTime.now().isBefore(trialEndsAt)) {
+      return PurchaseVerificationResult(
+        isValid: true,
+        status: SubscriptionStatus.trialActive,
+        tier: tier,
+        expiresAt: trialEndsAt,
+        trialEndsAt: trialEndsAt,
+        willAutoRenew: true,
+        validationSource: 'local',
+      );
+    }
+
+    return PurchaseVerificationResult(
+      isValid: true,
+      status: SubscriptionStatus.active,
+      tier: tier,
+      willAutoRenew: true,
+      validationSource: 'local',
+    );
+  }
+
+  Map<String, dynamic> _buildValidationPayload(
+    PurchaseDetails purchaseDetails,
+    String tier,
+  ) {
+    final payload = <String, dynamic>{
+      'platform': Platform.isIOS
+          ? 'ios'
+          : Platform.isAndroid
+              ? 'android'
+              : 'unknown',
+      'tier': tier,
+      'productId': purchaseDetails.productID,
+      'purchaseId': purchaseDetails.purchaseID,
+      'transactionDate': purchaseDetails.transactionDate,
+      'verificationData': {
+        'source': purchaseDetails.verificationData.source,
+        'localVerificationData':
+            purchaseDetails.verificationData.localVerificationData,
+        'serverVerificationData':
+            purchaseDetails.verificationData.serverVerificationData,
+      },
+    };
+
+    if (Platform.isAndroid && purchaseDetails is GooglePlayPurchaseDetails) {
+      final purchase = purchaseDetails.billingClientPurchase;
+      payload['storePayload'] = {
+        'orderId': purchase.orderId,
+        'packageName': purchase.packageName,
+        'purchaseTime': purchase.purchaseTime,
+        'purchaseToken': purchase.purchaseToken,
+        'products': purchase.products,
+        'isAutoRenewing': purchase.isAutoRenewing,
+        'originalJson': purchase.originalJson,
+        'signature': purchase.signature,
+        'isAcknowledged': purchase.isAcknowledged,
+        'purchaseState': purchase.purchaseState.name,
+      };
+    }
+
+    return payload;
+  }
+
+  SubscriptionStatus _statusFromBackendPayload(
+    Map<String, dynamic> payload, {
+    required String tier,
+  }) {
+    final rawStatus = payload['status'] as String?;
+    switch (rawStatus) {
+      case 'free':
+        return SubscriptionStatus.free;
+      case 'trial_active':
+      case 'trial':
+        return SubscriptionStatus.trialActive;
+      case 'paid_active':
+      case 'active':
+        return SubscriptionStatus.active;
+      case 'trial_cancelled':
+      case 'trial_canceled':
+      case 'cancelled_in_trial':
+        return SubscriptionStatus.trialCancelled;
+      case 'grace_period':
+      case 'billing_retry':
+        return SubscriptionStatus.gracePeriod;
+      case 'expired':
+        return SubscriptionStatus.expired;
+      default:
+        break;
+    }
+
+    if (payload['isInGracePeriod'] == true || payload['billingRetry'] == true) {
+      return SubscriptionStatus.gracePeriod;
+    }
+    if (payload['isTrialPeriod'] == true) {
+      return (payload['willAutoRenew'] as bool? ?? false)
+          ? SubscriptionStatus.trialActive
+          : SubscriptionStatus.trialCancelled;
+    }
+    if (tier == 'lifetime') {
+      return SubscriptionStatus.active;
+    }
+    if (payload['hasAccess'] == true) {
+      return SubscriptionStatus.active;
+    }
+    return SubscriptionStatus.expired;
+  }
+
+  DateTime? _parseDateValue(dynamic value) {
+    if (value == null) return null;
+    if (value is String && value.isNotEmpty) {
+      final intValue = int.tryParse(value);
+      if (intValue != null) {
+        return DateTime.fromMillisecondsSinceEpoch(intValue).toLocal();
+      }
+      return DateTime.tryParse(value)?.toLocal();
+    }
+    return null;
+  }
+
+  String? _tierFromProductId(String productId) {
+    if (productId == monthlyProductId) return 'monthly';
+    if (productId == yearlyProductId) return 'yearly';
+    if (productId == lifetimeDiscountProductId ||
+        productId == lifetimeFullPriceProductId) {
+      return 'lifetime';
+    }
+    return null;
+  }
+
+  DateTime? _purchaseDateForDetails(PurchaseDetails purchaseDetails) {
+    final transactionDate = purchaseDetails.transactionDate;
+    if (transactionDate == null || transactionDate.isEmpty) return null;
+    final milliseconds = int.tryParse(transactionDate);
+    if (milliseconds != null) {
+      return DateTime.fromMillisecondsSinceEpoch(milliseconds).toLocal();
+    }
+    return DateTime.tryParse(transactionDate)?.toLocal();
+  }
+
+  DateTime? _deriveTrialEndDate({
+    required String productId,
+    required DateTime? purchaseDate,
+  }) {
+    if (purchaseDate == null) return null;
+    if (productId != yearlyProductId) return null;
+    return purchaseDate.add(_trialDuration);
+  }
+
+  bool _isPaidEntitlementStatus(SubscriptionStatus status, String? tier) {
+    if (tier == 'lifetime') return true;
+    return status == SubscriptionStatus.active ||
+        status == SubscriptionStatus.gracePeriod;
   }
 
   /// Store purchase token for audit and future verification
@@ -555,11 +809,19 @@ class SubscriptionService {
 
     if (_currentUser == null) return;
 
+    final nextStatus = (_currentUser!.trialUsed ||
+            _currentUser!.proTier != null ||
+            _currentUser!.subscriptionStatus != SubscriptionStatus.free)
+        ? SubscriptionStatus.expired
+        : SubscriptionStatus.free;
+
     final updatedUser = _currentUser!.copyWith(
       isPro: false,
-      proTier: null,
-      proExpiresAt: null,
+      subscriptionStatus: nextStatus.storageValue,
+      subscriptionWillRenew: false,
+      gracePeriodExpiresAt: null,
       updatedAt: DateTime.now(),
+      lastValidatedAt: DateTime.now(),
     );
 
     await _saveUser(updatedUser);
@@ -574,9 +836,21 @@ class SubscriptionService {
       final proExpiresAtStr = prefs.getString('proExpiresAt');
       final trialStartedAtStr = prefs.getString('trialStartedAt');
       final trialUsed = prefs.getBool('trialUsed') ?? false;
+      final subscriptionStatus = prefs.getString('subscriptionStatus');
+      final subscriptionWillRenew =
+          prefs.getBool('subscriptionWillRenew') ?? false;
+      final gracePeriodExpiresAtStr = prefs.getString('gracePeriodExpiresAt');
+      final lastValidatedAtStr = prefs.getString('lastValidatedAt');
+      final trialDurationDays = prefs.getInt('trialDurationDays') ?? 3;
 
       final proExpiresAt =
           proExpiresAtStr != null ? DateTime.parse(proExpiresAtStr) : null;
+      final gracePeriodExpiresAt = gracePeriodExpiresAtStr != null
+          ? DateTime.parse(gracePeriodExpiresAtStr)
+          : null;
+      final lastValidatedAt = lastValidatedAtStr != null
+          ? DateTime.parse(lastValidatedAtStr)
+          : null;
 
       // For subscription tiers (monthly/yearly), we don't check local expiration
       // Instead, we rely on Google Play sync via restorePurchases()
@@ -609,6 +883,11 @@ class SubscriptionService {
             ? DateTime.parse(trialStartedAtStr)
             : null,
         trialUsed: trialUsed,
+        subscriptionStatusValue: subscriptionStatus,
+        subscriptionWillRenew: subscriptionWillRenew,
+        gracePeriodExpiresAt: gracePeriodExpiresAt,
+        lastValidatedAt: lastValidatedAt,
+        trialDurationDays: trialDurationDays,
       );
     } catch (e) {
       debugPrint('Failed to load user: $e');
@@ -617,6 +896,7 @@ class SubscriptionService {
         isPro: false,
         createdAt: DateTime.now(),
         updatedAt: DateTime.now(),
+        subscriptionStatusValue: SubscriptionStatus.free.storageValue,
       );
     }
   }
@@ -644,6 +924,30 @@ class SubscriptionService {
         await prefs.remove('trialStartedAt');
       }
       await prefs.setBool('trialUsed', user.trialUsed);
+      if (user.subscriptionStatusValue != null) {
+        await prefs.setString(
+            'subscriptionStatus', user.subscriptionStatusValue!);
+      } else {
+        await prefs.remove('subscriptionStatus');
+      }
+      await prefs.setBool('subscriptionWillRenew', user.subscriptionWillRenew);
+      if (user.gracePeriodExpiresAt != null) {
+        await prefs.setString(
+          'gracePeriodExpiresAt',
+          user.gracePeriodExpiresAt!.toIso8601String(),
+        );
+      } else {
+        await prefs.remove('gracePeriodExpiresAt');
+      }
+      if (user.lastValidatedAt != null) {
+        await prefs.setString(
+          'lastValidatedAt',
+          user.lastValidatedAt!.toIso8601String(),
+        );
+      } else {
+        await prefs.remove('lastValidatedAt');
+      }
+      await prefs.setInt('trialDurationDays', user.trialDurationDays);
       _currentUser = user;
     } catch (e) {
       debugPrint('Failed to save user: $e');
@@ -661,6 +965,12 @@ class SubscriptionService {
       }
     }
 
+    if (tier == 'lifetime' && hasLifetimePurchase) {
+      debugPrint(
+          'Lifetime purchase already owned; skipping duplicate purchase');
+      return false;
+    }
+
     // CRITICAL: Ensure billing is initialized before any purchase operation
     await ensureBillingInitialized();
 
@@ -669,19 +979,29 @@ class SubscriptionService {
       debugPrint('🔧 DEBUG MODE: Simulating purchase for tier: $tier');
       await Future.delayed(const Duration(seconds: 1)); // Simulate delay
 
+      final now = DateTime.now();
+      final isTrialPurchase = tier == 'yearly';
       DateTime? expiresAt;
+      SubscriptionStatus status = SubscriptionStatus.active;
+      var willAutoRenew = tier != 'lifetime';
       if (tier == 'monthly') {
-        expiresAt = DateTime.now().add(const Duration(days: 30));
-      } else if (tier == 'yearly') {
-        expiresAt = DateTime.now().add(const Duration(days: 365));
+        expiresAt = now.add(const Duration(days: 30));
+      } else if (isTrialPurchase) {
+        expiresAt = now.add(_trialDuration);
+        status = SubscriptionStatus.trialActive;
       }
-      // lifetime has no expiration date (null)
 
       final updatedUser = _currentUser!.copyWith(
-        isPro: true,
+        isPro: _isPaidEntitlementStatus(status, tier),
         proTier: tier,
         proExpiresAt: expiresAt,
-        updatedAt: DateTime.now(),
+        trialStartedAt: isTrialPurchase ? now : _currentUser!.trialStartedAt,
+        trialUsed: _currentUser!.trialUsed || isTrialPurchase,
+        subscriptionStatus: status.storageValue,
+        subscriptionWillRenew: willAutoRenew,
+        gracePeriodExpiresAt: null,
+        updatedAt: now,
+        lastValidatedAt: now,
       );
 
       await _saveUser(updatedUser);
@@ -701,7 +1021,7 @@ class SubscriptionService {
     } else if (tier == 'yearly') {
       productId = yearlyProductId;
     } else if (tier == 'lifetime') {
-      productId = lifetimeProductId;
+      productId = lifetimeDiscountProductId;
     } else {
       debugPrint('Unknown tier: $tier');
       return false;
@@ -750,10 +1070,9 @@ class SubscriptionService {
     if (_debugPurchasesEnabled) {
       debugPrint('🔧 DEBUG MODE: Simulating restore purchases');
       await Future.delayed(const Duration(seconds: 1));
-      // In debug mode, restore will succeed if user was previously marked as pro
-      final wasPro = _currentUser?.isPro ?? false;
-      debugPrint('🔧 DEBUG MODE: User was pro: $wasPro');
-      return wasPro;
+      final hadAccess = _currentUser?.hasProAccess ?? false;
+      debugPrint('🔧 DEBUG MODE: User had access: $hadAccess');
+      return hadAccess;
     }
 
     if (!_isAvailable) {
@@ -765,14 +1084,25 @@ class SubscriptionService {
       // Mark that we're doing a restore operation
       _isRestoreOperation = true;
       _foundValidPurchases = false;
+      _restoreOperationCompleter = Completer<bool>();
 
       await _iap.restorePurchases();
 
-      // Note: _onPurchaseUpdate will handle revoking access if no purchases found
-      return true;
+      // Note: _onPurchaseUpdate will handle revoking access if no purchases found.
+      return await _restoreOperationCompleter!.future.timeout(
+        const Duration(seconds: 5),
+        onTimeout: () {
+          debugPrint('⚠️ Restore timed out waiting for purchase updates');
+          _isRestoreOperation = false;
+          final restored = _currentUser?.isPro == true;
+          _restoreOperationCompleter = null;
+          return restored;
+        },
+      );
     } catch (e) {
       debugPrint('Failed to restore purchases: $e');
       _isRestoreOperation = false;
+      _restoreOperationCompleter = null;
       return false;
     }
   }
@@ -785,9 +1115,9 @@ class SubscriptionService {
     } else if (tier == 'yearly') {
       productId = yearlyProductId;
     } else if (tier == 'lifetime') {
-      productId = lifetimeProductId;
-    } else if (tier == 'lifetime_original') {
-      productId = lifetimeOriginalProductId;
+      productId = lifetimeDiscountProductId;
+    } else if (tier == 'lifetime_full_price') {
+      productId = lifetimeFullPriceProductId;
     } else {
       return null;
     }
@@ -797,11 +1127,11 @@ class SubscriptionService {
   /// Get lifetime pricing information from Play Console
   /// Returns both original and discounted prices if discount is active
   LifetimePricing? getLifetimePricing() {
-    final discountedProduct = _products[lifetimeProductId];
-    final originalProduct = _products[lifetimeOriginalProductId];
+    final discountedProduct = _products[lifetimeDiscountProductId];
+    final originalProduct = _products[lifetimeFullPriceProductId];
 
     if (discountedProduct == null) {
-      debugPrint('⚠️ Lifetime product not found');
+      debugPrint('⚠️ Discounted lifetime product not found');
       return null;
     }
 
@@ -835,10 +1165,29 @@ class SubscriptionService {
           createdAt: DateTime.now(),
           updatedAt: DateTime.now());
 
-  bool get isPro => _currentUser?.isPro ?? false;
+  bool get isPro => _debugForceProAccess || (_currentUser?.isPro ?? false);
 
   /// Check if user has Pro access (paid or trial)
-  bool get hasProAccess => _currentUser?.hasProAccess ?? false;
+  bool get hasProAccess =>
+      _debugForceProAccess || (_currentUser?.hasProAccess ?? false);
+
+  /// True when the user owns either lifetime Play product permanently.
+  bool get hasLifetimePurchase =>
+      _debugForceProAccess ||
+      (_currentUser?.isPro == true && _currentUser?.proTier == 'lifetime');
+
+  SubscriptionStatus get subscriptionStatus =>
+      _currentUser?.subscriptionStatus ?? SubscriptionStatus.free;
+
+  bool get isPaidSubscriptionActive =>
+      subscriptionStatus == SubscriptionStatus.active;
+
+  bool get isCancelledButTrialActive =>
+      _currentUser?.isCancelledButTrialActive ?? false;
+
+  bool get isInGracePeriod => _currentUser?.isInGracePeriod ?? false;
+
+  bool get isExpired => _currentUser?.isExpired ?? false;
 
   /// Check if user is in an active trial
   bool get isTrialActive => _currentUser?.isTrialActive ?? false;
@@ -854,7 +1203,7 @@ class SubscriptionService {
     if (_currentUser == null) return false;
     if (_currentUser!.isPro) return false;
     if (_currentUser!.trialUsed) return false;
-    if (_currentUser!.isTrialActive) return false; // Already in trial
+    if (_currentUser!.isTrialActive) return false;
     return true;
   }
 
@@ -873,10 +1222,16 @@ class SubscriptionService {
     }
 
     try {
+      final now = DateTime.now();
       final updatedUser = _currentUser!.copyWith(
-        trialStartedAt: DateTime.now(),
+        isPro: false,
+        proExpiresAt: now.add(_trialDuration),
+        trialStartedAt: now,
         trialUsed: true,
-        updatedAt: DateTime.now(),
+        subscriptionStatus: SubscriptionStatus.trialActive.storageValue,
+        subscriptionWillRenew: false,
+        updatedAt: now,
+        lastValidatedAt: now,
       );
 
       await _saveUser(updatedUser);
@@ -891,8 +1246,9 @@ class SubscriptionService {
   /// Check subscription status and refresh if needed
   Future<void> refreshSubscriptionStatus() async {
     await _loadUser();
+    await _refreshCachedStatus();
     debugPrint(
-        'Subscription status refreshed: isPro=$isPro, hasProAccess=$hasProAccess');
+        'Subscription status refreshed: status=${subscriptionStatus.storageValue}, isPro=$isPro, hasProAccess=$hasProAccess');
   }
 
   /// ═══════════════════════════════════════════════════════════════════════════════
@@ -908,14 +1264,21 @@ class SubscriptionService {
     try {
       debugPrint('🔍 Validating subscription status on startup...');
 
-      // Only validate if user is marked as pro locally
-      if (_currentUser?.isPro != true) {
-        debugPrint('   User is not pro, skipping validation');
+      await _refreshCachedStatus();
+
+      final shouldValidate = _currentUser != null &&
+          (_currentUser!.subscriptionStatus != SubscriptionStatus.free ||
+              _currentUser!.trialUsed ||
+              _currentUser!.proTier != null);
+
+      if (!shouldValidate) {
+        debugPrint('   No cached subscription history, skipping validation');
         return;
       }
 
-      debugPrint('   User is marked as pro: tier=${_currentUser?.proTier}');
-      debugPrint('   Checking with Google Play...');
+      debugPrint(
+          '   Cached status=${_currentUser?.subscriptionStatus.storageValue} tier=${_currentUser?.proTier}');
+      debugPrint('   Checking with store...');
 
       // Initialize billing client if needed (this is async and won't block)
       await ensureBillingInitialized();
@@ -931,10 +1294,7 @@ class SubscriptionService {
         return;
       }
 
-      // Sync will automatically revoke access if no valid purchases found
-      if (!_hasRestoredPurchases) {
-        await _syncSubscriptionWithStore();
-      }
+      await _syncSubscriptionWithStore();
 
       debugPrint('✅ Subscription validation complete');
     } catch (e) {

@@ -17,8 +17,8 @@ import 'package:flashback_cam/widgets/buffer_duration_selector.dart';
 import 'package:flashback_cam/widgets/persistent_bottom_bar.dart';
 import 'package:flashback_cam/widgets/video_preview.dart';
 import 'package:flashback_cam/screens/gallery_screen.dart';
-import 'package:flashback_cam/screens/settings_screen.dart';
 import 'package:flashback_cam/screens/lifetime_paywall_screen.dart';
+import 'package:flashback_cam/screens/pro_upgrade_screen.dart';
 import 'package:flashback_cam/services/paywall_service.dart';
 import 'package:permission_handler/permission_handler.dart';
 
@@ -32,6 +32,8 @@ class CameraScreen extends StatefulWidget {
 class _CameraScreenState extends State<CameraScreen>
     with SingleTickerProviderStateMixin {
   double _baseZoomLevel = 1.0;
+  double _verticalDragBaseZoom = 1.0;
+  double _verticalDragStartY = 0.0;
   Map<String, bool> _capabilities = {};
   bool _capabilitiesLoaded = false;
   bool _showInstructions = false;
@@ -280,8 +282,10 @@ class _CameraScreenState extends State<CameraScreen>
 
   /// Open paywall for locked pro features (4K/60fps)
   void _openPaywall(BuildContext context) {
-    final appState = context.read<AppState>();
-    _showLifetimePaywall(appState, PaywallTrigger.proFeatureTap);
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const ProUpgradeScreen()),
+    );
   }
 
   Future<void> _loadCapabilities() async {
@@ -294,6 +298,44 @@ class _CameraScreenState extends State<CameraScreen>
         _capabilitiesLoaded = true;
       });
     }
+  }
+
+  double _zoomFromVerticalDrag({
+    required double currentY,
+    required double viewportHeight,
+    required AppState appState,
+  }) {
+    final zoomRange = (appState.maxZoom - 1.0).clamp(0.0, double.infinity);
+    if (zoomRange == 0.0) {
+      return 1.0;
+    }
+
+    final dragDistance = _verticalDragStartY - currentY;
+    final responsiveHeight = (viewportHeight * 0.6).clamp(180.0, 420.0);
+    final zoomDelta = (dragDistance / responsiveHeight) * zoomRange;
+
+    return (_verticalDragBaseZoom + zoomDelta).clamp(1.0, appState.maxZoom);
+  }
+
+  void _handleVerticalZoomStart(
+    DragStartDetails details,
+    AppState appState,
+  ) {
+    _pendingFocusPoint = null;
+    _verticalDragBaseZoom = appState.zoomLevel;
+    _verticalDragStartY = details.localPosition.dy;
+  }
+
+  void _handleVerticalZoomUpdate(
+    DragUpdateDetails details,
+    AppState appState,
+  ) {
+    final newZoom = _zoomFromVerticalDrag(
+      currentY: details.localPosition.dy,
+      viewportHeight: MediaQuery.sizeOf(context).height,
+      appState: appState,
+    );
+    appState.setZoom(newZoom);
   }
 
   @override
@@ -429,6 +471,12 @@ class _CameraScreenState extends State<CameraScreen>
                         appState, details.localPosition);
                   },
                   onDoubleTap: () => _handleDoubleTapToUnlockFocus(appState),
+                  onVerticalDragStart: (details) {
+                    _handleVerticalZoomStart(details, appState);
+                  },
+                  onVerticalDragUpdate: (details) {
+                    _handleVerticalZoomUpdate(details, appState);
+                  },
                   onScaleStart: (details) {
                     if (details.pointerCount > 1) {
                       _pendingFocusPoint = null; // Cancel any pending focus
@@ -535,11 +583,11 @@ class _CameraScreenState extends State<CameraScreen>
                 _updateSettings(appState, fps: value);
               },
               isPro: appState.isPro,
-              onDebugLongPress: _showDebugPanel,
               capabilities: _capabilities,
               capabilitiesLoaded: _capabilitiesLoaded,
               onLockedTap: () => _openPaywall(context),
               isLowMemoryDevice: appState.isLowMemoryDevice,
+              selectedBufferSeconds: appState.selectedBufferSeconds,
             ),
           ),
         const Spacer(),
@@ -597,11 +645,11 @@ class _CameraScreenState extends State<CameraScreen>
                       _updateSettings(appState, fps: value);
                     },
                     isPro: appState.isPro,
-                    onDebugLongPress: _showDebugPanel,
                     capabilities: _capabilities,
                     capabilitiesLoaded: _capabilitiesLoaded,
                     onLockedTap: () => _openPaywall(context),
                     isLowMemoryDevice: appState.isLowMemoryDevice,
+                    selectedBufferSeconds: appState.selectedBufferSeconds,
                   ),
                 const Spacer(),
                 // Rewarded buffer unlock badge
@@ -916,7 +964,7 @@ class _FeatureHighlightCarouselState extends State<FeatureHighlightCarousel> {
     {
       'icon': Icons.timer_outlined,
       'title': 'Smart Buffer Recording',
-      'description': 'Tap pinch to zoom while recording for better shots',
+      'description': 'Swipe up to zoom in, down to zoom out, or pinch anytime',
       'color': AppColors.successGreen,
     },
     {
@@ -1133,11 +1181,11 @@ class TopControls extends StatelessWidget {
   final Function(String) onResolutionChanged;
   final Function(int) onFpsChanged;
   final bool isPro;
-  final VoidCallback onDebugLongPress;
   final Map<String, bool> capabilities;
   final bool capabilitiesLoaded;
   final VoidCallback? onLockedTap;
   final bool isLowMemoryDevice;
+  final int selectedBufferSeconds;
 
   const TopControls({
     super.key,
@@ -1146,11 +1194,11 @@ class TopControls extends StatelessWidget {
     required this.onResolutionChanged,
     required this.onFpsChanged,
     required this.isPro,
-    required this.onDebugLongPress,
     required this.capabilities,
     required this.capabilitiesLoaded,
     this.onLockedTap,
     this.isLowMemoryDevice = false,
+    this.selectedBufferSeconds = 10,
   });
 
   @override
@@ -1173,18 +1221,6 @@ class TopControls extends StatelessWidget {
 
     return Row(
       children: [
-        GestureDetector(
-          onTap: () => Navigator.push(
-            context,
-            MaterialPageRoute(builder: (_) => SettingsScreen()),
-          ),
-          onLongPress: onDebugLongPress,
-          child: GlassContainer(
-            padding: EdgeInsets.all(12),
-            child: Icon(Icons.settings, color: Colors.white, size: 24),
-          ),
-        ),
-        SizedBox(width: 12),
         // Make the chips horizontally scrollable to avoid overflow on small screens
         Expanded(
           child: SingleChildScrollView(

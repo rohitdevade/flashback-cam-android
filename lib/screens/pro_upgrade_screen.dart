@@ -86,10 +86,6 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
                   child: Column(
                     children: [
                       const SizedBox(height: 20),
-                      _buildProHero(),
-                      const SizedBox(height: 40),
-                      _buildFeaturesList(),
-                      const SizedBox(height: 40),
                       _buildPricingSection(),
                       const SizedBox(height: 32),
                       _buildPurchaseButton(),
@@ -120,12 +116,24 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
             ),
             const SizedBox(width: 16),
             Expanded(
-              child: Text(
-                'Upgrade to Pro',
-                style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                      color: AppColors.textPrimary,
-                      fontWeight: FontWeight.w700,
-                    ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Upgrade to Pro',
+                    style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                          color: AppColors.textPrimary,
+                          fontWeight: FontWeight.w700,
+                        ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'All buffer, resolution unlocked, no ads',
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          color: AppColors.textSecondary,
+                        ),
+                  ),
+                ],
               ),
             ),
           ],
@@ -314,6 +322,9 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
     final lifetimeProduct = _billingInitialized
         ? subscriptionService.getProductDetails('lifetime')
         : null;
+    final lifetimeFullPriceProduct = _billingInitialized
+        ? subscriptionService.getProductDetails('lifetime_full_price')
+        : null;
 
     return Column(
       children: [
@@ -340,6 +351,8 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
           price: yearlyProduct?.price ?? 'Loading...',
           period: 'per year',
           originalPrice: null,
+          badge: '3 DAYS FREE TRIAL',
+          isPopular: true,
         ),
         const SizedBox(height: 12),
         _buildPricingCard(
@@ -347,7 +360,8 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
           label: 'Lifetime',
           price: lifetimeProduct?.price ?? 'Loading...',
           period: 'one-time payment',
-          originalPrice: null,
+          originalPrice: lifetimeFullPriceProduct?.price,
+          badge: '50% OFF - LIMITED TIME',
         ),
       ],
     );
@@ -370,6 +384,7 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
         setState(() => _selectedTier = tier);
       },
       child: Stack(
+        clipBehavior: Clip.none,
         children: [
           GlassContainer(
             padding: const EdgeInsets.all(20),
@@ -522,9 +537,17 @@ class _ProUpgradeScreenState extends State<ProUpgradeScreen>
         }
 
         // Show appropriate disclaimer based on plan type
-        final disclaimerText = _selectedTier == 'lifetime'
-            ? 'One-time purchase. No subscription or recurring charges. All purchases are processed securely by Google Play.'
-            : 'Your subscription auto-renews at $selectedPrice$billingPeriod until canceled. Cancel anytime in Google Play. Manage subscriptions in Google Play settings.';
+        String disclaimerText;
+        if (_selectedTier == 'lifetime') {
+          disclaimerText =
+              'One-time purchase. No subscription or recurring charges. All purchases are processed securely by Google Play.';
+        } else if (_selectedTier == 'yearly') {
+          disclaimerText =
+              '3-day free trial, then $selectedPrice/year. After trial ends, you will be automatically charged. Cancel anytime in Google Play before trial ends to avoid charges.';
+        } else {
+          disclaimerText =
+              'Your subscription auto-renews at $selectedPrice$billingPeriod until canceled. Cancel anytime in Google Play. Manage subscriptions in Google Play settings.';
+        }
 
         return Text(
           disclaimerText,

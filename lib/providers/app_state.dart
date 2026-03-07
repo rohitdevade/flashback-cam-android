@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flashback_cam/models/app_settings.dart';
 import 'package:flashback_cam/models/debug_info.dart';
 import 'package:flashback_cam/models/device_capabilities.dart';
+import 'package:flashback_cam/models/user.dart';
 import 'package:flashback_cam/models/video_recording.dart';
 import 'package:flashback_cam/services/camera_service.dart';
 import 'package:flashback_cam/services/device_service.dart';
@@ -796,7 +797,7 @@ class AppState extends ChangeNotifier {
   static const int lowMemoryMaxBufferDuration = 20;
 
   /// Check if a buffer duration is available for the current user
-  /// Returns: 'available', 'locked', or 'unlocked' (via rewarded ad)
+  /// Returns: 'available', 'locked', 'unlocked' (via rewarded ad), or 'incompatible' (device limitation)
   String getBufferDurationStatus(int seconds) {
     // LOW-MEMORY MODE: 30s is not available on ≤4GB devices
     if (isLowMemoryDevice && seconds > lowMemoryMaxBufferDuration) {
@@ -835,7 +836,7 @@ class AppState extends ChangeNotifier {
 
   /// Attempt to select a buffer duration
   /// For locked durations, this will trigger rewarded ad or paywall
-  /// Returns: 'success', 'blocked', 'needs_ad', 'needs_paywall'
+  /// Returns: 'success', 'blocked', 'incompatible', 'needs_ad', 'needs_paywall'
   String trySelectBufferDuration(int seconds) {
     // Block during recording/processing
     if (!canSelectBufferDuration(seconds)) {
@@ -858,12 +859,8 @@ class AppState extends ChangeNotifier {
     }
 
     // Free user trying to select locked duration
-    // Check if they should see paywall instead of rewarded ad
-    if (shouldShowPaywallInsteadOfRewardedAd) {
-      return 'needs_paywall';
-    }
-
-    return 'needs_ad';
+    // Always show paywall for locked durations
+    return 'needs_paywall';
   }
 
   /// Show rewarded ad to unlock a buffer duration
@@ -1006,7 +1003,11 @@ class AppState extends ChangeNotifier {
     // Video preview mode: simulate buffer start without camera
     if (AppState.demoMode) {
       debugPrint('📹 Video preview mode: simulating buffer start');
-      await WakelockPlus.enable();
+      try {
+        await WakelockPlus.enable();
+      } catch (e) {
+        debugPrint('⚠️ Wakelock failed (non-critical): $e');
+      }
       _bufferStartTime = DateTime.now();
       _bufferRemainingSeconds = 0;
       _progressTimer?.cancel();
@@ -1030,8 +1031,15 @@ class AppState extends ChangeNotifier {
       debugPrint('Starting buffer: checking storage and starting encoders...');
 
       // COLD START: Enable wakelock when buffer starts (not at app launch)
-      await WakelockPlus.enable();
-      debugPrint('🔒 Wakelock enabled - screen will stay on during buffering');
+      // Wrapped in try-catch to prevent wakelock plugin issues from blocking buffer
+      try {
+        await WakelockPlus.enable();
+        debugPrint(
+            '🔒 Wakelock enabled - screen will stay on during buffering');
+      } catch (wakelockError) {
+        debugPrint('⚠️ Wakelock failed (non-critical): $wakelockError');
+        // Continue without wakelock - buffer can still work
+      }
 
       // Update storage mode before starting
       await _updateStorageMode();
@@ -1112,7 +1120,11 @@ class AppState extends ChangeNotifier {
           await _cameraService.stopBuffer();
         }
         // Disable wakelock
-        await WakelockPlus.disable();
+        try {
+          await WakelockPlus.disable();
+        } catch (e) {
+          debugPrint('⚠️ Wakelock disable failed: $e');
+        }
         debugPrint(
             '✅ Buffer cleanup complete - user can restart buffer manually');
       } catch (e) {
@@ -1133,7 +1145,11 @@ class AppState extends ChangeNotifier {
       debugPrint('📹 Video preview mode: simulating buffer stop');
       _progressTimer?.cancel();
       _progressTimer = null;
-      await WakelockPlus.disable();
+      try {
+        await WakelockPlus.disable();
+      } catch (e) {
+        debugPrint('⚠️ Wakelock disable failed: $e');
+      }
       _bufferStartTime = null;
       _bufferSeconds = 0;
       _bufferRemainingSeconds = 0;
@@ -1154,8 +1170,12 @@ class AppState extends ChangeNotifier {
       await _cameraService.stopBuffer();
 
       // COLD START: Disable wakelock when buffer stops
-      await WakelockPlus.disable();
-      debugPrint('🔓 Wakelock disabled - screen can turn off');
+      try {
+        await WakelockPlus.disable();
+        debugPrint('🔓 Wakelock disabled - screen can turn off');
+      } catch (e) {
+        debugPrint('⚠️ Wakelock disable failed: $e');
+      }
 
       // Clear buffer state (but keep preview texture)
       _bufferStartTime = null;
@@ -1278,7 +1298,11 @@ class AppState extends ChangeNotifier {
       // Stop buffer and return to idle - user must manually restart buffer
       _progressTimer?.cancel();
       _progressTimer = null;
-      await WakelockPlus.disable();
+      try {
+        await WakelockPlus.disable();
+      } catch (e) {
+        debugPrint('⚠️ Wakelock disable failed: $e');
+      }
       _bufferStartTime = null;
       _bufferSeconds = 0;
       _bufferRemainingSeconds = 0;
@@ -1489,7 +1513,15 @@ class AppState extends ChangeNotifier {
 
   // Trial-related getters
   bool get hasProAccess => _subscriptionService.hasProAccess;
+  SubscriptionStatus get subscriptionStatus =>
+      _subscriptionService.subscriptionStatus;
   bool get isTrialActive => _subscriptionService.isTrialActive;
+  bool get isCancelledButTrialActive =>
+      _subscriptionService.isCancelledButTrialActive;
+  bool get isPaidSubscriptionActive =>
+      _subscriptionService.isPaidSubscriptionActive;
+  bool get isBillingGracePeriod => _subscriptionService.isInGracePeriod;
+  bool get isSubscriptionExpired => _subscriptionService.isExpired;
   bool get trialUsed => _subscriptionService.trialUsed;
   int get trialDaysRemaining => _subscriptionService.trialDaysRemaining;
   bool get canStartTrial => _subscriptionService.canStartTrial;

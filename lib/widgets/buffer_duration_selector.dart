@@ -40,6 +40,7 @@ class BufferDurationSelector extends StatelessWidget {
             final isSelected = selectedDuration == duration;
             final isLocked = status == 'locked';
             final isUnlocked = status == 'unlocked';
+            final isIncompatible = status == 'incompatible';
 
             return Padding(
               padding: const EdgeInsets.only(right: 4),
@@ -48,6 +49,7 @@ class BufferDurationSelector extends StatelessWidget {
                 isSelected: isSelected,
                 isLocked: isLocked,
                 isUnlocked: isUnlocked,
+                isIncompatible: isIncompatible,
                 isPro: isPro,
                 onTap: () => _handleDurationTap(context, appState, duration),
               ),
@@ -81,18 +83,37 @@ class BufferDurationSelector extends StatelessWidget {
         _showBlockedMessage(context);
         break;
 
-      case 'needs_ad':
-        // Show rewarded ad dialog
-        _showRewardedAdDialog(context, appState, duration);
+      case 'incompatible':
+        _showIncompatibleMessage(context);
         break;
 
+      case 'needs_ad':
       case 'needs_paywall':
-        // Show paywall
+        // Show paywall for locked durations
         if (onShowPaywall != null) {
           onShowPaywall!();
         }
         break;
     }
+  }
+
+  void _showIncompatibleMessage(BuildContext context) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            Icon(Icons.memory, color: Colors.white, size: 18),
+            const SizedBox(width: 8),
+            const Text('This buffer duration is not supported on your device'),
+          ],
+        ),
+        duration: const Duration(seconds: 3),
+        backgroundColor: AppColors.charcoal,
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.all(16),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      ),
+    );
   }
 
   void _showBlockedMessage(BuildContext context) {
@@ -238,6 +259,7 @@ class _BufferDurationChip extends StatelessWidget {
   final bool isSelected;
   final bool isLocked;
   final bool isUnlocked;
+  final bool isIncompatible;
   final bool isPro;
   final VoidCallback onTap;
 
@@ -246,12 +268,15 @@ class _BufferDurationChip extends StatelessWidget {
     required this.isSelected,
     required this.isLocked,
     required this.isUnlocked,
+    required this.isIncompatible,
     required this.isPro,
     required this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
+    final isDisabled = isIncompatible;
+
     return GestureDetector(
       onTap: onTap,
       child: AnimatedContainer(
@@ -260,22 +285,36 @@ class _BufferDurationChip extends StatelessWidget {
         decoration: BoxDecoration(
           color: isSelected
               ? AppColors.vibrantPurple
-              : Colors.white.withOpacity(0.1),
+              : isDisabled
+                  ? Colors.white.withOpacity(0.05)
+                  : Colors.white.withOpacity(0.1),
           borderRadius: BorderRadius.circular(16),
           border: Border.all(
             color: isSelected
                 ? AppColors.vibrantPurple
                 : isUnlocked
                     ? AppColors.successGreen.withOpacity(0.5)
-                    : Colors.white.withOpacity(0.2),
+                    : isDisabled
+                        ? Colors.white.withOpacity(0.1)
+                        : Colors.white.withOpacity(0.2),
             width: 1,
           ),
         ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            // Lock icon for locked durations
-            if (isLocked && !isSelected)
+            // Block icon for incompatible durations (device limitation)
+            if (isIncompatible && !isSelected)
+              Padding(
+                padding: const EdgeInsets.only(right: 4),
+                child: Icon(
+                  Icons.block,
+                  size: 12,
+                  color: Colors.white.withOpacity(0.35),
+                ),
+              ),
+            // Lock icon for locked durations (needs unlock)
+            if (isLocked && !isSelected && !isIncompatible)
               Padding(
                 padding: const EdgeInsets.only(right: 4),
                 child: Icon(
@@ -300,9 +339,11 @@ class _BufferDurationChip extends StatelessWidget {
               style: TextStyle(
                 color: isSelected
                     ? Colors.white
-                    : isLocked
-                        ? Colors.white.withOpacity(0.5)
-                        : Colors.white.withOpacity(0.9),
+                    : isIncompatible
+                        ? Colors.white.withOpacity(0.35)
+                        : isLocked
+                            ? Colors.white.withOpacity(0.5)
+                            : Colors.white.withOpacity(0.9),
                 fontSize: 13,
                 fontWeight: isSelected ? FontWeight.w600 : FontWeight.w500,
               ),
