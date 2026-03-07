@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "84879617220",
+    "project_id": "flashback-cam-74ccb",
+    "storage_bucket": "flashback-cam-74ccb.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:84879617220:android:e5932ef3100d24bd33ed91",
+        "android_client_info": {
+          "package_name": "com.rochapps.flashbackcam"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyANsVebFx8cBKNddoAXzZ_hL-x9KIkMrws"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

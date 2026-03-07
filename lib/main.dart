@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:firebase_core/firebase_core.dart';
 import 'package:provider/provider.dart';
 import 'package:flashback_cam/theme.dart';
 import 'package:flashback_cam/providers/app_state.dart';
@@ -26,7 +27,7 @@ import 'package:flashback_cam/screens/camera_screen.dart';
 /// Target: main() to first frame in <500ms
 /// ═══════════════════════════════════════════════════════════════════════════════
 
-void main() {
+Future<void> main() async {
   // Cold start timing
   final startTime = DateTime.now();
   debugPrint('═══════════════════════════════════════════════════════════════');
@@ -35,6 +36,10 @@ void main() {
 
   // Required for Flutter - minimal overhead
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Android-only Firebase base initialization.
+  // This depends on android/app/google-services.json being present.
+  await Firebase.initializeApp();
 
   // Enable edge-to-edge mode - lightweight system UI configuration
   // This is non-blocking and essential for UI appearance
