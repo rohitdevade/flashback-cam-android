@@ -24,6 +24,7 @@ import android.media.MediaMetadataRetriever
 import android.media.AudioRecord
 import android.media.AudioFormat as AndroidAudioFormat
 import android.media.MediaScannerConnection
+import android.media.CamcorderProfile
 import java.nio.ByteBuffer
 import java.util.concurrent.ArrayBlockingQueue
 import android.os.Build
@@ -5007,6 +5008,9 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                 return
             }
             
+            // Get numeric camera ID for CamcorderProfile
+            val cameraIdInt = try { cameraId.toInt() } catch (e: Exception) { 0 }
+            
             val characteristics = cameraManager.getCameraCharacteristics(cameraId)
             val streamConfigMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             
@@ -5036,71 +5040,129 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
             
             Log.d(TAG, "Available sizes: ${outputSizes?.joinToString { "${it.width}x${it.height}" }}")
             
-            // Get FPS ranges
+            // ═══════════════════════════════════════════════════════════════════════
+            // ROBUST 60FPS DETECTION - Check ALL sources and enable if ANY confirms
+            // ═══════════════════════════════════════════════════════════════════════
+            
+            // METHOD 1: Check CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES
             val normalFpsRanges = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            Log.d(TAG, "[60FPS Detection] Method 1 - Normal FPS ranges: ${normalFpsRanges?.joinToString { "[${it.lower}, ${it.upper}]" }}")
             
-            Log.d(TAG, "Normal FPS ranges: ${normalFpsRanges?.joinToString { "[${it.lower}, ${it.upper}]" }}")
-            
-            // Check 60fps support - look for ranges where upper bound is at least 60
-            // A range like [60,60] or [30,60] indicates 60fps support
-            val has60fpsRange = normalFpsRanges?.any { range ->
+            val has60fpsFromFpsRanges = normalFpsRanges?.any { range ->
                 range.upper >= 60
             } ?: false
+            Log.d(TAG, "[60FPS Detection] Method 1 result: $has60fpsFromFpsRanges")
             
-            // Also check high-speed video sizes for 60fps support
-            val highSpeedSizes = try {
-                streamConfigMap.highSpeedVideoSizes?.toList() ?: emptyList()
+            // METHOD 2: Check CamcorderProfile for 60fps profiles
+            var has1080p60fpsFromProfile = false
+            var has4K60fpsFromProfile = false
+            
+            try {
+                // Check standard 1080p profile for 60fps
+                if (CamcorderProfile.hasProfile(cameraIdInt, CamcorderProfile.QUALITY_1080P)) {
+                    val profile1080p = CamcorderProfile.get(cameraIdInt, CamcorderProfile.QUALITY_1080P)
+                    if (profile1080p.videoFrameRate >= 60) {
+                        has1080p60fpsFromProfile = true
+                        Log.d(TAG, "[60FPS Detection] Method 2 - CamcorderProfile QUALITY_1080P: ${profile1080p.videoFrameRate}fps")
+                    }
+                }
+                
+                // Check 4K profile for 60fps (QUALITY_2160P)
+                if (CamcorderProfile.hasProfile(cameraIdInt, CamcorderProfile.QUALITY_2160P)) {
+                    val profile4K = CamcorderProfile.get(cameraIdInt, CamcorderProfile.QUALITY_2160P)
+                    if (profile4K.videoFrameRate >= 60) {
+                        has4K60fpsFromProfile = true
+                        Log.d(TAG, "[60FPS Detection] Method 2 - CamcorderProfile QUALITY_2160P: ${profile4K.videoFrameRate}fps")
+                    }
+                }
+                
+                // Check high-speed profiles which may include 60fps
+                val highSpeedProfiles = listOf(
+                    CamcorderProfile.QUALITY_HIGH_SPEED_1080P to "HIGH_SPEED_1080P",
+                    CamcorderProfile.QUALITY_HIGH_SPEED_2160P to "HIGH_SPEED_2160P",
+                    CamcorderProfile.QUALITY_HIGH_SPEED_720P to "HIGH_SPEED_720P"
+                )
+                
+                for ((profileId, profileName) in highSpeedProfiles) {
+                    if (CamcorderProfile.hasProfile(cameraIdInt, profileId)) {
+                        val profile = CamcorderProfile.get(cameraIdInt, profileId)
+                        Log.d(TAG, "[60FPS Detection] Method 2 - CamcorderProfile $profileName: ${profile.videoFrameWidth}x${profile.videoFrameHeight}@${profile.videoFrameRate}fps")
+                        
+                        // If high-speed profile supports 60fps or higher for 1080p
+                        if (profile.videoFrameRate >= 60) {
+                            if (profile.videoFrameWidth >= 1920 && profile.videoFrameHeight >= 1080) {
+                                has1080p60fpsFromProfile = true
+                            }
+                            if (profile.videoFrameWidth >= 3840 && profile.videoFrameHeight >= 2160) {
+                                has4K60fpsFromProfile = true
+                            }
+                        }
+                    }
+                }
             } catch (e: Exception) {
-                emptyList()
+                Log.w(TAG, "[60FPS Detection] Method 2 - CamcorderProfile check failed: ${e.message}")
             }
             
-            val highSpeedFpsRanges1080p = try {
-                val size1080p = android.util.Size(1920, 1080)
+            Log.d(TAG, "[60FPS Detection] Method 2 result - 1080p60: $has1080p60fpsFromProfile, 4K60: $has4K60fpsFromProfile")
+            
+            // METHOD 3: Check SCALER_STREAM_CONFIGURATION_MAP high-speed video
+            var has1080p60fpsFromHighSpeed = false
+            var has4K60fpsFromHighSpeed = false
+            
+            try {
+                val highSpeedSizes = streamConfigMap.highSpeedVideoSizes?.toList() ?: emptyList()
+                Log.d(TAG, "[60FPS Detection] Method 3 - High-speed video sizes: ${highSpeedSizes.joinToString { "${it.width}x${it.height}" }}")
+                
+                // Check 1080p high-speed support
+                val size1080p = Size(1920, 1080)
                 if (highSpeedSizes.any { it.width == 1920 && it.height == 1080 }) {
-                    streamConfigMap.getHighSpeedVideoFpsRangesFor(size1080p)?.toList() ?: emptyList()
-                } else {
-                    emptyList()
+                    val fpsRanges1080p = streamConfigMap.getHighSpeedVideoFpsRangesFor(size1080p)?.toList() ?: emptyList()
+                    Log.d(TAG, "[60FPS Detection] Method 3 - 1080p high-speed FPS ranges: ${fpsRanges1080p.joinToString { "[${it.lower}, ${it.upper}]" }}")
+                    has1080p60fpsFromHighSpeed = fpsRanges1080p.any { it.upper >= 60 }
                 }
-            } catch (e: Exception) {
-                emptyList()
-            }
-            
-            val highSpeedFpsRanges4K = try {
-                val size4K = android.util.Size(3840, 2160)
+                
+                // Check 4K high-speed support
+                val size4K = Size(3840, 2160)
                 if (highSpeedSizes.any { it.width == 3840 && it.height == 2160 }) {
-                    streamConfigMap.getHighSpeedVideoFpsRangesFor(size4K)?.toList() ?: emptyList()
-                } else {
-                    emptyList()
+                    val fpsRanges4K = streamConfigMap.getHighSpeedVideoFpsRangesFor(size4K)?.toList() ?: emptyList()
+                    Log.d(TAG, "[60FPS Detection] Method 3 - 4K high-speed FPS ranges: ${fpsRanges4K.joinToString { "[${it.lower}, ${it.upper}]" }}")
+                    has4K60fpsFromHighSpeed = fpsRanges4K.any { it.upper >= 60 }
                 }
             } catch (e: Exception) {
-                emptyList()
+                Log.w(TAG, "[60FPS Detection] Method 3 - High-speed video check failed: ${e.message}")
             }
             
-            Log.d(TAG, "High-speed video sizes: ${highSpeedSizes.joinToString { "${it.width}x${it.height}" }}")
-            Log.d(TAG, "High-speed 1080p FPS ranges: ${highSpeedFpsRanges1080p.joinToString { "[${it.lower}, ${it.upper}]" }}")
-            Log.d(TAG, "High-speed 4K FPS ranges: ${highSpeedFpsRanges4K.joinToString { "[${it.lower}, ${it.upper}]" }}")
+            Log.d(TAG, "[60FPS Detection] Method 3 result - 1080p60: $has1080p60fpsFromHighSpeed, 4K60: $has4K60fpsFromHighSpeed")
             
-            // Determine 60fps support for each resolution
-            // ONLY check normal FPS ranges - high-speed capture requires a different API
-            // that we don't support yet. High-speed ranges are logged for reference only.
-            // Device must have 60fps in NORMAL capture mode, not just high-speed mode.
-            val supports1080p60fpsFromRanges = has60fpsRange
-            val supports4K60fpsFromRanges = has60fpsRange
+            // ═══════════════════════════════════════════════════════════════════════
+            // COMBINE RESULTS: If ANY method confirms 60fps support, enable it
+            // ═══════════════════════════════════════════════════════════════════════
             
-            Log.d(TAG, "60fps from normal ranges: $has60fpsRange (high-speed only NOT counted)")
-            Log.d(TAG, "High-speed 1080p has 60fps: ${highSpeedFpsRanges1080p.any { it.upper >= 60 }} (requires constrainedHighSpeedCaptureSession)")
-            Log.d(TAG, "High-speed 4K has 60fps: ${highSpeedFpsRanges4K.any { it.upper >= 60 }} (requires constrainedHighSpeedCaptureSession)")
+            // For 1080p60: enable if ANY of the three methods confirms support
+            val has1080p60fpsFromAnySource = has60fpsFromFpsRanges || has1080p60fpsFromProfile || has1080p60fpsFromHighSpeed
             
-            var supports1080p60fps = supports1080p && supports1080p60fpsFromRanges
-            var supports4K60fps = supports4K && supports4K60fpsFromRanges
+            // For 4K60: enable if ANY method confirms support (but need 4K resolution support too)
+            val has4K60fpsFromAnySource = has60fpsFromFpsRanges || has4K60fpsFromProfile || has4K60fpsFromHighSpeed
             
-            // Additional verification with MediaCodec capabilities
+            Log.d(TAG, "[60FPS Detection] Combined results:")
+            Log.d(TAG, "   • 1080p60 from any source: $has1080p60fpsFromAnySource")
+            Log.d(TAG, "   • 4K60 from any source: $has4K60fpsFromAnySource")
+            
+            // Resolution + FPS must both be supported
+            var supports1080p60fps = supports1080p && has1080p60fpsFromAnySource
+            var supports4K60fps = supports4K && has4K60fpsFromAnySource
+            
+            // Final verification with MediaCodec encoder capabilities (must be able to encode)
             if (supports1080p60fps) {
-                supports1080p60fps = checkMediaRecorderSupport(1920, 1080, 60)
+                val encoderSupports = checkMediaRecorderSupport(1920, 1080, 60)
+                Log.d(TAG, "[60FPS Detection] Encoder check for 1080p60: $encoderSupports")
+                supports1080p60fps = encoderSupports
             }
             
             if (supports4K60fps) {
-                supports4K60fps = checkMediaRecorderSupport(3840, 2160, 60)
+                val encoderSupports = checkMediaRecorderSupport(3840, 2160, 60)
+                Log.d(TAG, "[60FPS Detection] Encoder check for 4K60: $encoderSupports")
+                supports4K60fps = encoderSupports
             }
             
             val capabilities = hashMapOf<String, Boolean>(
@@ -5110,8 +5172,11 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                 "supports1080p30fps" to supports1080p
             )
             
-            Log.d(TAG, "✅ Final capabilities (normal capture mode only): $capabilities")
-            Log.d(TAG, "   Note: High-speed capture (120fps+) requires different API and is not supported")
+            Log.d(TAG, "✅ Final capabilities (robust detection): $capabilities")
+            Log.d(TAG, "   Detection sources used:")
+            Log.d(TAG, "   • Method 1 (FPS ranges): $has60fpsFromFpsRanges")
+            Log.d(TAG, "   • Method 2 (CamcorderProfile): 1080p=$has1080p60fpsFromProfile, 4K=$has4K60fpsFromProfile")
+            Log.d(TAG, "   • Method 3 (High-speed video): 1080p=$has1080p60fpsFromHighSpeed, 4K=$has4K60fpsFromHighSpeed")
             result.success(capabilities)
             
         } catch (e: Exception) {
@@ -5266,13 +5331,17 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
     }
 
     private fun collectSupportedFps(characteristics: CameraCharacteristics?): List<Int> {
-        val ranges = characteristics?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
         val fpsSet = sortedSetOf<Int>()
-
-        Log.d(TAG, "[FPS Detection] Raw FPS ranges from device: ${ranges?.joinToString { "[${it.lower}, ${it.upper}]" }}")
+        
+        Log.d(TAG, "[FPS Detection] Starting robust FPS detection...")
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // METHOD 1: Check CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES
+        // ═══════════════════════════════════════════════════════════════════════
+        val ranges = characteristics?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+        Log.d(TAG, "[FPS Detection] Method 1 - Raw FPS ranges: ${ranges?.joinToString { "[${it.lower}, ${it.upper}]" }}")
 
         ranges?.forEach { range ->
-            // Add exact upper FPS value if it's in common recording values
             val upperFps = range.upper
             when {
                 upperFps >= 60 -> {
@@ -5283,12 +5352,93 @@ class CameraPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChanne
                 upperFps >= 24 -> fpsSet.add(24)
             }
         }
-
+        
+        val has60fpsFromRanges = fpsSet.contains(60)
+        Log.d(TAG, "[FPS Detection] Method 1 result - 60fps: $has60fpsFromRanges")
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // METHOD 2: Check CamcorderProfile for 60fps profiles
+        // ═══════════════════════════════════════════════════════════════════════
+        var has60fpsFromProfile = false
+        try {
+            val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val cameraId = cameraManager.cameraIdList.firstOrNull { id ->
+                val chars = cameraManager.getCameraCharacteristics(id)
+                chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+            }
+            val cameraIdInt = try { cameraId?.toInt() ?: 0 } catch (e: Exception) { 0 }
+            
+            // Check standard profiles for 60fps
+            val profilesToCheck = listOf(
+                CamcorderProfile.QUALITY_1080P to "QUALITY_1080P",
+                CamcorderProfile.QUALITY_2160P to "QUALITY_2160P",
+                CamcorderProfile.QUALITY_HIGH_SPEED_1080P to "HIGH_SPEED_1080P",
+                CamcorderProfile.QUALITY_HIGH_SPEED_2160P to "HIGH_SPEED_2160P",
+                CamcorderProfile.QUALITY_HIGH_SPEED_720P to "HIGH_SPEED_720P"
+            )
+            
+            for ((profileId, profileName) in profilesToCheck) {
+                if (CamcorderProfile.hasProfile(cameraIdInt, profileId)) {
+                    val profile = CamcorderProfile.get(cameraIdInt, profileId)
+                    Log.d(TAG, "[FPS Detection] Method 2 - CamcorderProfile $profileName: ${profile.videoFrameRate}fps")
+                    if (profile.videoFrameRate >= 60) {
+                        has60fpsFromProfile = true
+                        fpsSet.add(60)
+                    }
+                    if (profile.videoFrameRate >= 120) {
+                        fpsSet.add(120)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "[FPS Detection] Method 2 - CamcorderProfile check failed: ${e.message}")
+        }
+        Log.d(TAG, "[FPS Detection] Method 2 result - 60fps from profile: $has60fpsFromProfile")
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // METHOD 3: Check SCALER_STREAM_CONFIGURATION_MAP high-speed video
+        // ═══════════════════════════════════════════════════════════════════════
+        var has60fpsFromHighSpeed = false
+        try {
+            val streamConfigMap = characteristics?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val highSpeedSizes = streamConfigMap?.highSpeedVideoSizes?.toList() ?: emptyList()
+            
+            Log.d(TAG, "[FPS Detection] Method 3 - High-speed sizes: ${highSpeedSizes.joinToString { "${it.width}x${it.height}" }}")
+            
+            for (size in highSpeedSizes) {
+                try {
+                    val fpsRanges = streamConfigMap?.getHighSpeedVideoFpsRangesFor(size)?.toList() ?: emptyList()
+                    for (fpsRange in fpsRanges) {
+                        if (fpsRange.upper >= 60) {
+                            has60fpsFromHighSpeed = true
+                            fpsSet.add(60)
+                            Log.d(TAG, "[FPS Detection] Method 3 - Found 60fps support for ${size.width}x${size.height}: [${fpsRange.lower}, ${fpsRange.upper}]")
+                        }
+                        if (fpsRange.upper >= 120) {
+                            fpsSet.add(120)
+                        }
+                    }
+                } catch (e: Exception) {
+                    // Skip this size if check fails
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "[FPS Detection] Method 3 - High-speed video check failed: ${e.message}")
+        }
+        Log.d(TAG, "[FPS Detection] Method 3 result - 60fps from high-speed: $has60fpsFromHighSpeed")
+        
+        // Ensure at least 30fps is available as default
         if (fpsSet.isEmpty()) {
             fpsSet.add(30)
         }
+        
+        // Always ensure 30fps is in the list if any higher fps is supported
+        if (fpsSet.any { it >= 60 } && !fpsSet.contains(30)) {
+            fpsSet.add(30)
+        }
 
-        Log.d(TAG, "[FPS Detection] Supported FPS values: $fpsSet")
+        Log.d(TAG, "[FPS Detection] ✅ Final supported FPS values: $fpsSet")
+        Log.d(TAG, "[FPS Detection] Sources: FPS ranges=$has60fpsFromRanges, CamcorderProfile=$has60fpsFromProfile, HighSpeed=$has60fpsFromHighSpeed")
         return fpsSet.toList()
     }
 
